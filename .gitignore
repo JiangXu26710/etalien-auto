@@ -1,0 +1,33 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+build/
+dist/
+*.spec
+!etalien-auto.spec
+*.egg-info/
+.trash/
+test/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Logs
+*.log
+debug.log
+
+# Config (keep directory structure)
+config/accounts.json
+config/settings.json
+
+# Internal docs
+docs/

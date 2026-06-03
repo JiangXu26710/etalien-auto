@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>外星仔加速器 - 免广告自动领时长 F</title>
+<link rel="stylesheet" href="style.css">
+<style>
+#splash{position:fixed;inset:0;z-index:9999;background:#0a0a0c;display:flex;align-items:center;justify-content:center;transition:opacity 0.4s cubic-bezier(0.4,0,0.2,1)}
+#splash.fade-out{opacity:0;pointer-events:none}
+#splash-inner{display:flex;flex-direction:column;align-items:center;gap:16px}
+#splash-logo{width:48px;height:48px;border-radius:12px;animation:splashPulse 1.5s ease-in-out infinite}
+#splash-bar{width:120px;height:3px;background:#2a2a32;border-radius:2px;overflow:hidden}
+#splash-bar::after{content:'';display:block;width:40%;height:100%;background:linear-gradient(90deg,#c9a84c,#e0c878);border-radius:2px;animation:splashSlide 1.2s ease-in-out infinite}
+@keyframes splashPulse{0%,100%{transform:scale(1);opacity:0.8}50%{transform:scale(1.05);opacity:1}}
+@keyframes splashSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
+</style>
+</head>
+<body>
+<div id="splash"><div id="splash-inner"><img id="splash-logo" src="logo.png" alt=""><div id="splash-bar"></div></div></div>
+<div id="app">
+  <header class="title-bar" id="titleBar">
+    <div class="title-bar-drag" id="titleBarDrag">
+      <img class="logo-icon" src="logo.png" alt="F">
+      <div class="title-bar-text">外星仔加速器 - 免广告自动领时长 F</div>
+    </div>
+    <div class="title-bar-controls">
+      <button class="title-btn title-btn-min" onclick="windowMinimize()" title="最小化"></button>
+      <button class="title-btn title-btn-max" onclick="windowMaximize()" title="最大化"></button>
+      <button class="title-btn title-btn-close" onclick="windowClose()" title="关闭"></button>
+    </div>
+  </header>
+
+  <main class="main-content">
+    <section class="stats-bar" id="statsBar">
+      <div class="stat-card">
+        <div class="stat-value" id="totalAccounts">0</div>
+        <div class="stat-label">账号数</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="activeAccounts">0</div>
+        <div class="stat-label">已启用</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-value" id="totalProgress">0/0</div>
+        <div class="stat-label">总进度</div>
+      </div>
+    </section>
+
+    <section class="action-bar">
+      <div class="action-bar-left">
+        <button class="btn-primary" id="btnClaim" onclick="startClaim()">
+          开始领取
+        </button>
+        <button class="btn-secondary" onclick="refreshStatus()">
+          刷新状态
+        </button>
+        <button class="btn-accent" onclick="showAddAccount()">
+          添加账号
+        </button>
+      </div>
+      <div class="action-bar-right">
+        <button class="btn-secondary" onclick="showSettings()">
+          设置
+        </button>
+      </div>
+    </section>
+
+    <section class="accounts-section">
+      <div class="section-header">
+        <h2>账号列表</h2>
+      </div>
+      <div class="accounts-list" id="accountsList">
+        <div class="empty-state">暂无账号，点击"添加账号"开始</div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="modal-overlay" id="modalOverlay" onmousedown="modalMouseDownTarget=event.target" onclick="closeModal(event)">
+  <div class="modal" id="modalContent" onclick="event.stopPropagation()">
+  </div>
+</div>
+
+<div class="modal-overlay" id="logOverlay" onmousedown="logMouseDownTarget=event.target" onclick="closeLogModal(event)">
+  <div class="modal log-modal" id="logModalContent" onclick="event.stopPropagation()">
+    <div class="log-modal-header">
+      <h2>领取日志</h2>
+      <span class="claim-status" id="claimStatus"></span>
+    </div>
+    <div class="log-list" id="logList"></div>
+  </div>
+</div>
+
+<div class="toast-container" id="toastContainer"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package error;
+
+message Error {
+    int32 code = 1;
+    string msg = 2;
+}

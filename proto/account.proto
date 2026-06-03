@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package account;
+
+// 获取登录验证码请求
+// POST /account/v1/get_login_verification_code
+message GetLoginVerificationCodeRequest {
+    string phone_number = 1;
+}
+
+message GetLoginVerificationCodeResponse {
+    // 服务端返回，通常为空或包含发送状态
+}
+
+// 验证码登录请求
+// POST /account/v1/login
+message LoginRequest {
+    string phone_number = 1;
+    string verification_code = 2;
+    string password = 3;
+    string channel = 4;
+}
+
+message LoginResponse {
+    int64 user_id = 1;
+    string authorization = 2;
+}
+
+// 一键登录请求
+// POST /account/v1/login/by-one-click
+message LoginByOneClickRequest {
+    // 一键登录token
+}
+
+message LoginByOneClickResponse {
+    int64 user_id = 1;
+    string authorization = 2;
+}
+
+// 获取用户信息
+// GET /account/v1/my_profile
+message MyProfileResponse {
+    // 用户资料
+}
+
+// 刷新token
+// POST /v2/account/refresh/token
+message RefreshTokenRequest {
+    // 空请求体或包含refresh_token
+}
+
+message RefreshTokenResponse {
+    string authorization = 1;
+}
