@@ -9,6 +9,8 @@ dist/
 *.egg-info/
 .trash/
 test/
+demo/
+.playwright-cli/
 
 # IDE
 .idea/
@@ -31,3 +33,6 @@ config/settings.json
 
 # Internal docs
 docs/
+
+# APK reverse engineering artifacts
+etalien\ R\ result\ document/

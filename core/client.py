@@ -46,7 +46,7 @@ class EtAlienClient:
         query_part = signed.split("?", 1)[1] if "?" in signed else ""
         return f"{self.BASE_URL}{path}?{query_part}"
 
-    def _request_with_retry(self, method: str, url: str, data: bytes | None = None, timeout: int = 30) -> tuple[int, bytes]:
+    def _request_with_retry(self, method: str, url: str, data: bytes | None = None, timeout: int = 30, retry_on_500: bool = True) -> tuple[int, bytes]:
         last_exc = None
         for attempt in range(MAX_RETRIES + 1):
             try:
@@ -54,7 +54,9 @@ class EtAlienClient:
                     resp = self.session.post(url, data=data, timeout=timeout)
                 else:
                     resp = self.session.get(url, data=data, timeout=timeout)
-                if resp.status_code >= 500 and attempt < MAX_RETRIES:
+                # 密码登录等业务接口在参数错误时也会返回 500（实测 code=500 的业务错误），
+                # 这类响应不应重试，由调用方通过 retry_on_500=False 关闭
+                if resp.status_code >= 500 and retry_on_500 and attempt < MAX_RETRIES:
                     logger.warning("服务端错误 %d(第%d次)，%0.1fs后重试", resp.status_code, attempt + 1, RETRY_DELAY)
                     time.sleep(RETRY_DELAY)
                     continue
@@ -71,13 +73,13 @@ class EtAlienClient:
                     time.sleep(RETRY_DELAY)
         raise last_exc
 
-    def _post(self, path: str, body: bytes | None = None, query: dict | None = None) -> tuple[int, bytes]:
+    def _post(self, path: str, body: bytes | None = None, query: dict | None = None, retry_on_500: bool = True) -> tuple[int, bytes]:
         url = self._build_url("POST", path, query)
-        return self._request_with_retry("POST", url, data=body)
+        return self._request_with_retry("POST", url, data=body, retry_on_500=retry_on_500)
 
-    def _get(self, path: str, query: dict | None = None, body: bytes | None = None) -> tuple[int, bytes]:
+    def _get(self, path: str, query: dict | None = None, body: bytes | None = None, retry_on_500: bool = True) -> tuple[int, bytes]:
         url = self._build_url("GET", path, query)
-        return self._request_with_retry("GET", url, data=body)
+        return self._request_with_retry("GET", url, data=body, retry_on_500=retry_on_500)
 
     def _parse_protobuf_error(self, data: bytes) -> dict[str, Any] | None:
         try:
@@ -174,6 +176,36 @@ class EtAlienClient:
 
         return result
 
+    def login_by_password(self, password: str, phone: str | None = None) -> dict[str, Any]:
+        """密码登录（与验证码登录相互独立）
+        接口: POST /v2/account/login
+        密码为明文，规则 6-20 位 [a-zA-Z0-9_.]
+        """
+        phone = phone or self.phone
+        formatted = self._format_phone(phone)
+        req = account_pb2.LoginV2Request(phone_number=formatted, password=password)
+        body = req.SerializeToString()
+
+        # 密码登录接口对参数/业务错误也返回 500（实测 code=500），不应重试，否则用户要等 ~3s 才看到提示
+        status_code, data = self._post("/v2/account/login", body=body, retry_on_500=False)
+        result = self._parse_response(status_code, data)
+
+        if not result.get("_error"):
+            try:
+                # LoginV2Response 与 LoginResponse 结构相同，复用解析
+                resp = account_pb2.LoginResponse()
+                resp.ParseFromString(result["raw"])
+                self.auth_token = resp.authorization
+                self.user_id = resp.user_id
+                self.session.headers["Authorization"] = self.auth_token
+                result["user_id"] = resp.user_id
+                result["authorization"] = resp.authorization
+            except Exception as e:
+                logger.exception("Failed to parse LoginV2Response for %s", phone)
+                result["parse_error"] = str(e)
+
+        return result
+
     def fetch_pc_ad_config(self) -> dict[str, Any]:
         req = apiv2_pb2.PcAdConfigRequest()
         status_code, data = self._post("/v2/account/pc/ad/config", body=req.SerializeToString())
@@ -203,6 +235,16 @@ class EtAlienClient:
                     }
                     for item in resp.list
                 ]
+                # 校验 watch_cnt 与 is_watch 标志一致性（两口径并存：watch_cnt 来自服务端，
+                # is_watch 来自 items；若不一致，状态查询与领取循环的进度展示可能跳变）
+                for level_item in result["list"]:
+                    is_watch_sum = sum(1 for it in level_item["items"] if it["is_watch"])
+                    if level_item["watch_cnt"] != is_watch_sum:
+                        logger.warning(
+                            "PcAdConfig 校验不一致: level=%d watch_cnt=%d 但 is_watch=true 的 items 数=%d，"
+                            "进度展示可能跳变",
+                            level_item["level"], level_item["watch_cnt"], is_watch_sum,
+                        )
             except Exception as e:
                 logger.exception("Failed to parse PcAdConfigResponse")
                 result["parse_error"] = str(e)
@@ -232,7 +274,17 @@ class EtAlienClient:
 
         return result
 
-    def pc_ad_callback_backup(self, ad_id: str = "103334281", business: int = 0) -> dict[str, Any]:
+    def pc_ad_callback_backup(self, ad_id: str = "103334281", business: int = 1) -> dict[str, Any]:
+        """广告奖励补发（PC/手机/翻译三种权益共用此接口）。
+
+        Args:
+            ad_id: 穿山甲广告位ID，必须与 business 类型严格对应。
+                  PC加速="103334281", 手机加速="102815305", 翻译加速="103579416"
+            business: 业务类型。1=PC加速, 2=手机加速, 3=翻译加速
+
+        注意：ad_id 与 business 不匹配时服务端会返回 is_verify=False。
+        当前项目使用 PC 加速（business=1, ad_id="103334281"）和手机加速（business=2, ad_id="102815305"）。
+        """
         req = apiv2_pb2.PcAdCallbackBackupRequest()
         req.ad_id = ad_id
         req.business = business
@@ -246,6 +298,116 @@ class EtAlienClient:
                 result["is_verify"] = resp.is_verify
             except Exception as e:
                 logger.exception("Failed to parse PcAdCallbackBackupResponse")
+                result["parse_error"] = str(e)
+
+        return result
+
+    def fetch_mobile_ad_activity(self) -> dict[str, Any]:
+        """获取手机端广告任务列表。
+
+        GET /award/v1/ad/activity
+        响应结构见 apiv2.proto 的 AdActivityResponse。
+
+        Returns:
+            dict: 通用错误字段 + 业务字段
+                - user_watch_cnt: 累计 is_verify=true 的调用次数
+                - video_cnt: 任务总数（实测=任务列表长度）
+                - activity_status: 活动状态（1=进行中）
+                - video_bar: 任务列表 [{id, has_award, award, is_get}]
+                - rewarded_count: 有奖励的任务数（has_award=True）
+                - claimed_count: 已领取奖励的任务数（has_award=True 且 is_get=True）
+        """
+        status_code, data = self._get("/award/v1/ad/activity")
+        result = self._parse_response(status_code, data)
+
+        if not result.get("_error"):
+            try:
+                resp = apiv2_pb2.AdActivityResponse()
+                resp.ParseFromString(result["raw"])
+                video_bar = [
+                    {
+                        "id": item.id,
+                        "has_award": item.has_award,
+                        "award": item.award,
+                        "is_get": item.is_get,
+                    }
+                    for item in resp.video_bar
+                ]
+                rewarded = [t for t in video_bar if t["has_award"]]
+                claimed = [t for t in rewarded if t["is_get"]]
+                result.update({
+                    "user_watch_cnt": resp.user_watch_cnt,
+                    "video_cnt": resp.video_cnt,
+                    "activity_status": resp.activity_status,
+                    "video_bar": video_bar,
+                    "rewarded_count": len(rewarded),
+                    "claimed_count": len(claimed),
+                })
+            except Exception as e:
+                logger.exception("Failed to parse AdActivityResponse")
+                result["parse_error"] = str(e)
+
+        return result
+
+    def fetch_mobile_profile(self) -> dict[str, Any]:
+        """获取用户资料（含手机端加速时长余额）。
+
+        GET /account/v1/my_profile
+        响应结构见 account.proto 的 MyProfileResponse。
+
+        手机端加速时长余额 = max(0, member.expire_time - 当前时间戳)
+
+        Returns:
+            dict: 通用错误字段 + 业务字段
+                - user_id, nickname, avatar, steamid, register_time
+                - members: 会员信息列表 [{type, expire_time}]
+                - member: 当前会员信息 {type, expire_time} 或 None
+                - video_award: 视频奖励 {award, has} 或 None
+                - mobile_not_get_ad_duration: 今日未领取广告时长（小时）
+                - remaining_seconds: 加速时长余额（秒，由 member.expire_time 计算）
+        """
+        status_code, data = self._get("/account/v1/my_profile")
+        result = self._parse_response(status_code, data)
+
+        if not result.get("_error"):
+            try:
+                resp = account_pb2.MyProfileResponse()
+                resp.ParseFromString(result["raw"])
+                member = None
+                if resp.HasField("member"):
+                    member = {
+                        "type": resp.member.type,
+                        "expire_time": resp.member.expire_time,
+                    }
+                video_award = None
+                if resp.HasField("video_award"):
+                    video_award = {
+                        "award": resp.video_award.award,
+                        "has": resp.video_award.has,
+                    }
+                members = [
+                    {"type": m.type, "expire_time": m.expire_time}
+                    for m in resp.members
+                ]
+                # 计算加速时长余额
+                remaining = 0
+                if member:
+                    now = int(time.time())
+                    remaining = max(0, member["expire_time"] - now)
+                result.update({
+                    "user_id": resp.user_id,
+                    "nickname": resp.nickname,
+                    "avatar": resp.avatar,
+                    "steamid": resp.steamid,
+                    "register_time": resp.register_time,
+                    "members": members,
+                    "member": member,
+                    "video_award": video_award,
+                    "mobile_not_get_ad_duration": resp.mobile_not_get_ad_duration,
+                    "remaining_seconds": remaining,
+                })
+            except Exception as e:
+                logger.exception("Failed to parse MyProfileResponse")
                 result["parse_error"] = str(e)
 
         return result

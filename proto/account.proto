@@ -3,7 +3,7 @@ syntax = "proto3";
 package account;
 
 // 获取登录验证码请求
-// POST /account/v1/get_login_verification_code
+// GET /account/v1/get_login_verification_code
 message GetLoginVerificationCodeRequest {
     string phone_number = 1;
 }
@@ -26,6 +26,18 @@ message LoginResponse {
     string authorization = 2;
 }
 
+// 密码登录请求
+// POST /v2/account/login
+message LoginV2Request {
+    string phone_number = 1;
+    string password = 2;
+}
+
+message LoginV2Response {
+    int64 user_id = 1;
+    string authorization = 2;
+}
+
 // 一键登录请求
 // POST /account/v1/login/by-one-click
 message LoginByOneClickRequest {
@@ -40,7 +52,27 @@ message LoginByOneClickResponse {
 // 获取用户信息
 // GET /account/v1/my_profile
 message MyProfileResponse {
-    // 用户资料
+    int64 user_id = 1;
+    string nickname = 2;
+    string avatar = 3;
+    string steamid = 4;
+    int64 register_time = 5;        // 注册时间（秒级时间戳）
+    repeated Member members = 6;    // 会员信息列表
+    Member member = 7;              // 当前会员信息（关键字段）
+    UserVideoAward video_award = 8; // 视频奖励信息
+    int64 mobile_not_get_ad_duration = 9;  // 手机端今日未领取的广告时长（小时）
+}
+
+// 会员信息（MyProfileResponse.field 6/7 内嵌）
+message Member {
+    int64 type = 1;         // 会员类型（2=VIP）
+    int64 expire_time = 2;  // 会员过期时间（秒级时间戳）← 手机端加速时长余额的关键
+}
+
+// 视频奖励信息（MyProfileResponse.field 8 内嵌）
+message UserVideoAward {
+    int64 award = 1;        // 奖励数值
+    bool has = 2;           // 是否有奖励
 }
 
 // 刷新token

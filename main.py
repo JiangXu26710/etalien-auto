@@ -1,8 +1,10 @@
 import logging
 import os
 import sys
+from logging.handlers import RotatingFileHandler
 
 from core.config import load_accounts, load_settings, CONFIG_DIR
+from core.notify import send_claim_notification
 from core.service import run_concurrent_claim, format_duration
 
 EXIT_OK = 0
@@ -10,13 +12,17 @@ EXIT_PARTIAL = 1
 EXIT_ERROR = 2
 EXIT_NEED_LOGIN = 3
 EXIT_NO_ACCOUNTS = 4
+EXIT_NETWORK_ERROR = 5
 
 
 def _setup_logging(log_file: str | None = None):
     handlers = [logging.StreamHandler(sys.stderr)]
     if log_file:
         os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        # 按大小轮转：5MB 一份，保留 3 个备份，避免计划任务长期运行后日志无限增长
+        handlers.append(RotatingFileHandler(
+            log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        ))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -24,7 +30,7 @@ def _setup_logging(log_file: str | None = None):
     )
 
 
-def main():
+def main(auto_close: bool = False):
     log_file = os.path.join(CONFIG_DIR, "cli.log")
     _setup_logging(log_file)
     logger = logging.getLogger(__name__)
@@ -46,6 +52,7 @@ def main():
     results = run_concurrent_claim(enabled, settings)
 
     need_login = []
+    network_errors = []
     total_vip_before = 0
     total_vip_after = 0
     has_error = False
@@ -62,6 +69,8 @@ def main():
 
         if r["status"] == "need_login":
             need_login.append(r)
+        elif r["status"] == "network_error":
+            network_errors.append(r)
         elif r["status"] == "error":
             has_error = True
         elif r["status"] == "partial":
@@ -74,6 +83,7 @@ def main():
         "partial": "部分完成",
         "already_done": "已完成",
         "need_login": "需要登录",
+        "network_error": "网络错误",
         "error": "错误",
     }
     for r in results:
@@ -97,8 +107,22 @@ def main():
         for r in need_login:
             logger.warning("  - %s", r["label"])
 
+    if network_errors:
+        logger.warning("以下账号因网络/服务端错误未能领取（下次运行可能自动恢复）:")
+        for r in network_errors:
+            logger.warning("  - %s", r["label"])
+
+    # 仅在 --auto-close 模式（计划任务）下推送通知
+    if auto_close:
+        try:
+            send_claim_notification(results)
+        except Exception:
+            logger.exception("Server酱通知发送异常（不影响退出码）")
+
     if need_login:
         sys.exit(EXIT_NEED_LOGIN)
+    if network_errors:
+        sys.exit(EXIT_NETWORK_ERROR)
     if has_error and not has_done and not has_partial:
         sys.exit(EXIT_ERROR)
     if has_partial or (has_error and has_done):

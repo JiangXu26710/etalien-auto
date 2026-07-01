@@ -16,6 +16,7 @@ a = Analysis(
         (os.path.join(PROJECT_DIR, 'core', '__init__.py'), 'core'),
         (os.path.join(PROJECT_DIR, 'core', 'config.py'), 'core'),
         (os.path.join(PROJECT_DIR, 'core', 'client.py'), 'core'),
+        (os.path.join(PROJECT_DIR, 'core', 'notify.py'), 'core'),
         (os.path.join(PROJECT_DIR, 'core', 'service.py'), 'core'),
         (os.path.join(PROJECT_DIR, 'core', 'sign.py'), 'core'),
         (os.path.join(PROJECT_DIR, 'account_pb2.py'), '.'),
@@ -25,6 +26,7 @@ a = Analysis(
     hiddenimports=[
         'core',
         'core.client',
+        'core.notify',
         'core.sign',
         'gui',
         'gui.api',

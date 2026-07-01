@@ -131,7 +131,7 @@ if is_cli_mode:
         sys.stderr = _cli_stderr
         sys.stdin = _cli_stdin
         try:
-            cli_main()
+            cli_main(auto_close=auto_close)
         except SystemExit as e:
             exit_code = e.code if isinstance(e.code, int) else 0
             if not auto_close:
@@ -284,9 +284,9 @@ def main():
         api.is_maximized, api.get_position, api.move_window,
     )
 
-    def _fix_taskbar_minimize(win):
+    def _fix_taskbar_minimize(window):
         try:
-            hwnd = win.native.Handle.ToInt32()
+            hwnd = window.native.Handle.ToInt32()
             GWL_STYLE = -16
             WS_MINIMIZEBOX = 0x20000
             style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)

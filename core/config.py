@@ -28,14 +28,20 @@ DEFAULT_SETTINGS = {
     "max_concurrent": 10,
     "request_interval": 1.0,
     "max_rounds": 21,
+    "mobile_max_rounds": 7,
     "schedule_time": "08:00",
+    "schan_enabled": False,
+    "schan_key": "",
 }
 
 SETTINGS_SCHEMA = {
     "max_concurrent": {"type": int, "min": 1, "max": 50},
     "request_interval": {"type": float, "min": 0.1, "max": 30.0},
     "max_rounds": {"type": int, "min": 1, "max": 200},
+    "mobile_max_rounds": {"type": int, "min": 1, "max": 200},
     "schedule_time": {"type": str},
+    "schan_enabled": {"type": bool},
+    "schan_key": {"type": str},
 }
 
 

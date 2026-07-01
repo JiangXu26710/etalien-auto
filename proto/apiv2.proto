@@ -78,3 +78,24 @@ message MobilePcProductItem {
 message MobilePcProductListResponse {
     repeated MobilePcProductItem list = 1;
 }
+
+// 手机端广告任务列表
+// GET /award/v1/ad/activity
+// 注意：此接口无请求体（GET），响应结构为推断
+message AdActivityRequest {
+    // 空请求体（GET 请求无需 body）
+}
+
+message AdActivityItem {
+    int64 id = 1;           // 任务ID
+    bool has_award = 2;     // 是否有奖励数据（存在=true）
+    int64 award = 3;        // 奖励值（实测=24，即 24 小时/次）
+    bool is_get = 4;        // 是否已领取奖励（f4=1=已领取，缺失=未领取）
+}
+
+message AdActivityResponse {
+    int64 user_watch_cnt = 1;       // 累计 is_verify=true 的调用次数（实测即使无可发奖励或超额调用，is_verify 仍返回 true，故计数持续递增，可超过 video_cnt；ad_id 与 business 不匹配时服务端会返回 is_verify=false，其他导致is_verify=false 的触发条件未知；显示时需 clamp）
+    int64 video_cnt = 2;            // 任务总数（实测=任务列表长度）
+    repeated AdActivityItem video_bar = 3;  // 任务列表
+    int64 activity_status = 4;      // 活动状态（1=进行中）
+}
