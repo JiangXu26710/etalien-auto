@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
@@ -275,23 +276,48 @@ def _get_cli_exe_path() -> str:
 
 
 def query_schedule() -> dict[str, Any]:
+    # 优先从 schtasks /xml 解析真实 StartBoundary（任务时间）和 Settings/Enabled（任务启用状态）；
+    # 任务不存在或解析异常时回退到配置文件 schedule_time。
+    # 用 XML 格式而非 LIST /v：字段名语言无关，避开中文 Windows 本地化字段名问题。
     settings = load_settings()
-    schedule_time = settings.get("schedule_time", "08:00")
+    fallback_time = settings.get("schedule_time", "08:00")
     try:
         result = subprocess.run(
-            ["schtasks", "/query", "/tn", TASK_NAME, "/fo", "TABLE", "/nh"],
-            capture_output=True, text=True, timeout=10,
+            ["schtasks", "/query", "/tn", TASK_NAME, "/xml"],
+            capture_output=True, timeout=10,
             creationflags=SUBPROCESS_FLAGS,
         )
-        exists = result.returncode == 0
-        return {
-            "exists": exists,
-            "enabled": exists,
-            "time": schedule_time,
-        }
+        if result.returncode != 0:
+            return {"exists": False, "enabled": False, "time": fallback_time}
+
+        # schtasks /xml 声明为 UTF-16，实际输出 UTF-8（实测 Win11），用 utf-8 解码
+        xml_text = result.stdout.decode("utf-8", errors="replace")
+        root = ET.fromstring(xml_text)
+        ns = {"ms": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+
+        schedule_time = fallback_time
+        sb = root.find(".//ms:Triggers//ms:StartBoundary", ns)
+        if sb is not None and "T" in sb.text:
+            # 格式 2026-07-02T21:00:00，截取时间部分 HH:MM
+            time_part = sb.text.split("T", 1)[1]
+            if len(time_part) >= 5 and time_part[2] == ":":
+                schedule_time = time_part[:5]
+
+        # 启用状态：Settings/Enabled 缺省视为 True（任务默认启用），
+        # 显式 "false" 才视为禁用；同时检查 Triggers/Enabled 任一为 false 即视为禁用
+        enabled = True
+        settings_enabled = root.find("./ms:Settings/ms:Enabled", ns)
+        if settings_enabled is not None and settings_enabled.text.lower() == "false":
+            enabled = False
+        for trig_en in root.findall(".//ms:Triggers//ms:Enabled", ns):
+            if trig_en.text.lower() == "false":
+                enabled = False
+                break
+
+        return {"exists": True, "enabled": enabled, "time": schedule_time}
     except Exception as e:
         logger.exception("Failed to query schedule")
-        return {"exists": False, "enabled": False, "time": schedule_time, "error": str(e)}
+        return {"exists": False, "enabled": False, "time": fallback_time, "error": str(e)}
 
 
 def create_schedule(schedule_time: str) -> dict[str, Any]:
