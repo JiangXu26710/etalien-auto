@@ -6,11 +6,11 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
-from core.client import EtAlienClient
+from core.client import EtAlienClient, NeedLoginError
 from core.config import load_accounts, save_accounts, load_settings, save_settings, validate_settings, accounts_lock, PROJECT_DIR
 
 logger = logging.getLogger(__name__)
@@ -103,17 +103,53 @@ def verify_login(phone: str, code: str | None = None, password: str | None = Non
     return result
 
 
-def get_client_for_account(account: dict) -> EtAlienClient | None:
+def get_client_for_account(account: dict, enable_relogin: bool = False) -> EtAlienClient | None:
+    """构建账号对应的 EtAlienClient。
+
+    Args:
+        enable_relogin: 是否注入 token 过期自动重登能力（含密码与持久化回调）。
+            领取流程传 True；状态查询传 False（默认），token 过期时由公共流程抛
+            NeedLoginError，状态查询函数捕获后标记 token_expired。
+    重试配置（max_retries/retry_delay）无论 enable_relogin 是否为 True 都从 settings 注入，
+    保持全局一致。settings.json 走内存缓存，无磁盘 IO。
+    """
     phone = account["phone"]
     if not account.get("auth_token") or not account.get("device_id"):
         return None
+    settings = load_settings()
     client = EtAlienClient(
         phone=phone,
         auth_token=account["auth_token"],
-        device_id=account["device_id"]
+        device_id=account["device_id"],
+        password=account.get("password") if enable_relogin else None,
+        on_relogin=_make_relogin_callback(account) if enable_relogin else None,
+        max_retries=settings.get("max_retries", 3),
+        retry_delay=settings.get("retry_delay", 1.0),
     )
     client.user_id = account.get("user_id")
     return client
+
+
+def _make_relogin_callback(account: dict) -> Callable[[str | None, int | None, bool], None]:
+    """创建重登回调闭包，捕获 account 引用以便持久化新 token / 清除密码。
+
+    回调签名：callback(new_token, user_id, clear_password=False)
+    - 密码错误清除密码：clear_password=True
+    - 重登成功持久化新 token：new_token 非空
+    """
+    phone = account["phone"]
+    device_id = account.get("device_id", "")
+
+    def callback(new_token: str | None, user_id: int | None, clear_password: bool = False):
+        if clear_password:
+            _clear_account_password(phone)
+            return
+        if new_token:
+            # 构造 login_result dict 供 _save_login_result 使用
+            login_result = {"authorization": new_token, "user_id": user_id}
+            _save_login_result(phone, login_result, device_id)
+
+    return callback
 
 
 def get_account_status(account: dict) -> dict:
@@ -143,6 +179,7 @@ def get_account_status(account: dict) -> dict:
         info["logged_in"] = True
         try:
             # 4 个接口并发：PC duration + PC ad_config + mobile activity + mobile profile
+            # token 过期时，第一个 result() 即抛 NeedLoginError，跳到 except
             with ThreadPoolExecutor(max_workers=4) as ex:
                 dur_future = ex.submit(client.fetch_pc_duration)
                 tasks_future = ex.submit(client.fetch_pc_ad_config)
@@ -152,41 +189,41 @@ def get_account_status(account: dict) -> dict:
                 tasks_result = tasks_future.result()
                 mob_activity = mob_act_future.result()
                 mob_profile = mob_prof_future.result()
+        except NeedLoginError:
+            info["token_expired"] = True
+            return info
         except Exception:
             logger.exception("get_account_status API call failed for %s", phone)
             return info
-        token_expired = EtAlienClient._is_auth_error(dur)
-        if token_expired:
-            info["token_expired"] = True
+        # 正常路径（未抛异常）下显式标记 token 有效，否则前端无法区分"未登录"和"token 有效"
+        info["token_valid"] = True
+        if not dur.get("_error"):
+            info["vip_duration"] = dur.get("vip_duration_second", 0)
+            info["free_duration"] = dur.get("free_duration_second", 0)
+        if not tasks_result.get("_error"):
+            tasks = tasks_result.get("list", [])
+            total_w = sum(l["watch_cnt"] for l in tasks)
+            total_t = sum(len(l["items"]) for l in tasks)
+            info["progress"] = f"{total_w}/{total_t}"
+            info["tasks"] = tasks
+        # 手机端进度（与 PC 端共用同一 token，token 有效时直接查手机端接口）
+        if not mob_activity.get("_error"):
+            video_cnt = mob_activity.get("video_cnt", 0)
+            user_watch_cnt = mob_activity.get("user_watch_cnt", 0)
+            info["mobile_rewarded_count"] = mob_activity.get("rewarded_count", 0)
+            info["mobile_claimed_count"] = mob_activity.get("claimed_count", 0)
+            # 进度按总任务数统计（含无奖励任务），因领取需按顺序进行
+            # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
+            shown_cnt = min(user_watch_cnt, video_cnt) if video_cnt > 0 else user_watch_cnt
+            info["mobile_progress"] = f"{shown_cnt}/{video_cnt}"
+            info["mobile_tasks"] = mob_activity.get("video_bar", [])
         else:
-            info["token_valid"] = True
-            if not dur.get("_error"):
-                info["vip_duration"] = dur.get("vip_duration_second", 0)
-                info["free_duration"] = dur.get("free_duration_second", 0)
-            if not tasks_result.get("_error"):
-                tasks = tasks_result.get("list", [])
-                total_w = sum(l["watch_cnt"] for l in tasks)
-                total_t = sum(len(l["items"]) for l in tasks)
-                info["progress"] = f"{total_w}/{total_t}"
-                info["tasks"] = tasks
-            # 手机端进度（与 PC 端共用同一 token，token 有效时直接查手机端接口）
-            if not mob_activity.get("_error"):
-                video_cnt = mob_activity.get("video_cnt", 0)
-                user_watch_cnt = mob_activity.get("user_watch_cnt", 0)
-                info["mobile_rewarded_count"] = mob_activity.get("rewarded_count", 0)
-                info["mobile_claimed_count"] = mob_activity.get("claimed_count", 0)
-                # 进度按总任务数统计（含无奖励任务），因领取需按顺序进行
-                # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
-                shown_cnt = min(user_watch_cnt, video_cnt) if video_cnt > 0 else user_watch_cnt
-                info["mobile_progress"] = f"{shown_cnt}/{video_cnt}"
-                info["mobile_tasks"] = mob_activity.get("video_bar", [])
-            else:
-                info["mobile_error"] = True
-            if not mob_profile.get("_error"):
-                info["mobile_duration"] = mob_profile.get("remaining_seconds", 0)
-                info["mobile_not_get_ad_duration"] = mob_profile.get("mobile_not_get_ad_duration", 0)
-            else:
-                info["mobile_error"] = True
+            info["mobile_error"] = True
+        if not mob_profile.get("_error"):
+            info["mobile_duration"] = mob_profile.get("remaining_seconds", 0)
+            info["mobile_not_get_ad_duration"] = mob_profile.get("mobile_not_get_ad_duration", 0)
+        else:
+            info["mobile_error"] = True
     return info
 
 
@@ -221,13 +258,13 @@ def get_account_mobile_status(account: dict) -> dict:
             prof_future = ex.submit(client.fetch_mobile_profile)
             activity = act_future.result()
             profile = prof_future.result()
+    except NeedLoginError:
+        info["token_expired"] = True
+        return info
     except Exception:
         logger.exception("get_account_mobile_status API call failed for %s", phone)
         return info
 
-    if EtAlienClient._is_auth_error(activity) or EtAlienClient._is_auth_error(profile):
-        info["token_expired"] = True
-        return info
     info["token_valid"] = True
 
     if not activity.get("_error"):
@@ -381,19 +418,6 @@ def get_unwatched_count(tasks: list) -> int:
     )
 
 
-def _is_password_incorrect(result: dict) -> bool:
-    """判断服务端返回是否表示密码错误（需清除保存的密码）
-
-    注意：实测"密码格式错误"是输入格式不合规（用户输错），不是保存的密码本身错误，
-    不应触发清除密码，故不放入关键词列表。
-    """
-    if not result.get("_error"):
-        return False
-    msg = result.get("msg", "")
-    # 服务端返回的密码相关错误关键词（"密码格式错误"已排除，见 docstring）
-    return any(kw in msg for kw in ["密码错误", "密码不正确", "password incorrect"])
-
-
 def _clear_account_password(phone: str) -> None:
     """清除账号保存的密码（密码错误时调用，避免反复尝试触发风控）"""
     with accounts_lock:
@@ -406,44 +430,20 @@ def _clear_account_password(phone: str) -> None:
 
 
 def init_client(account: dict) -> tuple[EtAlienClient | None, str]:
-    """初始化客户端，校验 token 有效性。
+    """初始化客户端。不再预检查 token，token 有效性由 API 请求自动检测。
 
     Returns:
-        (client, status): status 为 "ok" / "need_login" / "network_error"
-        - "ok": client 已就绪
-        - "need_login": token 过期且无法密码重登（或无密码、或未登录）
-        - "network_error": token 状态未知（网络/服务端错误，非认证失败）
+        (client, status): status 为 "ok" / "need_login"
+        - "ok": client 已就绪（注入了重登能力，token 过期时由公共流程处理）
+        - "need_login": 未登录（无 auth_token 或 device_id）
     """
     phone = account["phone"]
-    client = get_client_for_account(account)
-
-    if client:
-        token_valid = client.check_token_valid()
-        if token_valid is True:
-            logger.info("  [%s] Token有效，跳过登录", phone)
-            return client, "ok"
-        elif token_valid is False:
-            logger.info("  [%s] Token已过期", phone)
-            password = account.get("password", "")
-            if password:
-                logger.info("  [%s] 检测到已配置密码,尝试密码登录", phone)
-                login_result = client.login_by_password(password)
-                if not login_result.get("_error"):
-                    _save_login_result(phone, login_result, account.get("device_id", ""))
-                    logger.info("  [%s] 密码登录成功,已更新token", phone)
-                    return client, "ok"
-                else:
-                    logger.warning("  [%s] 密码登录失败: %s", phone, login_result.get("msg"))
-                    if _is_password_incorrect(login_result):
-                        _clear_account_password(phone)
-                        logger.info("  [%s] 密码错误,已清除保存的密码", phone)
-            return None, "need_login"
-        else:
-            logger.info("  [%s] Token状态未知（网络/服务端错误），跳过", phone)
-            return None, "network_error"
-    else:
-        logger.info("  [%s] 未找到登录状态", phone)
-        return None, "need_login"
+    client = get_client_for_account(account, enable_relogin=True)
+    if client and client.is_logged_in():
+        logger.info("  [%s] 已登录，token 有效性由首个 API 请求检测", phone)
+        return client, "ok"
+    logger.info("  [%s] 未找到登录状态", phone)
+    return None, "need_login"
 
 
 def _make_claim_result(phone: str, label: str, status: str,
@@ -465,52 +465,22 @@ def _make_claim_result(phone: str, label: str, status: str,
     return result
 
 
-def _try_relogin(client: EtAlienClient, account: dict) -> bool:
-    """领取过程中检测到认证错误时，尝试用保存的密码重新登录。
-
-    成功返回 True（client 的 auth_token 已更新），失败或无密码返回 False。
-    密码错误时清除保存的密码，避免反复尝试触发风控。
-    网络异常时返回 False，让 consecutive_fail 正常计数。
-    """
-    phone = account["phone"]
-    password = account.get("password", "")
-    if not password:
-        logger.warning("  [%s] 领取中token过期,但未配置密码,无法重登", phone)
-        return False
-    logger.info("  [%s] 领取中token过期,尝试密码重登", phone)
-    try:
-        login_result = client.login_by_password(password)
-    except requests.RequestException as e:
-        logger.warning("  [%s] 密码重登网络异常: %s", phone, e)
-        return False
-    if login_result.get("_error"):
-        logger.warning("  [%s] 密码重登失败: %s", phone, login_result.get("msg"))
-        if _is_password_incorrect(login_result):
-            _clear_account_password(phone)
-            logger.info("  [%s] 密码错误,已清除保存的密码", phone)
-        return False
-    _save_login_result(phone, login_result, account.get("device_id", ""))
-    logger.info("  [%s] 密码重登成功,已更新token", phone)
-    return True
-
-
 def _claim_pc_phase(client: EtAlienClient, phone: str,
                     interval: float, max_rounds: int,
                     unwatched_before: int,
-                    progress_entry: dict | None = None,
-                    account: dict | None = None) -> tuple[int, int]:
+                    progress_entry: dict | None = None) -> tuple[int, int]:
     """执行PC加速权益的单阶段领取循环。
 
     优化：每轮只发补发请求，开始/结束各查1次config校准，请求量降约2/3。
     退出条件：local_success>=unwatched_before（领够）/ consecutive_fail>=3（失效）/ round>=max_rounds。
     真实领取数由结束查询的 unwatched 差值确定，比 is_verify 计数更可信。
-    领取中 token 过期时，若 account 提供了 password，会尝试一次密码重登后继续。
+    token 过期由 _post/_get 公共流程自动处理（重登或抛 NeedLoginError），
+    此处只需处理非 auth 错误的失败计数。
     """
     local_success = 0
     total_failed = 0
     consecutive_fail = 0
     round_num = 0
-    relogin_attempted = False  # 领取中仅尝试一次密码重登，避免循环重登
 
     if progress_entry is not None:
         logger.info("  [%s] PC阶段开始: unwatched=%d, entry.current=%d, entry.total=%d",
@@ -524,13 +494,6 @@ def _claim_pc_phase(client: EtAlienClient, phone: str,
         backup_result = client.pc_ad_callback_backup(ad_id=PC_AD_ID, business=PC_BUSINESS)
         if backup_result.get("_error"):
             logger.info("  [%s] PC第%d轮 error: %s", phone, round_num, backup_result.get("msg", ""))
-            # 检测认证错误（401/403/16），尝试密码重登（仅一次）
-            if (account is not None and not relogin_attempted
-                    and EtAlienClient._is_auth_error(backup_result)):
-                relogin_attempted = True
-                if _try_relogin(client, account):
-                    consecutive_fail = 0
-                    continue  # 重登成功，重试下一轮（本轮已消耗）
             total_failed += 1
             consecutive_fail += 1
         elif backup_result.get("is_verify"):
@@ -606,8 +569,7 @@ def _combine_phase_status(phase_results: list[str]) -> str:
 def _claim_mobile_phase(client: EtAlienClient, phone: str,
                         interval: float, max_rounds: int,
                         pending_count: int, watched_before: int,
-                        progress_entry: dict | None = None,
-                        account: dict | None = None) -> tuple[int, int]:
+                        progress_entry: dict | None = None) -> tuple[int, int]:
     """执行手机加速权益的领取循环。
 
     优化：每轮只发补发请求，开始/结束各查1次activity校准，请求量降约2/3。
@@ -616,13 +578,13 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
 
     注意：手机端任务需按顺序领取，无奖励任务也必须领取才能解锁后续有奖励任务，
     因此 pending_count 基于总任务数 video_cnt 计算，而非 rewarded_count。
-    领取中 token 过期时，若 account 提供了 password，会尝试一次密码重登后继续。
+    token 过期由 _post/_get 公共流程自动处理（重登或抛 NeedLoginError），
+    此处只需处理非 auth 错误的失败计数。
     """
     local_success = 0
     total_failed = 0
     consecutive_fail = 0
     round_num = 0
-    relogin_attempted = False  # 领取中仅尝试一次密码重登，避免循环重登
 
     if progress_entry is not None:
         logger.info("  [%s] 手机阶段开始: pending=%d, entry.current=%d, entry.total=%d",
@@ -636,13 +598,6 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
         backup_result = client.pc_ad_callback_backup(ad_id=MOBILE_AD_ID, business=MOBILE_BUSINESS)
         if backup_result.get("_error"):
             logger.info("  [%s] 手机第%d轮 error: %s", phone, round_num, backup_result.get("msg", ""))
-            # 检测认证错误（401/403/16），尝试密码重登（仅一次）
-            if (account is not None and not relogin_attempted
-                    and EtAlienClient._is_auth_error(backup_result)):
-                relogin_attempted = True
-                if _try_relogin(client, account):
-                    consecutive_fail = 0
-                    continue  # 重登成功，重试下一轮（本轮已消耗）
             total_failed += 1
             consecutive_fail += 1
         elif backup_result.get("is_verify"):
@@ -692,8 +647,8 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
 
     client, init_status = init_client(account)
 
-    if not client or not client.is_logged_in():
-        # init_status 为 "need_login" 或 "network_error"，区分 token 过期与网络错误
+    # init_client 不再返回 "network_error"，仅 "ok" / "need_login"
+    if not client:
         return _make_claim_result(phone, label, init_status, progress_entry=progress_entry)
 
     # 累计两阶段的统计
@@ -704,113 +659,141 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
     mobile_before = 0
     mobile_after = 0
     phase_results: list[str] = []  # 每个阶段的 status
+    # 维护 PC 阶段结果，供 except 块附加（避免手机阶段抛 NeedLoginError 时丢失 PC 数据）
+    pc_partial: dict | None = None
 
-    # ============ PC 阶段 ============
-    if claim_target in ("pc", "all"):
-        if progress_entry is not None:
-            progress_entry["phase"] = "pc"
-            progress_entry["current"] = 0
-            progress_entry["total"] = 0
-
-        ad_result = client.fetch_pc_ad_config()
-        if ad_result.get("_error"):
-            logger.warning("  [%s] 获取PC任务失败: %s", phone, ad_result.get('msg'))
-            phase_results.append("error")
-        else:
-            tasks = ad_result.get("list", [])
-            total_unwatched = get_unwatched_count(tasks)
-            total_items = sum(len(level["items"]) for level in tasks)
-
-            # 记录 PC 端初始进度到 progress_entry（后端统计总进度用）
+    try:
+        # ============ PC 阶段 ============
+        if claim_target in ("pc", "all"):
             if progress_entry is not None:
-                progress_entry["pc_initial"] = total_items - total_unwatched
-                progress_entry["pc_total"] = total_items
+                progress_entry["phase"] = "pc"
+                progress_entry["current"] = 0
+                progress_entry["total"] = 0
 
-            dur_before = client.fetch_pc_duration()
-            vip_before = dur_before.get("vip_duration_second", 0) if not dur_before.get("_error") else 0
-
-            if total_unwatched == 0:
-                logger.info("  [%s] PC所有任务已完成, VIP: %s", phone, format_duration(vip_before))
-                vip_after = vip_before
-                if progress_entry is not None:
-                    progress_entry["current"] = 0
-                    progress_entry["total"] = total_items
-                phase_results.append("already_done")
+            ad_result = client.fetch_pc_ad_config()
+            if ad_result.get("_error"):
+                logger.warning("  [%s] 获取PC任务失败: %s", phone, ad_result.get('msg'))
+                phase_results.append("error")
             else:
-                logger.info("  [%s] PC开始领取, 待完成: %s, VIP: %s",
-                            phone, total_unwatched, format_duration(vip_before))
+                tasks = ad_result.get("list", [])
+                total_unwatched = get_unwatched_count(tasks)
+                total_items = sum(len(level["items"]) for level in tasks)
+
+                # 记录 PC 端初始进度到 progress_entry（后端统计总进度用）
                 if progress_entry is not None:
-                    progress_entry["vip_before"] = vip_before
-                    if progress_entry.get("total", 0) == 0 and total_items > 0:
+                    progress_entry["pc_initial"] = total_items - total_unwatched
+                    progress_entry["pc_total"] = total_items
+
+                dur_before = client.fetch_pc_duration()
+                vip_before = dur_before.get("vip_duration_second", 0) if not dur_before.get("_error") else 0
+
+                if total_unwatched == 0:
+                    logger.info("  [%s] PC所有任务已完成, VIP: %s", phone, format_duration(vip_before))
+                    vip_after = vip_before
+                    if progress_entry is not None:
+                        progress_entry["current"] = 0
                         progress_entry["total"] = total_items
+                    phase_results.append("already_done")
+                else:
+                    logger.info("  [%s] PC开始领取, 待完成: %s, VIP: %s",
+                                phone, total_unwatched, format_duration(vip_before))
+                    if progress_entry is not None:
+                        progress_entry["vip_before"] = vip_before
+                        if progress_entry.get("total", 0) == 0 and total_items > 0:
+                            progress_entry["total"] = total_items
 
-                pc_claimed, pc_failed = _claim_pc_phase(client, phone, interval, max_rounds, total_unwatched, progress_entry, account)
-                total_claimed += pc_claimed
-                total_failed += pc_failed
+                    pc_claimed, pc_failed = _claim_pc_phase(client, phone, interval, max_rounds, total_unwatched, progress_entry)
+                    total_claimed += pc_claimed
+                    total_failed += pc_failed
 
-                dur_after = client.fetch_pc_duration()
-                vip_after = dur_after.get("vip_duration_second", 0) if not dur_after.get("_error") else vip_before
-                logger.info("  [%s] PC领取完成, VIP: %s -> %s (+%s)",
-                            phone, format_duration(vip_before), format_duration(vip_after),
-                            format_duration(vip_after - vip_before))
-                phase_results.append(_calculate_final_status(pc_claimed, pc_failed))
+                    dur_after = client.fetch_pc_duration()
+                    vip_after = dur_after.get("vip_duration_second", 0) if not dur_after.get("_error") else vip_before
+                    logger.info("  [%s] PC领取完成, VIP: %s -> %s (+%s)",
+                                phone, format_duration(vip_before), format_duration(vip_after),
+                                format_duration(vip_after - vip_before))
+                    phase_results.append(_calculate_final_status(pc_claimed, pc_failed))
 
-    # ============ Mobile 阶段 ============
-    if claim_target in ("mobile", "all"):
-        if progress_entry is not None:
-            # 保存 PC 阶段的领取数（进入手机阶段后 current 会被重置）
-            progress_entry["pc_claimed"] = progress_entry.get("current", 0)
-            progress_entry["phase"] = "mobile"
-            progress_entry["current"] = 0
-            progress_entry["total"] = 0
+            # PC 阶段完成后记录已领取数据，供 except 块附加
+            pc_partial = {
+                "pc_claimed": total_claimed,
+                "pc_failed": total_failed,
+                "vip_before": vip_before,
+                "vip_after": vip_after,
+                "phase_status": phase_results[-1] if phase_results else None,
+            }
 
-        activity = client.fetch_mobile_ad_activity()
-        if activity.get("_error"):
-            logger.warning("  [%s] 获取手机端任务失败: %s", phone, activity.get('msg'))
-            phase_results.append("error")
-        else:
-            # 手机端任务需按顺序领取，无奖励任务也必须领取才能解锁后续有奖励任务
-            # 因此 pending 基于总任务数 video_cnt 和已观看数 user_watch_cnt 计算
-            video_cnt = activity.get("video_cnt", 0)
-            watched_before = activity.get("user_watch_cnt", 0)
-
-            # 记录手机端初始进度到 progress_entry（后端统计总进度用）
-            # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
-            # 与 get_account_status/get_account_mobile_status 的 shown_cnt 口径一致，避免总进度超过 100%
+        # ============ Mobile 阶段 ============
+        if claim_target in ("mobile", "all"):
             if progress_entry is not None:
-                progress_entry["mobile_initial"] = min(watched_before, video_cnt) if video_cnt > 0 else watched_before
-                progress_entry["mobile_total"] = video_cnt
+                # 保存 PC 阶段的领取数（进入手机阶段后 current 会被重置）
+                progress_entry["pc_claimed"] = progress_entry.get("current", 0)
+                progress_entry["phase"] = "mobile"
+                progress_entry["current"] = 0
+                progress_entry["total"] = 0
 
-            profile_before = client.fetch_mobile_profile()
-            mobile_before = profile_before.get("remaining_seconds", 0) if not profile_before.get("_error") else 0
-
-            if video_cnt == 0 or watched_before >= video_cnt:
-                logger.info("  [%s] 手机端所有任务已完成, 加速时长: %s",
-                            phone, format_duration(mobile_before))
-                mobile_after = mobile_before
-                if progress_entry is not None:
-                    progress_entry["current"] = 0
-                    progress_entry["total"] = video_cnt
-                phase_results.append("already_done")
+            activity = client.fetch_mobile_ad_activity()
+            if activity.get("_error"):
+                logger.warning("  [%s] 获取手机端任务失败: %s", phone, activity.get('msg'))
+                phase_results.append("error")
             else:
-                logger.info("  [%s] 手机端开始领取, 已观看: %s/%s, 加速时长: %s",
-                            phone, watched_before, video_cnt, format_duration(mobile_before))
+                # 手机端任务需按顺序领取，无奖励任务也必须领取才能解锁后续有奖励任务
+                # 因此 pending 基于总任务数 video_cnt 和已观看数 user_watch_cnt 计算
+                video_cnt = activity.get("video_cnt", 0)
+                watched_before = activity.get("user_watch_cnt", 0)
+
+                # 记录手机端初始进度到 progress_entry（后端统计总进度用）
+                # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
+                # 与 get_account_status/get_account_mobile_status 的 shown_cnt 口径一致，避免总进度超过 100%
                 if progress_entry is not None:
-                    progress_entry["vip_before"] = mobile_before
-                    if progress_entry.get("total", 0) == 0 and video_cnt > 0:
+                    progress_entry["mobile_initial"] = min(watched_before, video_cnt) if video_cnt > 0 else watched_before
+                    progress_entry["mobile_total"] = video_cnt
+
+                profile_before = client.fetch_mobile_profile()
+                mobile_before = profile_before.get("remaining_seconds", 0) if not profile_before.get("_error") else 0
+
+                if video_cnt == 0 or watched_before >= video_cnt:
+                    logger.info("  [%s] 手机端所有任务已完成, 加速时长: %s",
+                                phone, format_duration(mobile_before))
+                    mobile_after = mobile_before
+                    if progress_entry is not None:
+                        progress_entry["current"] = 0
                         progress_entry["total"] = video_cnt
+                    phase_results.append("already_done")
+                else:
+                    logger.info("  [%s] 手机端开始领取, 已观看: %s/%s, 加速时长: %s",
+                                phone, watched_before, video_cnt, format_duration(mobile_before))
+                    if progress_entry is not None:
+                        progress_entry["vip_before"] = mobile_before
+                        if progress_entry.get("total", 0) == 0 and video_cnt > 0:
+                            progress_entry["total"] = video_cnt
 
-                pending = video_cnt - watched_before
-                mob_claimed, mob_failed = _claim_mobile_phase(client, phone, interval, mob_max_rounds, pending, watched_before, progress_entry, account)
-                total_claimed += mob_claimed
-                total_failed += mob_failed
+                    pending = video_cnt - watched_before
+                    mob_claimed, mob_failed = _claim_mobile_phase(client, phone, interval, mob_max_rounds, pending, watched_before, progress_entry)
+                    total_claimed += mob_claimed
+                    total_failed += mob_failed
 
-                profile_after = client.fetch_mobile_profile()
-                mobile_after = profile_after.get("remaining_seconds", mobile_before) if not profile_after.get("_error") else mobile_before
-                logger.info("  [%s] 手机端领取完成, 加速时长: %s -> %s (+%s)",
-                            phone, format_duration(mobile_before), format_duration(mobile_after),
-                            format_duration(mobile_after - mobile_before))
-                phase_results.append(_calculate_final_status(mob_claimed, mob_failed))
+                    profile_after = client.fetch_mobile_profile()
+                    mobile_after = profile_after.get("remaining_seconds", mobile_before) if not profile_after.get("_error") else mobile_before
+                    logger.info("  [%s] 手机端领取完成, 加速时长: %s -> %s (+%s)",
+                                phone, format_duration(mobile_before), format_duration(mobile_after),
+                                format_duration(mobile_after - mobile_before))
+                    phase_results.append(_calculate_final_status(mob_claimed, mob_failed))
+
+    except NeedLoginError as e:
+        # token 过期且无法重登（无密码/密码错误/已重登过仍失败）
+        logger.info("[%s] 领取中 token 失效且无法重登: %s", phone, e)
+        result = _make_claim_result(phone, label, "need_login", progress_entry=progress_entry)
+        # 若 PC 阶段已成功，附加其结果避免丢失已领取数据（前端不解析，仅用于日志/调试）
+        if pc_partial is not None:
+            result["pc_partial"] = pc_partial
+        return result
+    except requests.RequestException as e:
+        # 网络异常（重试 max_retries 次后仍失败）
+        logger.warning("[%s] 领取中网络异常: %s", phone, e)
+        result = _make_claim_result(phone, label, "network_error", progress_entry=progress_entry)
+        if pc_partial is not None:
+            result["pc_partial"] = pc_partial
+        return result
 
     # ============ 汇总 ============
     # 整体状态综合判定（规则见 _combine_phase_status）

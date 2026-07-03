@@ -1,7 +1,7 @@
 import logging
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -12,8 +12,27 @@ import error_pb2
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 2
-RETRY_DELAY = 1.0
+
+class NeedLoginError(Exception):
+    """token 过期且无法重登（无密码、密码错误、或已尝试过重登）时抛出。
+
+    由 _post/_get 在检测到 auth error 且无法恢复时抛出，
+    claim_for_account 捕获后返回 "need_login" 状态。
+    """
+    pass
+
+
+def _is_password_incorrect(result: dict) -> bool:
+    """判断服务端返回是否表示密码错误（需清除保存的密码）
+
+    注意：实测"密码格式错误"是输入格式不合规（用户输错），不是保存的密码本身错误，
+    不应触发清除密码，故不放入关键词列表。
+    """
+    if not result.get("_error"):
+        return False
+    msg = result.get("msg", "")
+    # 服务端返回的密码相关错误关键词（"密码格式错误"已排除，见 docstring）
+    return any(kw in msg for kw in ["密码错误", "密码不正确", "password incorrect"])
 
 
 class EtAlienClient:
@@ -24,11 +43,24 @@ class EtAlienClient:
     def generate_device_id() -> str:
         return uuid.uuid4().hex[:25]
 
-    def __init__(self, phone: str, auth_token: str | None = None, device_id: str | None = None):
+    def __init__(self, phone: str, auth_token: str | None = None, device_id: str | None = None,
+                 password: str | None = None,
+                 on_relogin: Callable[[str | None, int | None, bool], None] | None = None,
+                 max_retries: int = 3,
+                 retry_delay: float = 1.0):
         self.phone = phone
         self.auth_token = auth_token
         self.user_id: int | None = None
         self.device_id = device_id or self.generate_device_id()
+
+        # token 过期自动重登能力（可选，仅领取流程注入）
+        self._password = password
+        self._on_relogin = on_relogin   # 回调：持久化新 token / 清除密码
+        self._relogin_attempted = False  # 防止循环重登
+
+        # 重试机制配置（从 settings.json 注入）
+        self._max_retries = max_retries
+        self._retry_delay = retry_delay
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -48,7 +80,7 @@ class EtAlienClient:
 
     def _request_with_retry(self, method: str, url: str, data: bytes | None = None, timeout: int = 30, retry_on_500: bool = True) -> tuple[int, bytes]:
         last_exc = None
-        for attempt in range(MAX_RETRIES + 1):
+        for attempt in range(self._max_retries + 1):
             try:
                 if method == "POST":
                     resp = self.session.post(url, data=data, timeout=timeout)
@@ -56,30 +88,107 @@ class EtAlienClient:
                     resp = self.session.get(url, data=data, timeout=timeout)
                 # 密码登录等业务接口在参数错误时也会返回 500（实测 code=500 的业务错误），
                 # 这类响应不应重试，由调用方通过 retry_on_500=False 关闭
-                if resp.status_code >= 500 and retry_on_500 and attempt < MAX_RETRIES:
-                    logger.warning("服务端错误 %d(第%d次)，%0.1fs后重试", resp.status_code, attempt + 1, RETRY_DELAY)
-                    time.sleep(RETRY_DELAY)
+                if resp.status_code >= 500 and retry_on_500 and attempt < self._max_retries:
+                    logger.warning("服务端错误 %d(第%d次)，%0.1fs后重试", resp.status_code, attempt + 1, self._retry_delay)
+                    time.sleep(self._retry_delay)
                     continue
                 return resp.status_code, resp.content
             except requests.ConnectionError as e:
                 last_exc = e
-                if attempt < MAX_RETRIES:
-                    logger.warning("请求失败(第%d次)，%0.1fs后重试: %s", attempt + 1, RETRY_DELAY, e)
-                    time.sleep(RETRY_DELAY)
+                if attempt < self._max_retries:
+                    logger.warning("请求失败(第%d次)，%0.1fs后重试: %s", attempt + 1, self._retry_delay, e)
+                    time.sleep(self._retry_delay)
             except requests.Timeout as e:
                 last_exc = e
-                if attempt < MAX_RETRIES:
-                    logger.warning("请求超时(第%d次)，%0.1fs后重试: %s", attempt + 1, RETRY_DELAY, e)
-                    time.sleep(RETRY_DELAY)
+                if attempt < self._max_retries:
+                    logger.warning("请求超时(第%d次)，%0.1fs后重试: %s", attempt + 1, self._retry_delay, e)
+                    time.sleep(self._retry_delay)
         raise last_exc
 
-    def _post(self, path: str, body: bytes | None = None, query: dict | None = None, retry_on_500: bool = True) -> tuple[int, bytes]:
+    def _post(self, path: str, body: bytes | None = None, query: dict | None = None, retry_on_500: bool = True) -> dict[str, Any]:
         url = self._build_url("POST", path, query)
-        return self._request_with_retry("POST", url, data=body, retry_on_500=retry_on_500)
+        status_code, data = self._request_with_retry("POST", url, data=body, retry_on_500=retry_on_500)
+        result = self._parse_response(status_code, data)
+        # token 过期自动重登重试
+        if self._is_auth_error(result):
+            result = self._handle_auth_error_and_retry("POST", url, body, query, retry_on_500)
+        return result
 
-    def _get(self, path: str, query: dict | None = None, body: bytes | None = None, retry_on_500: bool = True) -> tuple[int, bytes]:
+    def _get(self, path: str, query: dict | None = None, body: bytes | None = None, retry_on_500: bool = True) -> dict[str, Any]:
         url = self._build_url("GET", path, query)
-        return self._request_with_retry("GET", url, data=body, retry_on_500=retry_on_500)
+        status_code, data = self._request_with_retry("GET", url, data=body, retry_on_500=retry_on_500)
+        result = self._parse_response(status_code, data)
+        if self._is_auth_error(result):
+            result = self._handle_auth_error_and_retry("GET", url, body, query, retry_on_500)
+        return result
+
+    def _handle_auth_error_and_retry(self, method: str, url: str,
+                                      body: bytes | None, query: dict | None,
+                                      retry_on_500: bool) -> dict[str, Any]:
+        """token 过期时的公共处理流程。
+
+        1. 无密码或已重登过 → 抛 NeedLoginError
+        2. 密码重登失败 → 抛 NeedLoginError（密码错误时回调清除密码）
+        3. 重登成功 → 持久化新 token → 重试原请求
+        """
+        if not self._password:
+            logger.info("[%s] token 过期，未配置密码，无法重登", self.phone)
+            raise NeedLoginError(f"{self.phone}: token expired, no password")
+
+        if self._relogin_attempted:
+            # 触发场景有二，均不再重复重登：
+            #   (1) 之前已重登过（无论成功/失败），后续其他 API 请求又收到 auth error
+            #   (2) 重登请求本身返回 auth error（重登走 _post 递归进入此分支）
+            logger.warning("[%s] token 过期，重登已尝试过（不再重复重登）", self.phone)
+            raise NeedLoginError(f"{self.phone}: relogin already attempted")
+
+        self._relogin_attempted = True
+        logger.info("[%s] token 过期，尝试密码重登", self.phone)
+
+        # 重登请求走 _post → _request_with_retry，享有 Layer 1 的本地重试兜底（网络异常/超时）
+        # 注意：login_by_password 传 retry_on_500=False，HTTP 500 不重试（密码错误的 500 是业务错误）
+        try:
+            login_result = self.login_by_password(self._password)
+        except requests.RequestException as e:
+            # 重登请求重试后仍网络异常，放弃重登
+            logger.warning("[%s] 密码重登网络异常（已重试 %d 次）: %s", self.phone, self._max_retries, e)
+            raise NeedLoginError(f"{self.phone}: relogin network error")
+
+        if login_result.get("_error"):
+            logger.warning("[%s] 密码重登失败: %s", self.phone, login_result.get("msg"))
+            # 密码错误时清除保存的密码（通过回调）
+            if self._on_relogin and _is_password_incorrect(login_result):
+                try:
+                    self._on_relogin(new_token=None, user_id=None, clear_password=True)
+                    logger.info("[%s] 密码错误，已清除保存的密码", self.phone)
+                except Exception:
+                    # 回调失败时密码未清除，日志需明确说明"未清除"以免误导
+                    logger.exception("[%s] 密码错误，但清除密码回调失败，密码未清除", self.phone)
+            raise NeedLoginError(f"{self.phone}: relogin failed")
+
+        # 重登成功：login_by_password 内部已更新 self.auth_token / self.user_id，
+        # 并同步到 session.headers["Authorization"]
+        # 这里通过回调持久化新 token 到 accounts.json
+        if self._on_relogin:
+            try:
+                self._on_relogin(new_token=self.auth_token, user_id=self.user_id)
+            except Exception:
+                # 回调异常（如文件写入失败）不应阻断重登后的重试流程
+                # token 已在 session.headers 中，重试仍可进行
+                logger.exception("[%s] 持久化新 token 回调异常", self.phone)
+        logger.info("[%s] 密码重登成功，重试原请求", self.phone)
+
+        # 重试原请求（新 token 已在 session.headers 中）
+        # 重试请求走 _request_with_retry，即重登后的请求同样享有"本地原因 3 次重试"兜底
+        status_code, data = self._request_with_retry(method, url, data=body, retry_on_500=retry_on_500)
+        result = self._parse_response(status_code, data)
+
+        # 防无限重试：重登后重试的原请求若仍返回 auth error，不再重登，直接抛异常
+        if self._is_auth_error(result):
+            logger.warning("[%s] 重登后重试请求仍返回 auth error，放弃", self.phone)
+            raise NeedLoginError(f"{self.phone}: auth error persists after relogin")
+
+        return result
 
     def _parse_protobuf_error(self, data: bytes) -> dict[str, Any] | None:
         try:
@@ -125,28 +234,12 @@ class EtAlienClient:
             return True
         return False
 
-    def check_token_valid(self) -> bool | None:
-        if not self.auth_token:
-            return False
-        try:
-            result = self.fetch_pc_duration()
-        except Exception:
-            logger.warning("check_token_valid: network error for %s", self.phone)
-            return None
-        if self._is_auth_error(result):
-            return False
-        if result.get("_error"):
-            logger.warning("check_token_valid: server error for %s: %s", self.phone, result.get("msg"))
-            return None
-        return True
-
     def get_login_code(self, phone: str | None = None) -> dict[str, Any]:
         phone = phone or self.phone
         formatted = self._format_phone(phone)
         req = account_pb2.GetLoginVerificationCodeRequest()
         req.phone_number = formatted
-        status_code, data = self._get("/account/v1/get_login_verification_code", body=req.SerializeToString())
-        return self._parse_response(status_code, data)
+        return self._get("/account/v1/get_login_verification_code", body=req.SerializeToString())
 
     def login_by_code(self, code: str, phone: str | None = None) -> dict[str, Any]:
         phone = phone or self.phone
@@ -155,11 +248,10 @@ class EtAlienClient:
         req.phone_number = formatted
         req.verification_code = code
 
-        status_code, data = self._post(
+        result = self._post(
             "/account/v1/login",
             body=req.SerializeToString(),
         )
-        result = self._parse_response(status_code, data)
 
         if not result.get("_error"):
             try:
@@ -187,8 +279,7 @@ class EtAlienClient:
         body = req.SerializeToString()
 
         # 密码登录接口对参数/业务错误也返回 500（实测 code=500），不应重试，否则用户要等 ~3s 才看到提示
-        status_code, data = self._post("/v2/account/login", body=body, retry_on_500=False)
-        result = self._parse_response(status_code, data)
+        result = self._post("/v2/account/login", body=body, retry_on_500=False)
 
         if not result.get("_error"):
             try:
@@ -208,8 +299,7 @@ class EtAlienClient:
 
     def fetch_pc_ad_config(self) -> dict[str, Any]:
         req = apiv2_pb2.PcAdConfigRequest()
-        status_code, data = self._post("/v2/account/pc/ad/config", body=req.SerializeToString())
-        result = self._parse_response(status_code, data)
+        result = self._post("/v2/account/pc/ad/config", body=req.SerializeToString())
 
         if not result.get("_error"):
             try:
@@ -253,8 +343,7 @@ class EtAlienClient:
 
     def fetch_pc_duration(self) -> dict[str, Any]:
         req = apiv2_pb2.GetUserRemainDurationRequest()
-        status_code, data = self._post("/v2/account/remain/duration", body=req.SerializeToString())
-        result = self._parse_response(status_code, data)
+        result = self._post("/v2/account/remain/duration", body=req.SerializeToString())
 
         if not result.get("_error"):
             try:
@@ -288,8 +377,7 @@ class EtAlienClient:
         req = apiv2_pb2.PcAdCallbackBackupRequest()
         req.ad_id = ad_id
         req.business = business
-        status_code, data = self._post("/v2/account/pc/ad/callback/backup", body=req.SerializeToString())
-        result = self._parse_response(status_code, data)
+        result = self._post("/v2/account/pc/ad/callback/backup", body=req.SerializeToString())
 
         if not result.get("_error"):
             try:
@@ -317,8 +405,7 @@ class EtAlienClient:
                 - rewarded_count: 有奖励的任务数（has_award=True）
                 - claimed_count: 已领取奖励的任务数（has_award=True 且 is_get=True）
         """
-        status_code, data = self._get("/award/v1/ad/activity")
-        result = self._parse_response(status_code, data)
+        result = self._get("/award/v1/ad/activity")
 
         if not result.get("_error"):
             try:
@@ -366,8 +453,7 @@ class EtAlienClient:
                 - mobile_not_get_ad_duration: 今日未领取广告时长（小时）
                 - remaining_seconds: 加速时长余额（秒，由 member.expire_time 计算）
         """
-        status_code, data = self._get("/account/v1/my_profile")
-        result = self._parse_response(status_code, data)
+        result = self._get("/account/v1/my_profile")
 
         if not result.get("_error"):
             try:

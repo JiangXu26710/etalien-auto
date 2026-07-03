@@ -3,7 +3,7 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-from core.config import load_accounts, load_settings, CONFIG_DIR
+from core.config import load_accounts, reload_settings, CONFIG_DIR
 from core.notify import send_claim_notification
 from core.service import run_concurrent_claim, format_duration
 
@@ -36,7 +36,7 @@ def main(auto_close: bool = False):
     logger = logging.getLogger(__name__)
     logger.info("日志文件: %s", log_file)
 
-    settings = load_settings()
+    settings = reload_settings()
     accounts = load_accounts()
     enabled = [a for a in accounts if a.get("enabled", True)]
 

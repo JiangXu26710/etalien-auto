@@ -9,7 +9,7 @@ from typing import Any
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
-from core.config import load_accounts, save_accounts, load_settings, save_settings, validate_settings, accounts_lock
+from core.config import load_accounts, save_accounts, load_settings, save_settings, reload_settings, validate_settings, accounts_lock
 from core.service import validate_phone, claim_for_account, run_concurrent_claim, send_login_code, verify_login, get_all_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule
 
 logger = logging.getLogger(__name__)
@@ -320,7 +320,8 @@ def start_claim():
     if not claim_mgr.start():
         return jsonify({"error": "领取正在进行中"}), 400
 
-    settings = load_settings()
+    # 领取前显式刷新 settings 缓存，确保使用最新配置（用户可能在领取前刚改过设置）
+    settings = reload_settings()
     accounts = load_accounts()
     enabled = [a for a in accounts if a.get("enabled", True)]
 
@@ -344,7 +345,8 @@ def get_claim_progress():
 
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
-    return jsonify(load_settings())
+    # 打开设置页时刷新缓存，应对外部手动编辑 settings.json 后的缓存过期
+    return jsonify(reload_settings())
 
 
 @app.route("/api/settings", methods=["PUT"])

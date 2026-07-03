@@ -163,6 +163,7 @@ logger = logging.getLogger(__name__)
 
 import webview
 import gui.api as gui_api
+from core.config import reload_settings
 from werkzeug.serving import make_server
 
 
@@ -242,6 +243,9 @@ def find_available_port(start_port: int = 52137, max_port: int = 52200) -> int:
 
 def main():
     logger.info("正在启动...")
+
+    # 初始化 settings 缓存（整个进程生命周期内首次读取）
+    reload_settings()
 
     # 查找可用端口
     try:
