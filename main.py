@@ -18,11 +18,15 @@ EXIT_NETWORK_ERROR = 5
 def _setup_logging(log_file: str | None = None):
     handlers = [logging.StreamHandler(sys.stderr)]
     if log_file:
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        # 按大小轮转：5MB 一份，保留 3 个备份，避免计划任务长期运行后日志无限增长
-        handlers.append(RotatingFileHandler(
-            log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-        ))
+        try:
+            os.makedirs(os.path.dirname(log_file), exist_ok=True)
+            # 按大小轮转：5MB 一份，保留 3 个备份，避免计划任务长期运行后日志无限增长
+            handlers.append(RotatingFileHandler(
+                log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+            ))
+        except OSError as e:
+            # 日志目录创建/文件打开失败时 fallback 到仅 stderr，避免启动失败
+            print(f"[WARN] 无法初始化日志文件 {log_file}: {e}", file=sys.stderr)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",

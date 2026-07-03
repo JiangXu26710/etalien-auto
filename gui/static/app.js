@@ -73,10 +73,19 @@ function pickClaimSelect(id, value, label, btn) {
 }
 
 function escapeHtml(str) {
-    return str.replace(/[&<>"']/g, c => ({
+    return str.replace(/[&<>"'`]/g, c => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;',
-        '"': '&quot;', "'": '&#39;'
+        '"': '&quot;', "'": '&#39;', '`': '&#96;'
     })[c]);
+}
+
+// 用于在 HTML 内联事件属性（如 onclick="fn(${jsStr(x)})"）中安全传递 JS 字符串字面量。
+// escapeHtml 仅防御 HTML 层面注入，无法防御浏览器实体解码后的 JS 字符串字面量破坏
+// （如 phone 含 ' 会先变 &#39; 再被浏览器解码回 '，破坏 onclick 中的单引号字符串）。
+// JSON.stringify 先把 JS 字符串转成带双引号的合法字面量（处理 \、引号、换行等），
+// 再用 escapeHtml 防止双引号闭合 HTML 属性。输出已含外层双引号，调用处不要再加引号。
+function jsStr(s) {
+    return escapeHtml(JSON.stringify(String(s)));
 }
 
 // 登录表单格式校验（规则与后端/服务端 protobuf 字段校验对齐，避免不友好请求往返）
@@ -554,15 +563,15 @@ function renderAccounts(statusList) {
 
             let actionsHtml = '';
             if (!s.logged_in || s.token_expired) {
-                actionsHtml = `<button class="btn-small" onclick="showLogin('${escapeHtml(s.phone)}')">登录</button>`;
+                actionsHtml = `<button class="btn-small" onclick="showLogin(${jsStr(s.phone)})">登录</button>`;
             }
             actionsHtml += `
             <div class="action-menu-wrap" data-phone="${escapeHtml(s.phone)}">
                 <button class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this)">⋯</button>
                 <div class="action-menu">
-                    <button class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu('${escapeHtml(s.phone)}', ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
-                    <button class="action-menu-item" onclick="showEditAccount('${escapeHtml(s.phone)}')">编辑</button>
-                    <button class="action-menu-item action-menu-danger" onclick="deleteAccount('${escapeHtml(s.phone)}')">删除</button>
+                    <button class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
+                    <button class="action-menu-item" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
+                    <button class="action-menu-item action-menu-danger" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
                 </div>
             </div>`;
 
@@ -754,10 +763,10 @@ async function doAddAccountStep1() {
                     <input type="text" id="addLoginCode" placeholder="请输入收到的验证码" maxlength="6">
                 </div>
                 <div class="modal-actions">
-                    <button class="btn-modal btn-modal-cancel" id="btnResendAdd" style="display:none" onclick="resendLoginCode('${escapeHtml(phone)}', 'btnResendAdd')">重新获取</button>
-                    <button class="btn-modal btn-modal-cancel" onclick="cancelAddAccount('${escapeHtml(phone)}')">取消</button>
-                    <button class="btn-modal btn-modal-primary" id="btnGetCodeAdd" onclick="sendLoginCode('${escapeHtml(phone)}', 'btnGetCodeAdd', 'btnLoginAdd', 'btnResendAdd')">获取</button>
-                    <button class="btn-modal btn-modal-primary" id="btnLoginAdd" style="display:none" onclick="doAddAccountStep2('${escapeHtml(phone)}')">登录</button>
+                    <button class="btn-modal btn-modal-cancel" id="btnResendAdd" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendAdd')">重新获取</button>
+                    <button class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
+                    <button class="btn-modal btn-modal-primary" id="btnGetCodeAdd" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeAdd', 'btnLoginAdd', 'btnResendAdd')">获取</button>
+                    <button class="btn-modal btn-modal-primary" id="btnLoginAdd" style="display:none" onclick="doAddAccountStep2(${jsStr(phone)})">登录</button>
                 </div>
             </div>
             <div class="login-form-panel" id="add-pwd-panel">
@@ -767,8 +776,8 @@ async function doAddAccountStep1() {
                     <input type="password" id="addLoginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码">
                 </div>
                 <div class="modal-actions">
-                    <button class="btn-modal btn-modal-cancel" onclick="cancelAddAccount('${escapeHtml(phone)}')">取消</button>
-                    <button class="btn-modal btn-modal-primary" onclick="doAddAccountStep2Pwd('${escapeHtml(phone)}')">登录</button>
+                    <button class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
+                    <button class="btn-modal btn-modal-primary" onclick="doAddAccountStep2Pwd(${jsStr(phone)})">登录</button>
                 </div>
             </div>
         `, true);
@@ -1040,7 +1049,7 @@ function showEditAccount(phone) {
             </div>
             <div class="modal-actions">
                 <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" onclick="doEditAccount('${escapeHtml(phone)}')">保存</button>
+                <button class="btn-modal btn-modal-primary" onclick="doEditAccount(${jsStr(phone)})">保存</button>
             </div>
         `, true);
 
@@ -1086,7 +1095,7 @@ async function deleteAccount(phone) {
         <p style="color:var(--text-muted);font-size:12px">此操作不可撤销</p>
         <div class="modal-actions">
             <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-            <button class="btn-modal btn-modal-danger" onclick="doDeleteAccount('${escapeHtml(phone)}')">删除</button>
+            <button class="btn-modal btn-modal-danger" onclick="doDeleteAccount(${jsStr(phone)})">删除</button>
         </div>
     `);
 }
@@ -1151,10 +1160,10 @@ function showLogin(phone) {
                 <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6">
             </div>
             <div class="modal-actions">
-                <button class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode('${escapeHtml(phone)}', 'btnResendLogin')">重新获取</button>
+                <button class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
                 <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" id="btnGetCodeLogin" onclick="sendLoginCode('${escapeHtml(phone)}', 'btnGetCodeLogin', 'btnLoginVerify', 'btnResendLogin')">获取</button>
-                <button class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify('${escapeHtml(phone)}')">登录</button>
+                <button class="btn-modal btn-modal-primary" id="btnGetCodeLogin" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeLogin', 'btnLoginVerify', 'btnResendLogin')">获取</button>
+                <button class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify(${jsStr(phone)})">登录</button>
             </div>
         </div>
         <div class="login-form-panel" id="login-pwd-panel">
@@ -1165,7 +1174,7 @@ function showLogin(phone) {
             </div>
             <div class="modal-actions">
                 <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" onclick="doVerifyPwd('${escapeHtml(phone)}')">登录</button>
+                <button class="btn-modal btn-modal-primary" onclick="doVerifyPwd(${jsStr(phone)})">登录</button>
             </div>
         </div>
     `);
@@ -1245,9 +1254,14 @@ async function startClaim() {
 function pollClaimProgress() {
     if (claimPollTimer) clearTimeout(claimPollTimer);
 
+    // 连续失败计数：超过阈值后停止轮询，避免后端持续失败时前端卡死在"领取中"
+    let pollFailCount = 0;
+    const POLL_MAX_FAIL = 10;
+
     async function _poll() {
         try {
             const data = await api('/api/claim/progress');
+            pollFailCount = 0;
             const logList = document.getElementById('logList');
 
             // 总进度：直接采用后端聚合（PC + 手机端，含各端 initial + 本次领取增量）
@@ -1339,7 +1353,22 @@ function pollClaimProgress() {
                 claimPollTimer = setTimeout(_poll, 1000);
             }
         } catch (e) {
-            claimPollTimer = setTimeout(_poll, 1000);
+            pollFailCount += 1;
+            if (pollFailCount >= POLL_MAX_FAIL) {
+                claimPollTimer = null;
+                const statusEl = document.getElementById('claimStatus');
+                if (statusEl) {
+                    statusEl.textContent = '领取状态查询失败，请刷新页面';
+                    statusEl.style.animation = 'none';
+                }
+                const btn = document.getElementById('btnClaim');
+                btn.disabled = false;
+                btn.textContent = '开始领取';
+                btn.onclick = startClaim;
+                showToast('领取状态查询连续失败，已停止轮询，请刷新页面', 'error');
+            } else {
+                claimPollTimer = setTimeout(_poll, 1000);
+            }
         }
     }
 

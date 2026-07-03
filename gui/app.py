@@ -237,6 +237,7 @@ def find_available_port(start_port: int = 52137, max_port: int = 52200) -> int:
             sock.close()
             return port
         except OSError:
+            sock.close()
             continue
     raise RuntimeError(f"无法在端口范围 {start_port}-{max_port} 中找到可用端口")
 

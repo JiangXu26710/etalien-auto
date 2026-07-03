@@ -14,6 +14,9 @@ from core.service import validate_phone, claim_for_account, run_concurrent_claim
 
 logger = logging.getLogger(__name__)
 
+# 敏感字段过滤列表：禁止下发给前端，防止 auth_token / user_id / password 泄露。
+SENSITIVE_FIELDS = ("auth_token", "user_id", "saved_at", "password")
+
 
 def _translate_login_error(result: dict, scene: str) -> str:
     """转译登录错误为用户友好提示。
@@ -144,7 +147,7 @@ def get_accounts():
     accounts.sort(key=lambda a: a.get("phone", ""))
     filtered_accounts = []
     for account in accounts:
-        filtered = {k: v for k, v in account.items() if k not in ["auth_token", "user_id", "saved_at", "password"]}
+        filtered = {k: v for k, v in account.items() if k not in SENSITIVE_FIELDS}
         filtered_accounts.append(filtered)
     return jsonify({"accounts": filtered_accounts})
 
@@ -155,7 +158,7 @@ def get_account(phone):
     for a in accounts:
         if a["phone"] == phone:
             # 过滤敏感字段（与 /api/accounts 保持一致，防止 password 泄露给前端）
-            filtered = {k: v for k, v in a.items() if k not in ["auth_token", "user_id", "saved_at", "password"]}
+            filtered = {k: v for k, v in a.items() if k not in SENSITIVE_FIELDS}
             return jsonify({"account": filtered})
     return jsonify({"error": "账号不存在"}), 404
 
@@ -186,7 +189,11 @@ def add_account():
             "enabled": data.get("enabled", True),
             "claim_target": claim_target,
         })
-        save_accounts(accounts)
+        try:
+            save_accounts(accounts)
+        except OSError as e:
+            logger.error("保存账号失败: %s", e)
+            return jsonify({"ok": False, "error": "保存账号失败，请检查磁盘空间或文件权限"}), 500
     return jsonify({"ok": True})
 
 
@@ -227,7 +234,11 @@ def update_account(phone):
                         a["password"] = pwd
                     else:
                         a.pop("password", None)
-                save_accounts(accounts)
+                try:
+                    save_accounts(accounts)
+                except OSError as e:
+                    logger.error("更新账号失败: %s", e)
+                    return jsonify({"ok": False, "error": "保存账号失败，请检查磁盘空间或文件权限"}), 500
                 return jsonify({"ok": True})
     return jsonify({"error": "账号不存在"}), 404
 
@@ -237,7 +248,11 @@ def delete_account(phone):
     with accounts_lock:
         accounts = load_accounts()
         accounts = [a for a in accounts if a["phone"] != phone]
-        save_accounts(accounts)
+        try:
+            save_accounts(accounts)
+        except OSError as e:
+            logger.error("删除账号失败: %s", e)
+            return jsonify({"ok": False, "error": "保存账号失败，请检查磁盘空间或文件权限"}), 500
     return jsonify({"ok": True})
 
 
@@ -376,7 +391,11 @@ def update_settings():
     if not is_valid:
         return jsonify({"error": error_msg}), 400
 
-    save_settings(settings)
+    try:
+        save_settings(settings)
+    except OSError as e:
+        logger.error("保存设置失败: %s", e)
+        return jsonify({"ok": False, "error": "保存设置失败，请检查磁盘空间或文件权限"}), 500
     return jsonify({"ok": True})
 
 

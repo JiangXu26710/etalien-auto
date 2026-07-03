@@ -66,7 +66,11 @@ def ensure_device_id(phone: str) -> str:
             return account["device_id"]
         device_id = EtAlienClient.generate_device_id()
         account["device_id"] = device_id
-        save_accounts(accounts)
+        try:
+            save_accounts(accounts)
+        except OSError as e:
+            # 辅助流程：device_id 已生成并用于本次登录，写盘失败不影响主流程，下次调用会重新尝试持久化
+            logger.warning("ensure_device_id save_accounts failed for %s: %s", phone, e)
         return device_id
 
 
@@ -88,7 +92,11 @@ def _save_login_result(phone: str, login_result: dict, device_id: str, password:
                 if password is not None:
                     a["password"] = password
                 break
-        save_accounts(accounts)
+        try:
+            save_accounts(accounts)
+        except OSError as e:
+            # 辅助流程：token 持久化失败不影响本次登录结果，下次 token 过期会触发重登重新获取
+            logger.warning("_save_login_result save_accounts failed for %s: %s", phone, e)
 
 
 def verify_login(phone: str, code: str | None = None, password: str | None = None) -> dict:
@@ -152,6 +160,16 @@ def _make_relogin_callback(account: dict) -> Callable[[str | None, int | None, b
     return callback
 
 
+def _clamp_watch_cnt(user_watch_cnt: int, video_cnt: int) -> int:
+    """对手机端 user_watch_cnt 做 clamp，返回前端展示用的观看数。
+
+    user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt
+    （实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增），
+    故按总任务数统计进度时需 clamp 到 video_cnt 上界。
+    """
+    return min(user_watch_cnt, video_cnt) if video_cnt > 0 else user_watch_cnt
+
+
 def get_account_status(account: dict) -> dict:
     phone = account["phone"]
     info = {
@@ -185,11 +203,17 @@ def get_account_status(account: dict) -> dict:
                 tasks_future = ex.submit(client.fetch_pc_ad_config)
                 mob_act_future = ex.submit(client.fetch_mobile_ad_activity)
                 mob_prof_future = ex.submit(client.fetch_mobile_profile)
+                # token 过期时 result() 抛 NeedLoginError，其余 futures 仍在飞行中；
+                # 在 except 块显式 cancel（仅能取消未开始的提交，已发出的 HTTP 请求
+                # 无法中断——requests 库限制，属可接受权衡，避免新增请求被调度）
+                futures = [dur_future, tasks_future, mob_act_future, mob_prof_future]
                 dur = dur_future.result()
                 tasks_result = tasks_future.result()
                 mob_activity = mob_act_future.result()
                 mob_profile = mob_prof_future.result()
         except NeedLoginError:
+            for f in futures:
+                f.cancel()
             info["token_expired"] = True
             return info
         except Exception:
@@ -213,8 +237,7 @@ def get_account_status(account: dict) -> dict:
             info["mobile_rewarded_count"] = mob_activity.get("rewarded_count", 0)
             info["mobile_claimed_count"] = mob_activity.get("claimed_count", 0)
             # 进度按总任务数统计（含无奖励任务），因领取需按顺序进行
-            # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
-            shown_cnt = min(user_watch_cnt, video_cnt) if video_cnt > 0 else user_watch_cnt
+            shown_cnt = _clamp_watch_cnt(user_watch_cnt, video_cnt)
             info["mobile_progress"] = f"{shown_cnt}/{video_cnt}"
             info["mobile_tasks"] = mob_activity.get("video_bar", [])
         else:
@@ -275,8 +298,7 @@ def get_account_mobile_status(account: dict) -> dict:
         info["mobile_rewarded_count"] = rewarded
         info["mobile_claimed_count"] = claimed
         # 进度按总任务数统计（含无奖励任务），因领取需按顺序进行
-        # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
-        shown_cnt = min(user_watch_cnt, video_cnt) if video_cnt > 0 else user_watch_cnt
+        shown_cnt = _clamp_watch_cnt(user_watch_cnt, video_cnt)
         info["mobile_progress"] = f"{shown_cnt}/{video_cnt}"
         info["mobile_tasks"] = activity.get("video_bar", [])
     else:
@@ -426,7 +448,11 @@ def _clear_account_password(phone: str) -> None:
             if a["phone"] == phone:
                 a.pop("password", None)
                 break
-        save_accounts(accounts)
+        try:
+            save_accounts(accounts)
+        except OSError as e:
+            # 辅助流程：清除密码失败不中断领取主流程，下次密码错误时仍会再次尝试清除
+            logger.warning("_clear_account_password save_accounts failed for %s: %s", phone, e)
 
 
 def init_client(account: dict) -> tuple[EtAlienClient | None, str]:
@@ -486,6 +512,11 @@ def _claim_pc_phase(client: EtAlienClient, phone: str,
         logger.info("  [%s] PC阶段开始: unwatched=%d, entry.current=%d, entry.total=%d",
                     phone, unwatched_before,
                     progress_entry.get("current", 0), progress_entry.get("total", 0))
+
+    # max_rounds=0 时不进入循环，跳过结束校准：避免服务端状态因其他原因变化
+    # （如其他设备领取）被差值误归功于本次未执行的领取
+    if max_rounds == 0:
+        return 0, 0
 
     while round_num < max_rounds:
         if local_success >= unwatched_before:
@@ -590,6 +621,11 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
         logger.info("  [%s] 手机阶段开始: pending=%d, entry.current=%d, entry.total=%d",
                     phone, pending_count,
                     progress_entry.get("current", 0), progress_entry.get("total", 0))
+
+    # max_rounds=0 时不进入循环，跳过结束校准：避免服务端状态因其他原因变化
+    # （如其他设备领取）被差值误归功于本次未执行的领取
+    if max_rounds == 0:
+        return 0, 0
 
     while round_num < max_rounds:
         if local_success >= pending_count:
@@ -830,7 +866,7 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
     return result
 
 
-def run_concurrent_claim(accounts: list[dict], settings: dict, progress_list: list[dict] | None = None, claim_mgr: Any = None) -> list[dict]:
+def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = None) -> list[dict]:
     max_concurrent = settings.get("max_concurrent", 10)
     results = []
 
@@ -848,16 +884,6 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, progress_list: li
                     "vip_after": 0,
                 }
                 claim_mgr.add_progress_entry(entry)
-            elif progress_list is not None:
-                entry = {
-                    "phone": account["phone"],
-                    "status": "running",
-                    "current": 0,
-                    "total": 0,
-                    "vip_before": 0,
-                    "vip_after": 0,
-                }
-                progress_list.append(entry)
 
             futures[executor.submit(claim_for_account, account, settings, entry)] = account
 
@@ -881,11 +907,6 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, progress_list: li
                 results.append(error_result)
                 if claim_mgr is not None:
                     claim_mgr.update_progress_entry(account["phone"], {"status": "error", "error": str(e)})
-                elif progress_list is not None:
-                    for entry in progress_list:
-                        if entry["phone"] == account["phone"]:
-                            entry.update({"status": "error", "error": str(e)})
-                            break
 
     # 按 phone 排序，保证 CLI 输出与通知顺序稳定（与 get_all_status 一致）
     results.sort(key=lambda r: r.get("phone", ""))

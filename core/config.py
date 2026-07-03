@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import time
 import logging
 import tempfile
 from threading import Lock
@@ -97,7 +98,20 @@ def _atomic_write(filepath: str, data: str) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
-        os.replace(tmp, filepath)
+        # Windows 上 os.replace 偶发 PermissionError(13, '拒绝访问')：目标文件被其他线程/进程
+        # 短暂占用（如杀软扫描、并发写入）。短重试可消除瞬时冲突，提升真实场景健壮性。
+        last_err: PermissionError | None = None
+        for attempt in range(3):
+            try:
+                os.replace(tmp, filepath)
+                last_err = None
+                break
+            except PermissionError as e:
+                last_err = e
+                if attempt < 2:
+                    time.sleep(0.02)
+        if last_err is not None:
+            raise last_err
     except Exception:
         try:
             os.unlink(tmp)
@@ -111,6 +125,7 @@ def save_accounts(accounts: list[dict]) -> None:
         _atomic_write(ACCOUNTS_FILE, json.dumps(accounts, ensure_ascii=False, indent=4))
     except OSError as e:
         logger.error("Failed to save accounts: %s", e)
+        raise
 
 
 def _read_settings_from_disk() -> dict:
@@ -158,14 +173,15 @@ def reload_settings() -> dict:
 def save_settings(settings: dict) -> None:
     """写入 settings 并更新缓存。
 
-    写盘失败时仅记录日志，不更新缓存（避免缓存与磁盘不一致：缓存反映新值但磁盘仍是旧值，
-    后续 load_settings 走缓存读到未持久化的"幽灵配置"，重启后丢失）。
+    写盘失败时记日志后向上抛出 OSError，且不更新缓存（避免缓存与磁盘不一致：缓存反映
+    新值但磁盘仍是旧值，后续 load_settings 走缓存读到未持久化的"幽灵配置"，重启后丢失）。
+    调用方需捕获 OSError 以感知失败。
     """
     global _settings_cache
     try:
         _atomic_write(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=4))
     except OSError as e:
         logger.error("Failed to save settings: %s", e)
-        return  # 写盘失败，保留旧缓存（与磁盘一致）
+        raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
     with _settings_lock:
         _settings_cache = dict(settings)  # 缓存写入的副本

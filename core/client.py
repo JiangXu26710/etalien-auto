@@ -90,6 +90,7 @@ class EtAlienClient:
                 # 这类响应不应重试，由调用方通过 retry_on_500=False 关闭
                 if resp.status_code >= 500 and retry_on_500 and attempt < self._max_retries:
                     logger.warning("服务端错误 %d(第%d次)，%0.1fs后重试", resp.status_code, attempt + 1, self._retry_delay)
+                    last_exc = requests.HTTPError(f"server returned {resp.status_code}")
                     time.sleep(self._retry_delay)
                     continue
                 return resp.status_code, resp.content
