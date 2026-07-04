@@ -78,7 +78,7 @@ def send_claim_notification(results: list[dict]) -> bool:
         results: run_concurrent_claim 返回的结果列表
 
     Returns:
-        True 发送成功（或 schan 未启用时返回 False 表示未发送）
+        True 发送成功；False 表示未发送（schan 未启用或 sendkey 为空）或发送失败
     """
     settings = load_settings()
     if not settings.get("schan_enabled"):
@@ -110,7 +110,7 @@ def send_claim_notification(results: list[dict]) -> bool:
         )
     else:
         title = "etalien-auto运行结果通知"
-        # 括号内只列问题类型，不重复列成功数（避免标题冗长）
+        # 括号内只列问题类型，不重复列成功数（避免正文冗长）
         parts = []
         if partial:
             parts.append(f"部分完成 {partial}")

@@ -59,7 +59,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,
+    console=False,    # GUI模式无终端窗口；CLI模式通过 --cli 参数切换，由 gui/app.py 调用 AllocConsole 分配控制台
     icon=os.path.join(PROJECT_DIR, 'logo', 'logo.ico'),
 )
 

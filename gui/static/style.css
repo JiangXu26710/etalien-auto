@@ -1578,7 +1578,7 @@ body {
     transform: rotateX(180deg);
 }
 
-/* Invisible sizer in document flow to determine card's natural height */
+/* 文档流中不可见的尺寸测量器，用于确定卡片自然高度 */
 .account-card .card-sizer {
     display: flex;
     align-items: center;
@@ -1588,7 +1588,7 @@ body {
     pointer-events: none;
 }
 
-/* Front face: absolute overlay */
+/* 正面：绝对定位覆盖层 */
 .account-card .card-front {
     background: var(--bg-card);
     border: 1px solid var(--border);
@@ -1609,7 +1609,7 @@ body {
     cursor: pointer;
 }
 
-/* Back face: absolute overlay, 3D rotated */
+/* 背面：绝对定位覆盖层，3D 旋转 */
 .account-card .card-back {
     background: var(--bg-card);
     border: 1px solid var(--border-gold-dim);
@@ -1637,7 +1637,7 @@ body {
     background: linear-gradient(90deg, transparent, var(--border-gold-dim), transparent);
 }
 
-/* Back face content layout */
+/* 背面内容布局 */
 .card-back-content {
     display: flex;
     align-items: center;
@@ -1673,7 +1673,7 @@ body {
     font-variant-numeric: tabular-nums;
 }
 
-/* Token expired back face border */
+/* token 过期时背面边框样式 */
 .account-card.token-expired .card-back {
     border-color: rgba(207, 92, 92, 0.3);
 }
@@ -1682,7 +1682,7 @@ body {
     background: linear-gradient(90deg, transparent, rgba(207, 92, 92, 0.3), transparent);
 }
 
-/* Disabled state for back face */
+/* 账号禁用时背面元素状态 */
 .account-card.account-disabled .card-back .account-avatar,
 .account-card.account-disabled .card-back .card-back-info {
     opacity: 0.4;
@@ -1694,7 +1694,7 @@ body {
     opacity: 0.6;
 }
 
-/* Loading indicator for back face data */
+/* 背面数据加载指示器 */
 .card-back-loading {
     display: flex;
     align-items: center;

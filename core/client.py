@@ -1,3 +1,10 @@
+"""
+et-api.com Protobuf 接口客户端模块。
+
+纯 API 通信层，封装 HTTP 请求、Protobuf 序列化/反序列化、请求签名、
+3 层重试机制（HTTP 层/认证层/业务层）。不包含业务逻辑或持久化操作。
+"""
+
 import logging
 import time
 import uuid
@@ -14,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class NeedLoginError(Exception):
-    """token 过期且无法重登（无密码、密码错误、或已尝试过重登）时抛出。
+    """token 过期且无法重登（无密码、密码错误、重登网络异常、或已尝试过重登（含重登后仍 auth error））时抛出。
 
     由 _post/_get 在检测到 auth error 且无法恢复时抛出，
     claim_for_account 捕获后返回 "need_login" 状态。
@@ -36,11 +43,18 @@ def _is_password_incorrect(result: dict) -> bool:
 
 
 class EtAlienClient:
+    """et-api.com protobuf 接口客户端。
+
+    封装账号登录（验证码/密码）、PC 端与手机端广告任务查询/补发、用户资料查询等接口。
+    内置本地重试（网络异常/超时/500）与 token 过期自动密码重登能力（需注入 password 与回调）。
+    """
+
     BASE_URL = "https://api.et-api.com"
     HOST = "api.et-api.com"
 
     @staticmethod
     def generate_device_id() -> str:
+        """生成固定长度的设备 ID，默认取 UUID 前 25 位十六进制字符。"""
         return uuid.uuid4().hex[:25]
 
     def __init__(self, phone: str, auth_token: str | None = None, device_id: str | None = None,
@@ -48,6 +62,17 @@ class EtAlienClient:
                  on_relogin: Callable[[str | None, int | None, bool], None] | None = None,
                  max_retries: int = 3,
                  retry_delay: float = 1.0):
+        """初始化客户端会话与重试配置。
+
+        Args:
+            phone: 账号手机号。
+            auth_token: 已登录态 token；若提供则直接写入请求头。
+            device_id: 设备标识；未提供时自动生成。
+            password: 用于 token 过期后自动密码重登。
+            on_relogin: 重登成功/失败回调，用于持久化新 token 或清除密码。
+            max_retries: 网络异常/超时/500 的最大重试次数。
+            retry_delay: 每次重试前的等待秒数。
+        """
         self.phone = phone
         self.auth_token = auth_token
         self.user_id: int | None = None
@@ -74,11 +99,32 @@ class EtAlienClient:
             self.session.headers["Authorization"] = self.auth_token
 
     def _build_url(self, method: str, path: str, query: dict | None = None) -> str:
+        """调用 sign_url 签名后拼装完整 URL（含协议前缀 BASE_URL）。"""
         signed = sign_url(method, self.HOST, path, query)
         query_part = signed.split("?", 1)[1] if "?" in signed else ""
         return f"{self.BASE_URL}{path}?{query_part}"
 
     def _request_with_retry(self, method: str, url: str, data: bytes | None = None, timeout: int = 30, retry_on_500: bool = True) -> tuple[int, bytes]:
+        """Layer 1 HTTP 请求层：发送请求并重试本地原因导致的失败。
+
+        对 ConnectionError / Timeout 重试 max_retries 次（默认 3，从 settings.json 读取），
+        间隔 retry_delay 秒。HTTP 500 也默认重试，可通过 retry_on_500=False 关闭
+        （如 login_by_password 密码错误的 500 是业务错误，不应重试）。
+        所有重试均耗尽后抛出最后一个异常。
+
+        Args:
+            method: HTTP 方法 "GET" 或 "POST"
+            url: 完整请求 URL
+            data: 请求体（protobuf 序列化后的 bytes）
+            timeout: 超时秒数
+            retry_on_500: 是否对 HTTP 500 重试
+
+        Returns:
+            (status_code, response_content) 元组
+
+        Raises:
+            requests.ConnectionError / requests.Timeout / requests.HTTPError: 重试耗尽后抛出
+        """
         last_exc = None
         for attempt in range(self._max_retries + 1):
             try:
@@ -107,6 +153,20 @@ class EtAlienClient:
         raise last_exc
 
     def _post(self, path: str, body: bytes | None = None, query: dict | None = None, retry_on_500: bool = True) -> dict[str, Any]:
+        """发送 POST 请求，含 Layer 1 重试 + Layer 2 认证错误处理。
+
+        构建签名 URL，通过 _request_with_retry 发送，解析响应后检测 auth error，
+        触发 _handle_auth_error_and_retry（token 过期自动重登）。
+
+        Args:
+            path: 请求路径，如 "/v2/account/login"
+            body: protobuf 序列化后的请求体
+            query: 额外查询参数
+            retry_on_500: 是否对 HTTP 500 重试
+
+        Returns:
+            通用错误结构 dict，_error=False 时 raw 字段包含响应 bytes
+        """
         url = self._build_url("POST", path, query)
         status_code, data = self._request_with_retry("POST", url, data=body, retry_on_500=retry_on_500)
         result = self._parse_response(status_code, data)
@@ -116,6 +176,19 @@ class EtAlienClient:
         return result
 
     def _get(self, path: str, query: dict | None = None, body: bytes | None = None, retry_on_500: bool = True) -> dict[str, Any]:
+        """发送 GET 请求（支持可选的 protobuf body），含 Layer 1 重试 + Layer 2 认证错误处理。
+
+        body 参数用于适配 get_login_code 等非标准 GET + protobuf body 场景。
+
+        Args:
+            path: 请求路径，如 "/account/v1/my_profile"
+            query: 查询参数
+            body: 可选的 protobuf 序列化请求体
+            retry_on_500: 是否对 HTTP 500 重试
+
+        Returns:
+            通用错误结构 dict，_error=False 时 raw 字段包含响应 bytes
+        """
         url = self._build_url("GET", path, query)
         status_code, data = self._request_with_retry("GET", url, data=body, retry_on_500=retry_on_500)
         result = self._parse_response(status_code, data)
@@ -129,8 +202,9 @@ class EtAlienClient:
         """token 过期时的公共处理流程。
 
         1. 无密码或已重登过 → 抛 NeedLoginError
-        2. 密码重登失败 → 抛 NeedLoginError（密码错误时回调清除密码）
+        2. 密码重登失败（密码错误/网络异常）→ 抛 NeedLoginError（密码错误时回调清除密码）
         3. 重登成功 → 持久化新 token → 重试原请求
+        4. 重试后仍 auth error → 抛 NeedLoginError（不再二次重登，防无限重试）
         """
         if not self._password:
             logger.info("[%s] token 过期，未配置密码，无法重登", self.phone)
@@ -180,7 +254,7 @@ class EtAlienClient:
         logger.info("[%s] 密码重登成功，重试原请求", self.phone)
 
         # 重试原请求（新 token 已在 session.headers 中）
-        # 重试请求走 _request_with_retry，即重登后的请求同样享有"本地原因 3 次重试"兜底
+        # 重试请求走 _request_with_retry，即重登后的请求同样享有"本地原因 max_retries 次重试"兜底
         status_code, data = self._request_with_retry(method, url, data=body, retry_on_500=retry_on_500)
         result = self._parse_response(status_code, data)
 
@@ -192,6 +266,10 @@ class EtAlienClient:
         return result
 
     def _parse_protobuf_error(self, data: bytes) -> dict[str, Any] | None:
+        """尝试将响应 bytes 解析为 error.proto 的 Error 消息。
+
+        解析成功返回 {"code": int, "msg": str}，失败返回 None。
+        """
         try:
             err = error_pb2.Error()
             err.ParseFromString(data)
@@ -201,6 +279,13 @@ class EtAlienClient:
             return None
 
     def _parse_response(self, status_code: int, data: bytes) -> dict[str, Any]:
+        """解析 HTTP 响应，统一为通用错误结构 dict。
+
+        - 4xx/5xx: 尝试解析 protobuf error 获取 code/msg，失败则用原始文本
+        - 2xx: 将原始 bytes 存入 raw 字段，由调用方按具体接口解析
+
+        返回 dict 始终包含 _error（bool）和 status_code 字段。
+        """
         result: dict[str, Any] = {"status_code": status_code}
         if status_code >= 400:
             err = self._parse_protobuf_error(data)
@@ -217,15 +302,18 @@ class EtAlienClient:
 
     @staticmethod
     def _format_phone(phone: str) -> str:
+        """格式化手机号：不带 + 前缀的国内号码自动添加 +86。"""
         if phone.startswith("+"):
             return phone
         return f"+86{phone}"
 
     def is_logged_in(self) -> bool:
+        """判断当前客户端是否已登录（是否存在 auth_token）。"""
         return bool(self.auth_token)
 
     @staticmethod
     def _is_auth_error(result: dict[str, Any]) -> bool:
+        """检测响应是否为认证错误（protobuf error code 401/403/16）。"""
         if not result.get("_error"):
             return False
         code = result.get("code")
@@ -236,6 +324,14 @@ class EtAlienClient:
         return False
 
     def get_login_code(self, phone: str | None = None) -> dict[str, Any]:
+        """请求发送登录验证码。
+
+        Args:
+            phone: 手机号；为 None 时使用初始化时的 self.phone。
+
+        Returns:
+            通用错误结构 dict，成功时 _error=False。
+        """
         phone = phone or self.phone
         formatted = self._format_phone(phone)
         req = account_pb2.GetLoginVerificationCodeRequest()
@@ -243,6 +339,15 @@ class EtAlienClient:
         return self._get("/account/v1/get_login_verification_code", body=req.SerializeToString())
 
     def login_by_code(self, code: str, phone: str | None = None) -> dict[str, Any]:
+        """验证码登录。
+
+        Args:
+            code: 短信验证码。
+            phone: 手机号；为 None 时使用初始化时的 self.phone。
+
+        Returns:
+            通用错误结构 dict，成功时额外包含 user_id、authorization。
+        """
         phone = phone or self.phone
         formatted = self._format_phone(phone)
         req = account_pb2.LoginRequest()
@@ -270,16 +375,25 @@ class EtAlienClient:
         return result
 
     def login_by_password(self, password: str, phone: str | None = None) -> dict[str, Any]:
-        """密码登录（与验证码登录相互独立）
+        """密码登录（与验证码登录相互独立）。
+
         接口: POST /v2/account/login
-        密码为明文，规则 6-20 位 [a-zA-Z0-9_.]
+        密码为明文，规则 6-20 位 [a-zA-Z0-9_.]。
+        对参数/业务错误也返回 500（实测 code=500），因此传 retry_on_500=False 关闭 500 重试。
+
+        Args:
+            password: 明文密码
+            phone: 手机号；为 None 时使用初始化时的 self.phone
+
+        Returns:
+            通用错误结构 dict，成功时额外包含 user_id、authorization
         """
         phone = phone or self.phone
         formatted = self._format_phone(phone)
         req = account_pb2.LoginV2Request(phone_number=formatted, password=password)
         body = req.SerializeToString()
 
-        # 密码登录接口对参数/业务错误也返回 500（实测 code=500），不应重试，否则用户要等 ~3s 才看到提示
+        # 密码登录接口对参数/业务错误也返回 500（实测 code=500），不应重试，否则用户要等约 max_retries×retry_delay 秒才看到提示
         result = self._post("/v2/account/login", body=body, retry_on_500=False)
 
         if not result.get("_error"):
@@ -299,6 +413,12 @@ class EtAlienClient:
         return result
 
     def fetch_pc_ad_config(self) -> dict[str, Any]:
+        """获取 PC 端广告任务配置。
+
+        Returns:
+            通用错误结构 dict，成功时包含 list 字段，结构为：
+            [{level, watch_cnt, title, text, tag, items: [{id, award_unix, level, is_watch, title}]}]
+        """
         req = apiv2_pb2.PcAdConfigRequest()
         result = self._post("/v2/account/pc/ad/config", body=req.SerializeToString())
 
@@ -343,6 +463,12 @@ class EtAlienClient:
         return result
 
     def fetch_pc_duration(self) -> dict[str, Any]:
+        """获取 PC 端剩余加速时长。
+
+        Returns:
+            通用错误结构 dict，成功时包含 vip_duration_second、free_duration_second、
+            timestamp、pause_state、is_first_award、pc_vip_state。
+        """
         req = apiv2_pb2.GetUserRemainDurationRequest()
         result = self._post("/v2/account/remain/duration", body=req.SerializeToString())
 
@@ -369,8 +495,8 @@ class EtAlienClient:
 
         Args:
             ad_id: 穿山甲广告位ID，必须与 business 类型严格对应。
-                  PC加速="103334281", 手机加速="102815305", 翻译加速="103579416"
-            business: 业务类型。1=PC加速, 2=手机加速, 3=翻译加速
+                  PC加速="103334281", 手机加速="102815305", 翻译功能="103579416"
+            business: 业务类型。1=PC加速, 2=手机加速, 3=翻译功能（项目不涉及）
 
         注意：ad_id 与 business 不匹配时服务端会返回 is_verify=False。
         当前项目使用 PC 加速（business=1, ad_id="103334281"）和手机加速（business=2, ad_id="102815305"）。

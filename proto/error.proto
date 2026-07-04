@@ -2,7 +2,8 @@ syntax = "proto3";
 
 package error;
 
+// 用于解析 4xx/5xx 错误响应（core/client.py 的 _parse_protobuf_error 使用）
 message Error {
-    int32 code = 1;
-    string msg = 2;
+    int32 code = 1;    // 业务错误码（如 401/403/16 表示认证失败）
+    string msg = 2;    // 错误消息
 }

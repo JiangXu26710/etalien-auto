@@ -1,3 +1,9 @@
+"""EtAlien 自动领取工具的 Flask API 服务层。
+
+负责处理前端 HTTP 请求，包括账号管理、登录验证码/密码校验、
+领取任务启停与进度查询、设置读写、Windows 计划任务管理。
+"""
+
 import copy
 import logging
 import os
@@ -14,7 +20,7 @@ from core.service import validate_phone, claim_for_account, run_concurrent_claim
 
 logger = logging.getLogger(__name__)
 
-# 敏感字段过滤列表：禁止下发给前端，防止 auth_token / user_id / password 泄露。
+# 敏感字段过滤列表：禁止下发给前端，防止 auth_token / user_id / saved_at / password 泄露。
 SENSITIVE_FIELDS = ("auth_token", "user_id", "saved_at", "password")
 
 
@@ -27,7 +33,7 @@ def _translate_login_error(result: dict, scene: str) -> str:
     其他错误（code=1000/1001/500 等）服务端已返回友好中文，直接透传。
 
     Args:
-        result: client.py 返回的 result dict
+        result: core.service 的 send_login_code/verify_login 返回的 result dict
         scene: "send_code" / "verify_code" / "verify_password"
 
     Returns:
@@ -55,17 +61,29 @@ app = Flask(__name__, static_folder=STATIC_DIR)
 
 
 class ClaimManager:
+    """线程安全的领取进度管理器。
+
+    用于追踪并发领取任务的运行状态、各账号进度条目，以及 PC/手机端总进度汇总。
+    """
+
     def __init__(self):
+        """初始化锁、运行标记和进度列表。"""
         self._lock = threading.Lock()
         self._running = False
         self._progress: list[dict[str, Any]] = []
 
     @property
     def running(self) -> bool:
+        """线程安全地返回当前是否正在领取。"""
         with self._lock:
             return self._running
 
     def start(self) -> bool:
+        """尝试启动领取。
+
+        Returns:
+            若当前未运行则启动并返回 True；若已在运行中则返回 False。
+        """
         with self._lock:
             if self._running:
                 return False
@@ -74,10 +92,17 @@ class ClaimManager:
             return True
 
     def finish(self) -> None:
+        """标记当前领取任务结束。"""
         with self._lock:
             self._running = False
 
     def get_progress(self) -> dict:
+        """返回当前进度快照。
+
+        Returns:
+            dict: 包含 running（布尔）、progress（各账号条目列表的深拷贝）、
+            total_progress（聚合的 watched/total 计数）。
+        """
         with self._lock:
             # 后端统计总进度（PC + 手机端）
             total_watched = 0
@@ -107,10 +132,12 @@ class ClaimManager:
             }
 
     def add_progress_entry(self, entry: dict[str, Any]) -> None:
+        """添加新账号的进度条目。"""
         with self._lock:
             self._progress.append(entry)
 
     def update_progress_entry(self, phone: str, updates: dict[str, Any]) -> None:
+        """按手机号更新已有进度条目。"""
         with self._lock:
             for entry in self._progress:
                 if entry["phone"] == phone:
@@ -125,6 +152,7 @@ VERSION = "1.0.1"
 
 @app.before_request
 def _check_json_body():
+    """校验 POST/PUT 请求体是否为合法 JSON。"""
     if request.method in ("POST", "PUT") and request.content_type and "application/json" in request.content_type:
         if request.content_length and request.content_length > 0:
             if request.get_json(silent=True) is None:
@@ -133,16 +161,19 @@ def _check_json_body():
 
 @app.route("/")
 def index():
+    """返回前端首页。"""
     return send_from_directory(STATIC_DIR, "index.html")
 
 
 @app.route("/<path:path>")
 def static_files(path):
+    """返回前端静态资源。"""
     return send_from_directory(STATIC_DIR, path)
 
 
 @app.route("/api/accounts", methods=["GET"])
 def get_accounts():
+    """获取所有账号列表，过滤敏感字段后返回。"""
     accounts = load_accounts()
     accounts.sort(key=lambda a: a.get("phone", ""))
     filtered_accounts = []
@@ -154,6 +185,7 @@ def get_accounts():
 
 @app.route("/api/accounts/<phone>", methods=["GET"])
 def get_account(phone):
+    """获取单个账号详情，过滤敏感字段后返回。"""
     accounts = load_accounts()
     for a in accounts:
         if a["phone"] == phone:
@@ -165,6 +197,7 @@ def get_account(phone):
 
 @app.route("/api/accounts", methods=["POST"])
 def add_account():
+    """添加新账号。"""
     data = request.json
     phone = data.get("phone", "").strip()
     if not phone:
@@ -180,6 +213,7 @@ def add_account():
                 return jsonify({"error": "手机号已存在"}), 400
 
         claim_target = data.get("claim_target", "all")
+        # 非法值回退到 "all"，防止前端传参异常导致领取阶段出错
         if claim_target not in ("all", "pc", "mobile"):
             claim_target = "all"
         accounts.append({
@@ -199,6 +233,7 @@ def add_account():
 
 @app.route("/api/accounts/<phone>", methods=["PUT"])
 def update_account(phone):
+    """更新账号信息，手机号变更时会清除关联的登录态字段。"""
     data = request.json
     with accounts_lock:
         accounts = load_accounts()
@@ -245,6 +280,7 @@ def update_account(phone):
 
 @app.route("/api/accounts/<phone>", methods=["DELETE"])
 def delete_account(phone):
+    """删除账号。"""
     with accounts_lock:
         accounts = load_accounts()
         accounts = [a for a in accounts if a["phone"] != phone]
@@ -272,6 +308,7 @@ def get_mobile_status(phone):
 
 @app.route("/api/login/<phone>", methods=["POST"])
 def send_code(phone):
+    """发送登录验证码。"""
     try:
         result = send_login_code(phone)
     except (requests.ConnectionError, requests.Timeout):
@@ -282,7 +319,7 @@ def send_code(phone):
 
     if result.get("_error"):
         code = result.get("code")
-        # 错误码60和1000表示触发验证码请求冷却，验证码已发送但需等待
+        # 错误码60和1000表示触发验证码请求冷却，验证码可能已发送，仍允许用户输入已收到的验证码
         if code in (60, 1000):
             return jsonify({"ok": True, "msg": "验证码请求冷却中，请稍后再试"})
         logger.warning("Send code failed for %s: %s", phone, result.get("msg"))
@@ -292,6 +329,7 @@ def send_code(phone):
 
 @app.route("/api/login/<phone>/verify", methods=["POST"])
 def verify_code(phone):
+    """验证登录，支持验证码或密码两种方式。"""
     data = request.json
     code = data.get("code", "").strip()
     password = data.get("password", "").strip()
@@ -326,12 +364,14 @@ def verify_code(phone):
 
 @app.route("/api/status", methods=["GET"])
 def get_status():
+    """获取所有账号状态。"""
     settings = load_settings()
     return jsonify({"status": get_all_status(max_workers=settings.get("max_concurrent", 10))})
 
 
 @app.route("/api/claim", methods=["POST"])
 def start_claim():
+    """启动领取任务，后台线程执行。"""
     if not claim_mgr.start():
         return jsonify({"error": "领取正在进行中"}), 400
 
@@ -355,20 +395,25 @@ def start_claim():
 
 @app.route("/api/claim/progress", methods=["GET"])
 def get_claim_progress():
+    """获取当前领取进度。"""
     return jsonify(claim_mgr.get_progress())
 
 
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
+    """获取设置，刷新缓存以反映外部手动编辑。"""
     # 打开设置页时刷新缓存，应对外部手动编辑 settings.json 后的缓存过期
     return jsonify(reload_settings())
 
 
 @app.route("/api/settings", methods=["PUT"])
 def update_settings():
+    """更新设置并持久化。"""
     data = request.json
     settings = load_settings()
 
+    # 按字段类型转换值：int 类字段（max_concurrent 等）、float 类字段
+    # （request_interval）、str 类字段（schedule_time/schan_key）、bool 类字段（schan_enabled）
     for key, value in data.items():
         if key in ("max_concurrent", "max_rounds", "mobile_max_rounds"):
             try:
@@ -401,6 +446,7 @@ def update_settings():
 
 @app.route("/api/schedule", methods=["GET"])
 def get_schedule():
+    """查询 Windows 计划任务状态。"""
     result = query_schedule()
     if "error" in result:
         return jsonify(result), 500
@@ -409,6 +455,7 @@ def get_schedule():
 
 @app.route("/api/schedule", methods=["POST"])
 def post_schedule():
+    """创建 Windows 计划任务。"""
     data = request.json or {}
     schedule_time = data.get("time", "08:00")
     result = create_schedule(schedule_time)
@@ -420,6 +467,7 @@ def post_schedule():
 
 @app.route("/api/schedule", methods=["DELETE"])
 def del_schedule():
+    """删除 Windows 计划任务。"""
     result = delete_schedule()
     if "error" in result:
         return jsonify(result), 500
@@ -428,4 +476,5 @@ def del_schedule():
 
 @app.route("/api/version", methods=["GET"])
 def get_version():
+    """返回当前版本号。"""
     return jsonify({"version": VERSION})

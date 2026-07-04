@@ -1,3 +1,10 @@
+"""
+业务逻辑模块。
+
+统一业务逻辑层，GUI 和 CLI 共用同一套领取/登录/状态查询/计划任务管理逻辑。
+PC 加速和手机加速权益的领取流程在此实现，token 过期等异常由 EtAlienClient 处理。
+"""
+
 import logging
 import os
 import re
@@ -15,15 +22,18 @@ from core.config import load_accounts, save_accounts, load_settings, save_settin
 
 logger = logging.getLogger(__name__)
 
+# 中国大陆 11 位手机号正则
 PHONE_PATTERN = re.compile(r'^1[3-9]\d{9}$')
 
+# 子进程标志：Windows 下隐藏控制台窗口
 SUBPROCESS_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+# Windows 计划任务名称
 TASK_NAME = "EtAlienAuto_DailyClaim"
 
 # PC加速权益常量
 PC_AD_ID = "103334281"      # 穿山甲广告位ID（生产环境）
-PC_BUSINESS = 1             # business类型: 1=PC加速, 2=手机加速, 3=翻译加速
+PC_BUSINESS = 1             # business类型: 1=PC加速, 2=手机加速, 3=翻译功能（项目不涉及）
 
 # 手机加速权益常量
 MOBILE_AD_ID = "102815305"  # 手机加速穿山甲广告位ID
@@ -31,10 +41,12 @@ MOBILE_BUSINESS = 2         # business=2 表示手机加速
 
 
 def validate_phone(phone: str) -> bool:
+    """校验手机号是否符合中国大陆 11 位号段规则。"""
     return bool(PHONE_PATTERN.match(phone))
 
 
 def account_label(account: dict) -> str:
+    """生成账号展示标签，格式为「姓名 手机号 (备注)」，缺失字段自动省略。"""
     parts = []
     if account.get("name"):
         parts.append(account["name"])
@@ -45,6 +57,18 @@ def account_label(account: dict) -> str:
 
 
 def _get_or_create_account(phone: str, accounts: list[dict]) -> dict:
+    """在账号列表中查找指定手机号，找不到则创建初始态账号并追加到列表。
+
+    初始态账号仅含 name/phone/remark/enabled 四个字段，不含 claim_target 和 password，
+    依赖调用方通过 account.get("key", default) 兜底。
+
+    Args:
+        phone: 手机号
+        accounts: 账号列表（会被原地修改）
+
+    Returns:
+        找到或新建的账号字典
+    """
     for a in accounts:
         if a["phone"] == phone:
             return a
@@ -59,6 +83,7 @@ def _get_or_create_account(phone: str, accounts: list[dict]) -> dict:
 
 
 def ensure_device_id(phone: str) -> str:
+    """获取或生成 device_id，并持久化到账号数据中。"""
     with accounts_lock:
         accounts = load_accounts()
         account = _get_or_create_account(phone, accounts)
@@ -75,12 +100,18 @@ def ensure_device_id(phone: str) -> str:
 
 
 def send_login_code(phone: str) -> dict:
+    """发送登录验证码。"""
     device_id = ensure_device_id(phone)
     client = EtAlienClient(phone=phone, device_id=device_id)
     return client.get_login_code()
 
 
 def _save_login_result(phone: str, login_result: dict, device_id: str, password: str | None = None) -> None:
+    """持久化登录结果到 accounts.json（加锁，内部调用 load_accounts + save_accounts）。
+
+    更新 auth_token、user_id、device_id、saved_at，可选保存 password。
+    写盘失败时记录警告日志但不中断调用方（辅助流程，token 已在内存中可用）。
+    """
     with accounts_lock:
         accounts = load_accounts()
         for a in accounts:
@@ -100,6 +131,7 @@ def _save_login_result(phone: str, login_result: dict, device_id: str, password:
 
 
 def verify_login(phone: str, code: str | None = None, password: str | None = None) -> dict:
+    """验证登录，支持验证码或密码两种方式，成功后持久化 token。"""
     device_id = ensure_device_id(phone)
     client = EtAlienClient(phone=phone, device_id=device_id)
     if password:
@@ -115,11 +147,15 @@ def get_client_for_account(account: dict, enable_relogin: bool = False) -> EtAli
     """构建账号对应的 EtAlienClient。
 
     Args:
+        account: 账号字典，需包含 phone、auth_token、device_id。
         enable_relogin: 是否注入 token 过期自动重登能力（含密码与持久化回调）。
             领取流程传 True；状态查询传 False（默认），token 过期时由公共流程抛
             NeedLoginError，状态查询函数捕获后标记 token_expired。
-    重试配置（max_retries/retry_delay）无论 enable_relogin 是否为 True 都从 settings 注入，
-    保持全局一致。settings.json 走内存缓存，无磁盘 IO。
+            重试配置（max_retries/retry_delay）无论 enable_relogin 是否为 True 都从 settings 注入，
+            保持全局一致。settings.json 走内存缓存，无磁盘 IO。
+
+    Returns:
+        构造好的 EtAlienClient，若缺少 auth_token 或 device_id 则返回 None。
     """
     phone = account["phone"]
     if not account.get("auth_token") or not account.get("device_id"):
@@ -171,6 +207,20 @@ def _clamp_watch_cnt(user_watch_cnt: int, video_cnt: int) -> int:
 
 
 def get_account_status(account: dict) -> dict:
+    """查询单个账号的完整状态（PC + 手机端时长、任务进度、登录态）。
+
+    内部使用 ThreadPoolExecutor(max_workers=4) 并发查询 4 个接口：
+    fetch_pc_duration、fetch_pc_ad_config、fetch_mobile_ad_activity、fetch_mobile_profile。
+    token 过期时捕获 NeedLoginError 标记 token_expired，不抛异常。
+
+    Returns:
+        dict 包含以下字段:
+        - phone, name, remark, enabled, logged_in, token_valid
+        - vip_duration, free_duration, progress（PC 端）
+        - mobile_duration, mobile_progress, mobile_rewarded_count, mobile_claimed_count
+        - mobile_not_get_ad_duration, mobile_error, claim_target
+        - token_expired（仅 token 失效时出现）
+    """
     phone = account["phone"]
     info = {
         "phone": phone,
@@ -314,6 +364,7 @@ def get_account_mobile_status(account: dict) -> dict:
 
 
 def get_all_status(max_workers: int = 10) -> list[dict]:
+    """并发查询所有账号状态，并按手机号排序返回。"""
     accounts = load_accounts()
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(get_account_status, a): a for a in accounts}
@@ -328,6 +379,11 @@ def get_all_status(max_workers: int = 10) -> list[dict]:
 
 
 def _get_cli_exe_path() -> str:
+    """生成计划任务中 CLI 模式的执行命令路径。
+
+    - 打包环境: 返回 exe 路径（带引号） + --cli --auto-close
+    - 开发环境: 返回 main.py 路径（带引号）
+    """
     if getattr(sys, "frozen", False):
         exe_path = sys.executable
         return f'"{exe_path}" --cli --auto-close'
@@ -335,6 +391,7 @@ def _get_cli_exe_path() -> str:
 
 
 def query_schedule() -> dict[str, Any]:
+    """查询 Windows 计划任务状态，返回是否存在、启用状态和执行时间。"""
     # 优先从 schtasks /xml 解析真实 StartBoundary（任务时间）和 Settings/Enabled（任务启用状态）；
     # 任务不存在或解析异常时回退到配置文件 schedule_time。
     # 用 XML 格式而非 LIST /v：字段名语言无关，避开中文 Windows 本地化字段名问题。
@@ -380,6 +437,7 @@ def query_schedule() -> dict[str, Any]:
 
 
 def create_schedule(schedule_time: str) -> dict[str, Any]:
+    """创建每日自动执行的 Windows 计划任务。"""
     _, err, err_cat = validate_settings({"schedule_time": schedule_time})
     if err:
         return {"error": err, "error_category": err_cat or "system"}
@@ -411,6 +469,7 @@ def create_schedule(schedule_time: str) -> dict[str, Any]:
 
 
 def delete_schedule() -> dict[str, Any]:
+    """删除 Windows 计划任务。"""
     try:
         result = subprocess.run(
             ["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
@@ -427,6 +486,7 @@ def delete_schedule() -> dict[str, Any]:
 
 
 def format_duration(seconds: int) -> str:
+    """将秒数格式化为 HH:MM:SS。"""
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
@@ -434,6 +494,7 @@ def format_duration(seconds: int) -> str:
 
 
 def get_unwatched_count(tasks: list) -> int:
+    """统计所有任务层级中未观看的条目总数。"""
     return sum(
         len([item for item in level["items"] if not item["is_watch"]])
         for level in tasks
@@ -477,6 +538,11 @@ def _make_claim_result(phone: str, label: str, status: str,
                        claimed: int = 0, failed: int = 0,
                        progress_entry: dict | None = None,
                        **progress_extra) -> dict:
+    """构建领取结果字典，并同步更新 progress_entry（如提供）。
+
+    用于 need_login / network_error 等简单路径的结果构建，
+    同时将状态信息写入 progress_entry 供前端进度查询。
+    """
     result = {
         "phone": phone,
         "label": label,
@@ -563,6 +629,13 @@ def _claim_pc_phase(client: EtAlienClient, phone: str,
 
 
 def _calculate_final_status(total_claimed: int, total_failed: int) -> str:
+    """单阶段领取结果状态判定。
+
+    规则:
+    - total_failed == 0 → "done"（全部成功）
+    - total_claimed > 0 → "partial"（部分完成）
+    - 否则 → "error"（全部失败）
+    """
     if total_failed == 0:
         return "done"
     if total_claimed > 0:
@@ -673,9 +746,36 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
 
 
 def claim_for_account(account: dict, settings: dict, progress_entry: dict | None = None) -> dict:
+    """单账号领取主流程，按 claim_target 分流执行 PC 和/或手机加速权益领取。
+
+    流程:
+    1. init_client 初始化客户端（注入 token 过期自动重登能力）
+    2. 根据 claim_target 执行 PC 阶段和/或 Mobile 阶段
+       - 每阶段先查初始状态（config/activity + duration/profile）
+       - 全部已完成 → "already_done"，跳过领取循环
+       - 有待完成 → 进入领取循环（_claim_pc_phase / _claim_mobile_phase）
+       - 循环中 token 过期由 client 公共流程自动处理（重登或抛 NeedLoginError）
+    3. 综合两阶段结果调用 _combine_phase_status 判定最终状态
+    4. PC 阶段已成功但因手机阶段 token 过期中断时，附加 pc_partial 字段保留已领取数据
+
+    Args:
+        account: 账号字典，需包含 phone、auth_token、device_id，
+                可选 claim_target（"pc"/"mobile"/"all"，默认 "all"）、password
+        settings: 全局设置，需包含 request_interval、max_rounds、mobile_max_rounds
+        progress_entry: 可选的进度追踪字典，用于前端实时查询领取进度
+
+    Returns:
+        领取结果 dict，包含:
+        - phone, label, status, claim_target
+        - vip_before, vip_after（PC 端 VIP 时长）
+        - mobile_before, mobile_after（手机端加速时长）
+        - claimed, failed（总领取计数）
+        - phases（各阶段 status 列表）
+        - pc_partial（仅 PC 阶段成功但后续中断时出现）
+    """
     phone = account["phone"]
     label = account_label(account)
-    interval = settings.get("request_interval", 2.0)
+    interval = settings.get("request_interval", 1.0)
     max_rounds = settings.get("max_rounds", 21)
     mob_max_rounds = settings.get("mobile_max_rounds", 7)
     # claim_target: "all" / "pc" / "mobile"，默认 "all"（旧账号兼容）
@@ -867,6 +967,19 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
 
 
 def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = None) -> list[dict]:
+    """并发执行多个账号的领取任务。
+
+    使用 ThreadPoolExecutor 按 max_concurrent 并发度提交，通过 claim_mgr 追踪进度。
+    返回按 phone 排序的结果列表，便于 CLI 输出与通知顺序稳定。
+
+    Args:
+        accounts: 待领取的账号列表。
+        settings: 全局设置，需包含 max_concurrent、request_interval 等字段。
+        claim_mgr: 可选进度管理器，用于前端实时查询领取进度。
+
+    Returns:
+        按 phone 排序的领取结果列表。
+    """
     max_concurrent = settings.get("max_concurrent", 10)
     results = []
 

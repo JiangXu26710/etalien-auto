@@ -8,36 +8,41 @@ message PcAdConfigRequest {
     // 空请求体
 }
 
+// PC广告任务项
 message PcAdConfigItem {
-    int64 id = 1;
-    int64 award_unix = 2;
-    int64 level = 3;
-    bool is_watch = 4;
-    string title = 5;
+    int64 id = 1;               // 任务ID
+    int64 award_unix = 2;       // 奖励发放时间
+    int64 level = 3;            // 等级
+    bool is_watch = 4;          // 是否已观看
+    string title = 5;           // 标题
 }
 
+// PC广告任务等级分组
 message PcAdConfigLevelItem {
-    int64 level = 1;
-    repeated PcAdConfigItem list = 2;
-    int64 watch_cnt = 3;
-    string text = 4;
-    string tag = 5;
-    string title = 6;
+    int64 level = 1;                         // 等级
+    repeated PcAdConfigItem list = 2;        // 该等级下的广告任务
+    int64 watch_cnt = 3;                     // 已观看数量
+    string text = 4;                         // 描述文本
+    string tag = 5;                          // 标签
+    string title = 6;                        // 标题
 }
 
+// PC广告任务配置响应
 message PcAdConfigResponse {
-    repeated PcAdConfigLevelItem list = 1;
+    repeated PcAdConfigLevelItem list = 1;  // 按level分组的任务列表
 }
 
 // PC广告奖励补发
 // POST /v2/account/pc/ad/callback/backup
 message PcAdCallbackBackupRequest {
-    string ad_id = 1;
-    int64 business = 2;
+    string ad_id = 1;           // 广告位ID，需与 business 严格对应
+                                // PC加速="103334281", 手机="102815305", 翻译功能="103579416"
+    int64 business = 2;         // 业务类型：1=PC加速, 2=手机加速, 3=翻译功能（项目不涉及）
 }
 
+// PC广告奖励补发响应
 message PcAdCallbackBackupResponse {
-    bool is_verify = 1;
+    bool is_verify = 1;         // 是否验证通过（领取成功）
 }
 
 // PC加速时长
@@ -47,20 +52,21 @@ message GetUserRemainDurationRequest {
 }
 
 message GetUserRemainDurationResponse {
-    int64 vip_duration_second = 1;
-    int64 free_duration_second = 2;
-    int64 timestamp = 3;
-    int64 pause_state = 4;
-    bool is_first_award = 5;
-    int64 pc_vip_state = 7;
+    int64 vip_duration_second = 1;    // VIP剩余秒数
+    int64 free_duration_second = 2;   // 免费时长秒数
+    int64 timestamp = 3;              // 服务器时间戳（Unix秒）
+    int64 pause_state = 4;            // 暂停状态（0=未暂停, 其他值待确认）
+    bool is_first_award = 5;          // 是否首次奖励
+    int64 pc_vip_state = 7;           // PC VIP状态（注意：field 6被跳过）
 }
 
 // 更新暂停状态
 // POST /v2/account/update/pause/state
 message UpdatePauseStateRequest {
-    int64 pause_state = 1;
+    int64 pause_state = 1;            // 暂停状态（0=未暂停, 其他值待确认）
 }
 
+// 更新暂停状态响应
 message UpdatePauseStateResponse {
     // 空响应
 }
@@ -71,10 +77,12 @@ message MobilePcProductListRequest {
     // 空请求体
 }
 
+// PC产品项（字段待逆向确认）
 message MobilePcProductItem {
-    // 产品信息
+    // 产品信息（字段待逆向确认）
 }
 
+// PC产品列表响应
 message MobilePcProductListResponse {
     repeated MobilePcProductItem list = 1;
 }
@@ -86,6 +94,7 @@ message AdActivityRequest {
     // 空请求体（GET 请求无需 body）
 }
 
+// 手机端广告任务项
 message AdActivityItem {
     int64 id = 1;           // 任务ID
     bool has_award = 2;     // 是否有奖励数据（存在=true）
@@ -93,6 +102,7 @@ message AdActivityItem {
     bool is_get = 4;        // 是否已领取奖励（f4=1=已领取，缺失=未领取）
 }
 
+// 手机端广告任务列表响应
 message AdActivityResponse {
     int64 user_watch_cnt = 1;       // 累计 is_verify=true 的调用次数（实测即使无可发奖励或超额调用，is_verify 仍返回 true，故计数持续递增，可超过 video_cnt；ad_id 与 business 不匹配时服务端会返回 is_verify=false，其他导致is_verify=false 的触发条件未知；显示时需 clamp）
     int64 video_cnt = 2;            // 任务总数（实测=任务列表长度）

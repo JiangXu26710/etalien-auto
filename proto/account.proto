@@ -5,34 +5,37 @@ package account;
 // 获取登录验证码请求
 // GET /account/v1/get_login_verification_code
 message GetLoginVerificationCodeRequest {
-    string phone_number = 1;
+    string phone_number = 1;    // +86格式手机号
 }
 
+// 验证码发送响应
 message GetLoginVerificationCodeResponse {
-    // 服务端返回，通常为空或包含发送状态
+    // 空响应体
 }
 
 // 验证码登录请求
 // POST /account/v1/login
 message LoginRequest {
-    string phone_number = 1;
-    string verification_code = 2;
-    string password = 3;
-    string channel = 4;
+    string phone_number = 1;     // +86格式手机号
+    string verification_code = 2; // 6位验证码
+    string password = 3;         // 本客户端未使用（验证码登录不传此字段；密码登录走 LoginV2Request）
+    string channel = 4;          // 本客户端未使用（渠道信息通过 x-eta 请求头的 ch=default 传递）
 }
 
+// 登录响应（验证码/密码登录通用）
 message LoginResponse {
-    int64 user_id = 1;
-    string authorization = 2;
+    int64 user_id = 1;           // 用户ID
+    string authorization = 2;    // 认证Token
 }
 
 // 密码登录请求
 // POST /v2/account/login
 message LoginV2Request {
-    string phone_number = 1;
-    string password = 2;
+    string phone_number = 1;     // +86格式手机号
+    string password = 2;         // 明文密码（6-20位 [a-zA-Z0-9_.]）
 }
 
+// 与 LoginResponse 结构相同，复用解析
 message LoginV2Response {
     int64 user_id = 1;
     string authorization = 2;
@@ -41,9 +44,10 @@ message LoginV2Response {
 // 一键登录请求
 // POST /account/v1/login/by-one-click
 message LoginByOneClickRequest {
-    // 一键登录token
+    // 空请求体（一键登录参数由SDK自动填充）
 }
 
+// 一键登录响应
 message LoginByOneClickResponse {
     int64 user_id = 1;
     string authorization = 2;
@@ -67,20 +71,23 @@ message MyProfileResponse {
 message Member {
     int64 type = 1;         // 会员类型（2=VIP）
     int64 expire_time = 2;  // 会员过期时间（秒级时间戳）← 手机端加速时长余额的关键
+                            // 派生字段（非 proto 字段）：remaining_seconds = max(0, expire_time - now)
+                            //   由 core/client.py fetch_mobile_profile() 计算并加入返回字典
 }
 
 // 视频奖励信息（MyProfileResponse.field 8 内嵌）
 message UserVideoAward {
-    int64 award = 1;        // 奖励数值
+    int64 award = 1;        // 奖励值（单位/含义待确认）
     bool has = 2;           // 是否有奖励
 }
 
 // 刷新token
 // POST /v2/account/refresh/token
 message RefreshTokenRequest {
-    // 空请求体或包含refresh_token
+    // 空请求体
 }
 
+// Token刷新响应
 message RefreshTokenResponse {
     string authorization = 1;
 }

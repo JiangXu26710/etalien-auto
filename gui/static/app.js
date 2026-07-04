@@ -12,16 +12,22 @@ let hasRenderedOnce = false;
 let logMouseDownTarget = null;
 let menuCounter = 0;
 
-// Cache for mobile status data
+// vipFloatShown: 已显示过 VIP 飘字动画的账号集合，防止轮询重复触发
+// prevStats: 上一轮统计值（total/active/watched/items），供 animateValue/animateProgress 做滚动计数
+// hasRenderedOnce: 首次渲染标志，控制卡片入场交错动画是否播放
+// logMouseDownTarget: 日志弹窗 mousedown 目标，用于遮罩层点击关闭检测
+// menuCounter: 自增计数器，为 action-menu-wrap 生成唯一 ID
+
+// 手机端状态数据缓存
 const mobileStatusCache = {};
 const flippedPhones = new Set();
 
-// SVG icon helpers
+// SVG 图标辅助常量
 const SVG_PC = '<svg viewBox="0 0 24 24"><path d="M20 18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/></svg>';
 const SVG_MOBILE = '<svg viewBox="0 0 24 24"><path d="M15.5 1h-8C6.12 1 5 2.12 5 3.5v17C5 21.88 6.12 23 7.5 23h8c1.38 0 2.5-1.12 2.5-2.5v-17C18 2.12 16.88 1 15.5 1zm-4 21c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4.5-4H7V4h9v14z"/></svg>';
 const SVG_ALL = '<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>';
 
-// Claim select dropdown HTML builder
+// 领取选择下拉框 HTML 构建器
 function claimSelectHTML(id, selected) {
     const opts = [
         { value: 'all', label: '全部领取', icon: SVG_ALL },
@@ -146,10 +152,16 @@ async function windowClose() {
     } catch(e) { window.close(); }
 }
 
+/**
+ * 初始化窗口标题栏拖拽。
+ * 含 3px 移动阈值（避免双击误触发）、异步竞态防护（每次 await 后检查 isMouseDown）、
+ * 最大化状态下拖拽自动还原、双击切换最大化。
+ */
 function initDrag() {
     const titleBarDrag = document.getElementById('titleBarDrag');
     if (!titleBarDrag) return;
 
+    // mousedown: 同步记录按下位置（不调用 API，避免 async 竞态）
     titleBarDrag.addEventListener('mousedown', (e) => {
         if (e.button !== 0) return;
         e.preventDefault();
@@ -159,6 +171,7 @@ function initDrag() {
 
     document.addEventListener('mousemove', async (e) => {
         if (mouseDownPos && !dragState && !dragInitiating) {
+            // 延迟初始化：移动超过 3px 阈值才启动拖拽，避免双击触发拖拽
             const dx = e.screenX - mouseDownPos.x;
             const dy = e.screenY - mouseDownPos.y;
             if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
@@ -169,6 +182,7 @@ function initDrag() {
 
             try {
                 const isMax = await pywebview.api.is_maximized();
+                // 竞态防护：每次 await 后检查 isMouseDown，鼠标已释放则中止
                 if (!isMouseDown) return;
                 if (isMax) {
                     document.body.classList.add('win-state-out');
@@ -203,6 +217,7 @@ function initDrag() {
             return;
         }
 
+        // 拖拽中：计算偏移并调用 move_window；dragInFlight 防止异步调用堆积
         if (!dragState || dragInFlight) return;
         dragInFlight = true;
         const dx = e.screenX - dragState.startX;
@@ -212,12 +227,14 @@ function initDrag() {
         });
     });
 
+    // mouseup: 清除所有拖拽状态
     document.addEventListener('mouseup', () => {
         isMouseDown = false;
         mouseDownPos = null;
         dragState = null;
     });
 
+    // dblclick: 清除拖拽状态后切换最大化（避免残留 dragState 导致窗口跟随鼠标）
     titleBarDrag.addEventListener('dblclick', () => {
         isMouseDown = false;
         mouseDownPos = null;
@@ -226,6 +243,7 @@ function initDrag() {
     });
 }
 
+// 从最小化恢复时播放淡入动画（frameless 窗口无原生 DWM 过渡）
 document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
         document.body.classList.add('win-maximize-in');
@@ -243,6 +261,7 @@ function formatDuration(seconds) {
     return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+// 在账号卡片的 VIP 时长位置显示 "+HH:MM:SS" 飘字动画，1.5s 上浮 28px 并淡出
 function showVipFloat(phone, diffSeconds) {
     const card = document.querySelector(`.account-card[data-phone="${phone}"]`);
     if (!card) return;
@@ -284,6 +303,11 @@ function animateProgress(el, startW, endW, startT, endT, duration) {
     requestAnimationFrame(update);
 }
 
+/**
+ * 更新账号卡片的进度条与进度文本。
+ * phase='mobile' 时更新手机端面（card-back），否则更新 PC 面（card-front）。
+ * 初始进度来自缓存（cachedStatusList 或 mobileStatusCache），叠加本次领取增量。
+ */
 function updateCardProgress(phone, current, total, phase) {
     const card = document.querySelector(`.account-card[data-phone="${phone}"]`);
     if (!card) return;
@@ -440,7 +464,7 @@ function _animateCloseLogModal() {
 async function refreshStatus(withAnimation = true) {
     try {
         if (withAnimation) hasRenderedOnce = false;
-        // Clear mobile status cache on full refresh so fresh data is fetched
+        // 全量刷新时清空手机端状态缓存，以获取新数据
         Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
         const data = await api('/api/status');
         cachedStatusList = data.status || [];
@@ -484,6 +508,11 @@ async function refreshAccountsLight() {
     }
 }
 
+/**
+ * 根据 statusList 渲染账号卡片列表。
+ * 含翻转状态恢复、action-menu 迁移到 body（避免 preserve-3d 撑大父级）、
+ * 统计聚合（总账号数/已启用/总进度，按 claim_target 过滤阶段）。
+ */
 function renderAccounts(statusList) {
     let totalWatched = 0;
     let totalItems = 0;
@@ -519,7 +548,7 @@ function renderAccounts(statusList) {
                         totalItems += t;
                     }
                 }
-                // 手机端进度累加（与 PC 端共用同一 token）
+                // claim_target !== 'pc' 时累加手机端进度（mobile_progress 字段独立于 PC 端 progress）
                 if (ct !== 'pc' && s.mobile_progress) {
                     const [mw, mt] = s.mobile_progress.split('/').map(Number);
                     if (!isNaN(mw) && !isNaN(mt)) {
@@ -626,7 +655,7 @@ function renderAccounts(statusList) {
         }).join('');
     }
 
-    // Restore flipped state after re-render
+    // 重新渲染后恢复翻转状态
     if (flippedPhones.size > 0) {
         listEl.querySelectorAll('.account-card').forEach(card => {
             const phone = card.dataset.phone;
@@ -637,7 +666,7 @@ function renderAccounts(statusList) {
                     if (mobileStatusCache[phone]) {
                         renderMobileBack(backInfo, mobileStatusCache[phone]);
                     } else {
-                        // Cache cleared by refresh — re-fetch mobile status
+                        // 缓存已被 refresh 清空 — 重新获取手机端状态
                         fetchMobileStatus(card);
                     }
                 }
@@ -645,12 +674,13 @@ function renderAccounts(statusList) {
         });
     }
 
-    // 将所有 .action-menu 从卡片内部迁到 body，避免 card-back 的 transform
-    // 创建 containing block 让 position:fixed 的 menu 相对 card-back 定位，
-    // 其尺寸计入 card-back.scrollHeight（撑出约 63px），传导到 body.scrollHeight。
-    // 当同行卡片全部翻面时 card-inner 的 3D transform 改变 scrollHeight 继承，
-    // 这部分溢出消失，导致 body.scrollHeight 异常减少（页面高度抖动）。
-    // card-front 的 menu 因 card-front 无 transform 不受影响，但为一致性统一迁出。
+    // 将所有 .action-menu 从卡片内部迁到 body，避免 .card-inner 的
+    // transform-style: preserve-3d 使其成为 position:fixed 后代的 containing block，
+    // 导致 menu 尺寸计入 card-inner.scrollHeight（未翻面时撑出约 63px）。
+    // 当同行卡片全部翻面时，card-inner 的 3D transform 改变 scrollHeight 计算，
+    // 这部分溢出消失（翻面后卡片计算高度比实际更矮）；矮卡片会对齐高卡片，
+    // 只有同行全部翻面时才触发，导致 body.scrollHeight 异常减少（页面高度抖动）。
+    // card-front/card-back 的 menu 均在 card-inner 内同样受影响，统一迁出。
     listEl.querySelectorAll('.action-menu-wrap').forEach(wrap => {
         if (!wrap.id) wrap.id = 'amw-' + (++menuCounter);
         const menu = wrap.querySelector('.action-menu');
@@ -867,6 +897,7 @@ function closeAllActionMenus() {
     });
 }
 
+// 翻转账号卡片，显示正面（PC 权益）或背面（手机权益）。翻面时懒加载手机端状态。
 function flipCard(el) {
     if (event.target.closest('.account-actions')) return;
     closeAllActionMenus();
@@ -881,6 +912,7 @@ function flipCard(el) {
     }
 }
 
+// 懒加载手机端状态（VIP 时长 + 任务进度），优先读缓存，未命中时调 API 并缓存结果。
 async function fetchMobileStatus(card) {
     const phone = card.dataset.phone;
     const backInfo = card.querySelector('.card-back-info');
@@ -936,12 +968,17 @@ function renderMobileBack(backInfo, status) {
     `;
 }
 
+/**
+ * 切换账号卡片操作菜单（⋯）的显隐。
+ * menu 位置在 body 中管理（避免 preserve-3d containing block 问题），
+ * 含视口边界自适应（右边界超出向左偏移、下边界超出向上展开）。
+ */
 function toggleActionMenu(btn) {
     if (event) event.stopPropagation();
     const wrap = btn.closest('.action-menu-wrap');
     if (!wrap.id) wrap.id = 'amw-' + (++menuCounter);
     
-    // menu 首次打开时在 wrap 中；曾打开过则已移到 body 中，通过 originWrapId 关联
+    // menu 可能在 wrap 中（renderAccounts 前）或 body 中（renderAccounts 后），通过 originWrapId 关联
     let menu = wrap.querySelector('.action-menu');
     if (!menu) {
         menu = document.body.querySelector(`:scope > .action-menu[data-origin-wrap-id="${wrap.id}"]`);
@@ -950,7 +987,7 @@ function toggleActionMenu(btn) {
     
     const rect = btn.getBoundingClientRect();
     
-    // Close all other menus（menu 留在 body 中，不 append 回 wrap，避免 preserve-3d 撑大父级）
+    // 关闭其他菜单（menu 留在 body 中，不 append 回 wrap，避免 preserve-3d 撑大父级）
     document.querySelectorAll('.action-menu.active').forEach(m => {
         if (m !== menu) {
             m.classList.remove('active');
@@ -1224,6 +1261,7 @@ async function doVerifyPwd(phone) {
     } catch (e) { showToast(e.message || '登录失败', 'error'); }
 }
 
+// 启动异步领取流程：调用后端 /api/claim，将按钮切换为"查看日志"，开始轮询进度。
 async function startClaim() {
     const btn = document.getElementById('btnClaim');
     btn.disabled = true;
@@ -1251,6 +1289,11 @@ async function startClaim() {
     }
 }
 
+/**
+ * 领取进度轮询：每 1s 调用 /api/claim/progress，更新日志面板和卡片进度。
+ * 停止条件：data.running=false（领取完成）或连续失败 10 次（后端不可达）。
+ * 领取完成时自动刷新状态并恢复按钮。
+ */
 function pollClaimProgress() {
     if (claimPollTimer) clearTimeout(claimPollTimer);
 
@@ -1375,11 +1418,13 @@ function pollClaimProgress() {
     claimPollTimer = setTimeout(_poll, 1000);
 }
 
+// 翻转设置弹窗中的"最大轮数"卡片，在 PC 端和手机端配置之间切换。
 function flipSettingsCard(btn) {
     const card = btn.closest('.settings-flip-card');
     if (card) card.classList.toggle('flipped');
 }
 
+// 打开设置弹窗：并发加载设置、计划任务、版本信息，渲染含最大并发数、间隔、轮数、定时任务、Server酱等配置项。
 function showSettings() {
     Promise.all([
         api('/api/settings'),
@@ -1460,6 +1505,7 @@ function showSettings() {
     }).catch(e => showToast(e.message || '获取设置失败', 'error'));
 }
 
+// 保存设置：含风控预警（理论请求频率 > 50次/秒时弹二次确认），同步更新计划任务。
 async function doSaveSettings() {
     const maxConcurrent = parseInt(document.getElementById('setMaxConcurrent').value);
     const requestInterval = parseFloat(document.getElementById('setInterval').value);
@@ -1516,6 +1562,7 @@ async function doSaveSettings() {
     } catch (e) { showToast(e.message || '保存失败', 'error'); }
 }
 
+// 弹出确认对话框，返回 Promise<boolean>。用户点击确认按钮 resolve(true)，取消按钮 resolve(false)。
 function showConfirmDialog(title, message, confirmText, cancelText) {
     return new Promise(resolve => {
         const overlay = document.createElement('div');
@@ -1555,6 +1602,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }, 300);
 });
 
+// 初始化按钮涟漪按压反馈：mousedown 时从鼠标位置生成金色渐变涟漪圆，0.5s 扩散淡出。
 function initRipple() {
     document.addEventListener('mousedown', (e) => {
         const btn = e.target.closest('.btn-primary, .btn-secondary, .btn-accent, .btn-small, .btn-modal, .login-method-tab');

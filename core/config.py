@@ -1,3 +1,11 @@
+"""
+配置管理模块。
+
+统一管理项目路径、账号数据（accounts.json）和全局设置（settings.json）的读写。
+提供设置校验、原子写入、内存缓存等基础设施。账号读写锁 accounts_lock 在此定义，
+gui/api.py 和 core/service.py 均从此模块导入，确保同一实例。
+"""
+
 import json
 import os
 import re
@@ -9,8 +17,10 @@ from threading import Lock
 
 logger = logging.getLogger(__name__)
 
+# 定时执行时间格式校验正则（HH:MM）
 SCHEDULE_TIME_PATTERN = re.compile(r'^\d{2}:\d{2}$')
 
+# 账号数据读写锁（全局唯一），gui/api.py 和 core/service.py 共用
 accounts_lock = Lock()
 
 
@@ -56,6 +66,18 @@ _settings_lock = Lock()
 
 
 def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
+    """校验设置值的类型与范围，缺失字段自动填充默认值。
+
+    内部创建入参的浅拷贝，不修改原始字典。未知字段会被记录警告并忽略。
+
+    Args:
+        settings: 待校验的设置字典，可包含 SETTINGS_SCHEMA 中定义的任意字段子集
+
+    Returns:
+        (是否通过, 错误消息, 错误类别) 三元组。
+        通过时返回 (True, None, None)；
+        失败时错误类别为 "validation"，错误消息描述具体失败原因。
+    """
     settings = dict(settings)
     unknown_keys = set(settings.keys()) - set(SETTINGS_SCHEMA.keys())
     if unknown_keys:
@@ -82,6 +104,13 @@ def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
 
 
 def load_accounts() -> list[dict]:
+    """从 accounts.json 读取账号列表。
+
+    文件不存在或解析失败时返回空列表，不抛异常。
+
+    Returns:
+        账号字典列表，每个字典包含 phone、auth_token、device_id 等字段
+    """
     if os.path.exists(ACCOUNTS_FILE):
         try:
             with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
@@ -121,6 +150,14 @@ def _atomic_write(filepath: str, data: str) -> None:
 
 
 def save_accounts(accounts: list[dict]) -> None:
+    """将账号列表原子写入 accounts.json。
+
+    使用 _atomic_write 确保写入中途崩溃不会损坏数据。
+    写盘失败时向上抛出 OSError，调用方需自行捕获处理。
+
+    Args:
+        accounts: 账号字典列表
+    """
     try:
         _atomic_write(ACCOUNTS_FILE, json.dumps(accounts, ensure_ascii=False, indent=4))
     except OSError as e:
