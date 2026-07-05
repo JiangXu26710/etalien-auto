@@ -21,6 +21,9 @@ let menuCounter = 0;
 // 手机端状态数据缓存
 const mobileStatusCache = {};
 const flippedPhones = new Set();
+// 手机端时长自减：追踪需要递减的 phone 集合，由单个全局定时器统一处理
+const mobileCountdownPhones = new Set();
+let mobileCountdownTimer = null;
 
 // SVG 图标辅助常量
 const SVG_PC = '<svg viewBox="0 0 24 24"><path d="M20 18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/></svg>';
@@ -466,6 +469,12 @@ async function refreshStatus(withAnimation = true) {
         if (withAnimation) hasRenderedOnce = false;
         // 全量刷新时清空手机端状态缓存，以获取新数据
         Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
+        // 停止所有手机端时长自减（翻面卡片重新渲染后会按需重启）
+        mobileCountdownPhones.clear();
+        if (mobileCountdownTimer) {
+            clearInterval(mobileCountdownTimer);
+            mobileCountdownTimer = null;
+        }
         const data = await api('/api/status');
         cachedStatusList = data.status || [];
         renderAccounts(cachedStatusList);
@@ -562,9 +571,16 @@ function renderAccounts(statusList) {
 
             // 同步手机端数据到 mobileStatusCache（避免翻面时重复请求 /api/accounts/<phone>/mobile_status）
             if (s.token_valid && s.mobile_progress) {
+                const oldCache = mobileStatusCache[s.phone];
+                const newDuration = s.mobile_duration || 0;
+                // mobile_duration 未变化时保留旧 mobile_expire_ts，避免轻量刷新重置自减基线
+                const expireTs = (oldCache && oldCache.mobile_duration === newDuration && oldCache.mobile_expire_ts)
+                    ? oldCache.mobile_expire_ts
+                    : Math.floor(Date.now() / 1000) + newDuration;
                 mobileStatusCache[s.phone] = {
                     phone: s.phone,
-                    mobile_duration: s.mobile_duration || 0,
+                    mobile_duration: newDuration,
+                    mobile_expire_ts: expireTs,
                     mobile_progress: s.mobile_progress,
                     mobile_rewarded_count: s.mobile_rewarded_count || 0,
                     mobile_claimed_count: s.mobile_claimed_count || 0,
@@ -575,6 +591,7 @@ function renderAccounts(statusList) {
                 };
             } else {
                 // token 失效或未登录时清除旧缓存，避免显示过期数据
+                stopMobileCountdown(s.phone);
                 delete mobileStatusCache[s.phone];
             }
 
@@ -909,6 +926,7 @@ function flipCard(el) {
         fetchMobileStatus(card);
     } else {
         flippedPhones.delete(phone);
+        stopMobileCountdown(phone);
     }
 }
 
@@ -928,6 +946,7 @@ async function fetchMobileStatus(card) {
     try {
         const data = await api(`/api/accounts/${encodeURIComponent(phone)}/mobile_status`);
         if (data.status) {
+            data.status.mobile_expire_ts = Math.floor(Date.now() / 1000) + (data.status.mobile_duration || 0);
             mobileStatusCache[phone] = data.status;
             renderMobileBack(backInfo, data.status);
         }
@@ -951,7 +970,11 @@ function renderMobileBack(backInfo, status) {
         `;
         return;
     }
-    const duration = formatDuration(status.mobile_duration || 0);
+    // 优先基于 mobile_expire_ts 计算剩余时长（自减场景下比 mobile_duration 更准确）
+    const remain = status.mobile_expire_ts
+        ? Math.max(0, status.mobile_expire_ts - Math.floor(Date.now() / 1000))
+        : (status.mobile_duration || 0);
+    const duration = formatDuration(remain);
     const progress = status.mobile_progress || '-/-';
     const progressParts = progress.split('/');
     const pct = progressParts[1] > 0 ? (progressParts[0] / progressParts[1] * 100) : 0;
@@ -966,6 +989,50 @@ function renderMobileBack(backInfo, status) {
             <span class="account-progress-label">${progress}</span>
         </div>
     `;
+    // 渲染成功后启动时长自减（基于 mobile_expire_ts 绝对时间戳计算）
+    startMobileCountdown(status.phone);
+}
+
+// 启动指定账号的手机端时长自减：加入全局追踪集合，按需启动唯一定时器
+function startMobileCountdown(phone) {
+    if (!phone) return;
+    mobileCountdownPhones.add(phone);
+    ensureMobileCountdown();
+}
+
+// 确保全局定时器运行（仅在没有活动定时器时启动）
+function ensureMobileCountdown() {
+    if (mobileCountdownTimer) return;
+    mobileCountdownTimer = setInterval(updateAllMobileCountdowns, 1000);
+}
+
+// 单次 tick：遍历所有需递减的账号，基于 mobile_expire_ts 重算剩余秒数并更新 DOM
+function updateAllMobileCountdowns() {
+    const now = Math.floor(Date.now() / 1000);
+    for (const phone of mobileCountdownPhones) {
+        const cache = mobileStatusCache[phone];
+        if (!cache || !cache.mobile_expire_ts) continue;
+        const card = document.querySelector(
+            `.account-card[data-phone="${phone}"] .card-back .card-back-value`
+        );
+        if (!card) continue;
+        const remain = Math.max(0, cache.mobile_expire_ts - now);
+        card.textContent = formatDuration(remain);
+        if (remain <= 0) mobileCountdownPhones.delete(phone);
+    }
+    if (mobileCountdownPhones.size === 0) {
+        clearInterval(mobileCountdownTimer);
+        mobileCountdownTimer = null;
+    }
+}
+
+// 停止指定账号的手机端时长自减（翻回正面 / 删除账号时调用）
+function stopMobileCountdown(phone) {
+    mobileCountdownPhones.delete(phone);
+    if (mobileCountdownPhones.size === 0 && mobileCountdownTimer) {
+        clearInterval(mobileCountdownTimer);
+        mobileCountdownTimer = null;
+    }
 }
 
 /**
@@ -1178,6 +1245,7 @@ async function doDeleteAccount(phone) {
 
         showToast('账号已删除', 'success');
         closeModalForce();
+        stopMobileCountdown(phone);
         delete mobileStatusCache[phone];
         setTimeout(() => refreshAccountsLight(), 400);
     } catch (e) { showToast(e.message || '删除失败', 'error'); }
