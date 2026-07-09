@@ -1,11 +1,13 @@
 """
 配置管理模块。
 
-统一管理项目路径、账号数据（accounts.json）和全局设置（settings.json）的读写。
-提供设置校验、原子写入、内存缓存等基础设施。账号读写锁 accounts_lock 在此定义，
-gui/api.py 和 core/service.py 均从此模块导入，确保同一实例。
+统一管理项目路径与全局设置（settings.json）的读写，提供设置校验、原子写入、
+内存缓存等基础设施。账号运行时存储已迁移至 core/db.py（SQLite），本模块仅保留
+_load_accounts_json（迁移工具读取旧 accounts.json 的纯函数版本，供 core/db.py 的
+migrate_from_json 跨模块调用）。
 """
 
+import copy
 import json
 import os
 import re
@@ -17,11 +19,11 @@ from threading import Lock
 
 logger = logging.getLogger(__name__)
 
+# 应用版本号（api.py 通过 /api/version 接口对外暴露）
+VERSION = "1.0.1"
+
 # 定时执行时间格式校验正则（HH:MM）
 SCHEDULE_TIME_PATTERN = re.compile(r'^\d{2}:\d{2}$')
-
-# 账号数据读写锁（全局唯一），gui/api.py 和 core/service.py 共用
-accounts_lock = Lock()
 
 
 def get_project_dir() -> str:
@@ -48,15 +50,15 @@ DEFAULT_SETTINGS = {
 }
 
 SETTINGS_SCHEMA = {
-    "max_concurrent": {"type": int, "min": 1, "max": 50},
-    "request_interval": {"type": float, "min": 0.1, "max": 30.0},
+    "max_concurrent": {"type": int, "min": 1, "max": 999},
+    "request_interval": {"type": float, "min": 0.01, "max": 30.0},
     "max_rounds": {"type": int, "min": 1, "max": 200},
     "mobile_max_rounds": {"type": int, "min": 1, "max": 200},
     "schedule_time": {"type": str},
     "schan_enabled": {"type": bool},
     "schan_key": {"type": str},
     "max_retries": {"type": int, "min": 0, "max": 10},       # 0=不重试，10=极端场景
-    "retry_delay": {"type": float, "min": 0.1, "max": 30.0},  # 与 request_interval 范围一致
+    "retry_delay": {"type": float, "min": 0.01, "max": 30.0},  # 与 request_interval 范围一致
 }
 
 
@@ -103,20 +105,24 @@ def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
     return True, None, None
 
 
-def load_accounts() -> list[dict]:
-    """从 accounts.json 读取账号列表。
+def _load_accounts_json(json_path: str = ACCOUNTS_FILE) -> list[dict]:
+    """从指定 JSON 文件读取账号列表（纯函数版本，不走缓存/锁）。
 
-    文件不存在或解析失败时返回空列表，不抛异常。
+    供 core/db.py 的 migrate_from_json 跨模块调用，读取旧 accounts.json
+    或 accounts.json.bak 作为迁移数据源。文件不存在或解析失败时返回空列表。
+
+    Args:
+        json_path: JSON 文件路径，默认 ACCOUNTS_FILE
 
     Returns:
-        账号字典列表，每个字典包含 phone、auth_token、device_id 等字段
+        账号字典列表
     """
-    if os.path.exists(ACCOUNTS_FILE):
+    if os.path.exists(json_path):
         try:
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            with open(json_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to load accounts: %s", e)
+            logger.error("Failed to load accounts from %s: %s", json_path, e)
             return []
     return []
 
@@ -149,22 +155,6 @@ def _atomic_write(filepath: str, data: str) -> None:
         raise
 
 
-def save_accounts(accounts: list[dict]) -> None:
-    """将账号列表原子写入 accounts.json。
-
-    使用 _atomic_write 确保写入中途崩溃不会损坏数据。
-    写盘失败时向上抛出 OSError，调用方需自行捕获处理。
-
-    Args:
-        accounts: 账号字典列表
-    """
-    try:
-        _atomic_write(ACCOUNTS_FILE, json.dumps(accounts, ensure_ascii=False, indent=4))
-    except OSError as e:
-        logger.error("Failed to save accounts: %s", e)
-        raise
-
-
 def _read_settings_from_disk() -> dict:
     """从磁盘读取 settings.json（load_settings 的底层实现）。"""
     if os.path.exists(SETTINGS_FILE):
@@ -181,16 +171,17 @@ def load_settings() -> dict:
     """读取 settings，优先走内存缓存。
 
     缓存未初始化时从磁盘读取并缓存；已初始化时直接返回缓存副本。
+    返回 copy.deepcopy 深拷贝副本，防止调用方修改嵌套对象污染缓存。
     需要刷新缓存的场景调用 reload_settings()。
     """
     global _settings_cache
     if _settings_cache is not None:
-        return dict(_settings_cache)  # 返回副本，防止调用方 in-place 修改污染缓存
+        return copy.deepcopy(_settings_cache)
     with _settings_lock:
         if _settings_cache is not None:
-            return dict(_settings_cache)
+            return copy.deepcopy(_settings_cache)
         _settings_cache = _read_settings_from_disk()
-        return dict(_settings_cache)
+        return copy.deepcopy(_settings_cache)
 
 
 def reload_settings() -> dict:
@@ -204,7 +195,7 @@ def reload_settings() -> dict:
     global _settings_cache
     with _settings_lock:
         _settings_cache = _read_settings_from_disk()
-        return dict(_settings_cache)
+        return copy.deepcopy(_settings_cache)
 
 
 def save_settings(settings: dict) -> None:
@@ -213,6 +204,12 @@ def save_settings(settings: dict) -> None:
     写盘失败时记日志后向上抛出 OSError，且不更新缓存（避免缓存与磁盘不一致：缓存反映
     新值但磁盘仍是旧值，后续 load_settings 走缓存读到未持久化的"幽灵配置"，重启后丢失）。
     调用方需捕获 OSError 以感知失败。
+
+    并发说明：_atomic_write 在 _settings_lock 外执行以避免阻塞读操作，两个并发
+    save_settings 可能导致缓存与磁盘不一致（A 写盘 → B 写盘覆盖 → A 更新缓存 →
+    B 更新缓存，中间状态缓存为 A 值但磁盘已是 B 值）。由于写盘与加锁相互独立，
+    最终磁盘值（最后完成的写盘）与缓存值（最后获取锁的 save）可能来自不同线程，
+    但后续 reload_settings 可纠正。save_settings 是低频操作（用户改设置），当前权衡可接受。
     """
     global _settings_cache
     try:
@@ -221,4 +218,4 @@ def save_settings(settings: dict) -> None:
         logger.error("Failed to save settings: %s", e)
         raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
     with _settings_lock:
-        _settings_cache = dict(settings)  # 缓存写入的副本
+        _settings_cache = copy.deepcopy(settings)  # 缓存写入的深拷贝副本

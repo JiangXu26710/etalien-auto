@@ -18,9 +18,13 @@ from typing import Any, Callable
 import requests
 
 from core.client import EtAlienClient, NeedLoginError
-from core.config import load_accounts, save_accounts, load_settings, save_settings, validate_settings, accounts_lock, PROJECT_DIR
+from core.config import load_settings, save_settings, validate_settings, PROJECT_DIR
+from core.db import DbAccountRepository
 
 logger = logging.getLogger(__name__)
+
+# 模块级 Repository 单例（连接延迟到首次方法调用时建立，随进程退出由 OS 回收）
+repo = DbAccountRepository()
 
 # 中国大陆 11 位手机号正则
 PHONE_PATTERN = re.compile(r'^1[3-9]\d{9}$')
@@ -56,47 +60,23 @@ def account_label(account: dict) -> str:
     return " ".join(parts)
 
 
-def _get_or_create_account(phone: str, accounts: list[dict]) -> dict:
-    """在账号列表中查找指定手机号，找不到则创建初始态账号并追加到列表。
-
-    初始态账号仅含 name/phone/remark/enabled 四个字段，不含 claim_target 和 password，
-    依赖调用方通过 account.get("key", default) 兜底。
-
-    Args:
-        phone: 手机号
-        accounts: 账号列表（会被原地修改）
-
-    Returns:
-        找到或新建的账号字典
-    """
-    for a in accounts:
-        if a["phone"] == phone:
-            return a
-    new_account = {
-        "name": "",
-        "phone": phone,
-        "remark": "",
-        "enabled": True,
-    }
-    accounts.append(new_account)
-    return new_account
-
-
 def ensure_device_id(phone: str) -> str:
     """获取或生成 device_id，并持久化到账号数据中。"""
-    with accounts_lock:
-        accounts = load_accounts()
-        account = _get_or_create_account(phone, accounts)
-        if account.get("device_id"):
-            return account["device_id"]
-        device_id = EtAlienClient.generate_device_id()
-        account["device_id"] = device_id
-        try:
-            save_accounts(accounts)
-        except OSError as e:
-            # 辅助流程：device_id 已生成并用于本次登录，写盘失败不影响主流程，下次调用会重新尝试持久化
-            logger.warning("ensure_device_id save_accounts failed for %s: %s", phone, e)
-        return device_id
+    account = repo.get_or_create(phone)
+    if account is None:
+        # 极端竞态：get_or_create 在 IntegrityError 后重查时账号已被跨进程删除
+        # 仅返回临时 device_id 保证本次登录流程可继续，不持久化（无对应账号记录）
+        logger.warning("ensure_device_id: account vanished after get_or_create for %s", phone)
+        return EtAlienClient.generate_device_id()
+    if account.get("device_id"):
+        return account["device_id"]
+    device_id = EtAlienClient.generate_device_id()
+    try:
+        repo.update_fields(phone, device_id=device_id)
+    except Exception as e:
+        # 辅助流程：device_id 已生成并用于本次登录，写盘失败不影响主流程，下次调用会重新尝试持久化
+        logger.warning("ensure_device_id update_fields failed for %s: %s", phone, e)
+    return device_id
 
 
 def send_login_code(phone: str) -> dict:
@@ -107,27 +87,24 @@ def send_login_code(phone: str) -> dict:
 
 
 def _save_login_result(phone: str, login_result: dict, device_id: str, password: str | None = None) -> None:
-    """持久化登录结果到 accounts.json（加锁，内部调用 load_accounts + save_accounts）。
+    """持久化登录结果到账号表（Repository 内部自带 _db_lock）。
 
     更新 auth_token、user_id、device_id、saved_at，可选保存 password。
     写盘失败时记录警告日志但不中断调用方（辅助流程，token 已在内存中可用）。
     """
-    with accounts_lock:
-        accounts = load_accounts()
-        for a in accounts:
-            if a["phone"] == phone:
-                a["auth_token"] = login_result.get("authorization")
-                a["user_id"] = login_result.get("user_id")
-                a["device_id"] = device_id
-                a["saved_at"] = time.time()
-                if password is not None:
-                    a["password"] = password
-                break
-        try:
-            save_accounts(accounts)
-        except OSError as e:
-            # 辅助流程：token 持久化失败不影响本次登录结果，下次 token 过期会触发重登重新获取
-            logger.warning("_save_login_result save_accounts failed for %s: %s", phone, e)
+    updates = {
+        "auth_token": login_result.get("authorization"),
+        "user_id": login_result.get("user_id"),
+        "device_id": device_id,
+        "saved_at": time.time(),
+    }
+    if password is not None:
+        updates["password"] = password
+    try:
+        repo.update_fields(phone, **updates)
+    except Exception as e:
+        # 辅助流程：token 持久化失败不影响本次登录结果，下次 token 过期会触发重登重新获取
+        logger.warning("_save_login_result update_fields failed for %s: %s", phone, e)
 
 
 def verify_login(phone: str, code: str | None = None, password: str | None = None) -> dict:
@@ -239,6 +216,7 @@ def get_account_status(account: dict) -> dict:
         "mobile_claimed_count": 0,
         "mobile_not_get_ad_duration": 0,
         "mobile_error": False,  # 手机端接口查询失败标记，前端据此显示"查询失败"而非误导性的 0/0
+        "pc_error": False,  # PC 端接口查询失败标记，与 mobile_error 对称，前端据此区分"无任务"和"查询失败"
         # 暴露给前端，使 idle 总进度口径与领取中对齐（只统计 claim_target 配置的阶段）
         "claim_target": account.get("claim_target", "all"),
     }
@@ -248,6 +226,8 @@ def get_account_status(account: dict) -> dict:
         try:
             # 4 个接口并发：PC duration + PC ad_config + mobile activity + mobile profile
             # token 过期时，第一个 result() 即抛 NeedLoginError，跳到 except
+            # 其余 futures 会快速失败：_handle_auth_error_and_retry 立即抛 NeedLoginError（无重试），
+            # 无需共享取消标志；ThreadPoolExecutor.__exit__ 的 shutdown(wait=True) 等待全部完成
             with ThreadPoolExecutor(max_workers=4) as ex:
                 dur_future = ex.submit(client.fetch_pc_duration)
                 tasks_future = ex.submit(client.fetch_pc_ad_config)
@@ -265,21 +245,27 @@ def get_account_status(account: dict) -> dict:
             for f in futures:
                 f.cancel()
             info["token_expired"] = True
+            client.close()
             return info
         except Exception:
             logger.exception("get_account_status API call failed for %s", phone)
+            client.close()
             return info
         # 正常路径（未抛异常）下显式标记 token 有效，否则前端无法区分"未登录"和"token 有效"
         info["token_valid"] = True
         if not dur.get("_error"):
             info["vip_duration"] = dur.get("vip_duration_second", 0)
             info["free_duration"] = dur.get("free_duration_second", 0)
+        else:
+            info["pc_error"] = True
         if not tasks_result.get("_error"):
             tasks = tasks_result.get("list", [])
             total_w = sum(l["watch_cnt"] for l in tasks)
             total_t = sum(len(l["items"]) for l in tasks)
             info["progress"] = f"{total_w}/{total_t}"
             info["tasks"] = tasks
+        else:
+            info["pc_error"] = True
         # 手机端进度（与 PC 端共用同一 token，token 有效时直接查手机端接口）
         if not mob_activity.get("_error"):
             video_cnt = mob_activity.get("video_cnt", 0)
@@ -297,6 +283,7 @@ def get_account_status(account: dict) -> dict:
             info["mobile_not_get_ad_duration"] = mob_profile.get("mobile_not_get_ad_duration", 0)
         else:
             info["mobile_error"] = True
+        client.close()
     return info
 
 
@@ -333,9 +320,11 @@ def get_account_mobile_status(account: dict) -> dict:
             profile = prof_future.result()
     except NeedLoginError:
         info["token_expired"] = True
+        client.close()
         return info
     except Exception:
         logger.exception("get_account_mobile_status API call failed for %s", phone)
+        client.close()
         return info
 
     info["token_valid"] = True
@@ -360,12 +349,18 @@ def get_account_mobile_status(account: dict) -> dict:
     else:
         info["mobile_error"] = True
 
+    client.close()
     return info
 
 
 def get_all_status(max_workers: int = 10) -> list[dict]:
-    """并发查询所有账号状态，并按手机号排序返回。"""
-    accounts = load_accounts()
+    """并发查询所有账号状态，并按 id 降序返回（新加用户靠前）。
+
+    list_all() 已按 id DESC 返回，但 as_completed 会打乱顺序，故这里按
+    phone→id 映射重新排序，保持与 db 主键顺序一致。
+    """
+    accounts = repo.list_all()
+    phone_to_id = {a["phone"]: a.get("id", 0) for a in accounts}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(get_account_status, a): a for a in accounts}
         results = []
@@ -374,7 +369,7 @@ def get_all_status(max_workers: int = 10) -> list[dict]:
                 results.append(future.result())
             except Exception:
                 logger.exception("get_account_status failed for %s", futures[future]["phone"])
-        results.sort(key=lambda r: r.get("phone", ""))
+        results.sort(key=lambda r: phone_to_id.get(r.get("phone", ""), 0), reverse=True)
         return results
 
 
@@ -413,7 +408,7 @@ def query_schedule() -> dict[str, Any]:
 
         schedule_time = fallback_time
         sb = root.find(".//ms:Triggers//ms:StartBoundary", ns)
-        if sb is not None and "T" in sb.text:
+        if sb is not None and sb.text and "T" in sb.text:
             # 格式 2026-07-02T21:00:00，截取时间部分 HH:MM
             time_part = sb.text.split("T", 1)[1]
             if len(time_part) >= 5 and time_part[2] == ":":
@@ -423,10 +418,10 @@ def query_schedule() -> dict[str, Any]:
         # 显式 "false" 才视为禁用；同时检查 Triggers/Enabled 任一为 false 即视为禁用
         enabled = True
         settings_enabled = root.find("./ms:Settings/ms:Enabled", ns)
-        if settings_enabled is not None and settings_enabled.text.lower() == "false":
+        if settings_enabled is not None and settings_enabled.text and settings_enabled.text.lower() == "false":
             enabled = False
         for trig_en in root.findall(".//ms:Triggers//ms:Enabled", ns):
-            if trig_en.text.lower() == "false":
+            if trig_en.text and trig_en.text.lower() == "false":
                 enabled = False
                 break
 
@@ -458,7 +453,12 @@ def create_schedule(schedule_time: str) -> dict[str, Any]:
         if result.returncode == 0:
             settings = load_settings()
             settings["schedule_time"] = schedule_time
-            save_settings(settings)
+            try:
+                save_settings(settings)
+            except OSError as e:
+                # 计划任务已成功创建，仅配置文件保存失败：返回部分成功，避免用户误以为创建失败
+                logger.warning("计划任务已创建但配置保存失败: %s", e)
+                return {"ok": True, "msg": f"计划任务已创建（每天 {schedule_time} 执行），但配置文件保存失败，下次启动可能回退"}
             return {"ok": True, "msg": f"计划任务已创建，每天 {schedule_time} 执行"}
         else:
             logger.warning("schtasks create failed: %s", result.stderr.strip())
@@ -478,8 +478,11 @@ def delete_schedule() -> dict[str, Any]:
         )
         if result.returncode == 0:
             return {"ok": True, "msg": "计划任务已删除"}
-        else:
+        # schtasks 对不存在的任务返回特定错误信息，视为"已删除"幂等结果；其他错误如实返回
+        stderr_lower = (result.stderr or "").lower()
+        if "cannot find" in stderr_lower or "找不到" in stderr_lower:
             return {"ok": True, "msg": "计划任务不存在或已删除"}
+        return {"error": f"删除失败: {(result.stderr or '').strip()}"}
     except Exception as e:
         logger.exception("Failed to delete schedule")
         return {"error": str(e)}
@@ -487,6 +490,8 @@ def delete_schedule() -> dict[str, Any]:
 
 def format_duration(seconds: int) -> str:
     """将秒数格式化为 HH:MM:SS。"""
+    if seconds < 0:
+        seconds = 0
     h = seconds // 3600
     m = (seconds % 3600) // 60
     s = seconds % 60
@@ -502,18 +507,16 @@ def get_unwatched_count(tasks: list) -> int:
 
 
 def _clear_account_password(phone: str) -> None:
-    """清除账号保存的密码（密码错误时调用，避免反复尝试触发风控）"""
-    with accounts_lock:
-        accounts = load_accounts()
-        for a in accounts:
-            if a["phone"] == phone:
-                a.pop("password", None)
-                break
-        try:
-            save_accounts(accounts)
-        except OSError as e:
-            # 辅助流程：清除密码失败不中断领取主流程，下次密码错误时仍会再次尝试清除
-            logger.warning("_clear_account_password save_accounts failed for %s: %s", phone, e)
+    """清除账号保存的密码（密码错误时调用，避免反复尝试触发风控）。
+
+    通过 update_fields 将 password 设为 None（Repository 内部不会显式置 NULL，
+    但传入 None 会被 SQLite 存为 NULL，等价于清除）。
+    """
+    try:
+        repo.update_fields(phone, password=None)
+    except Exception as e:
+        # 辅助流程：清除密码失败不中断领取主流程，下次密码错误时仍会再次尝试清除
+        logger.warning("_clear_account_password update_fields failed for %s: %s", phone, e)
 
 
 def init_client(account: dict) -> tuple[EtAlienClient | None, str]:
@@ -535,7 +538,9 @@ def init_client(account: dict) -> tuple[EtAlienClient | None, str]:
 
 def _make_claim_result(phone: str, label: str, status: str,
                        vip_before: int = 0, vip_after: int = 0,
+                       mobile_before: int = 0, mobile_after: int = 0,
                        claimed: int = 0, failed: int = 0,
+                       claim_target: str = "all",
                        progress_entry: dict | None = None,
                        **progress_extra) -> dict:
     """构建领取结果字典，并同步更新 progress_entry（如提供）。
@@ -547,13 +552,21 @@ def _make_claim_result(phone: str, label: str, status: str,
         "phone": phone,
         "label": label,
         "status": status,
+        "claim_target": claim_target,
         "vip_before": vip_before,
         "vip_after": vip_after,
+        "mobile_before": mobile_before,
+        "mobile_after": mobile_after,
         "claimed": claimed,
         "failed": failed,
     }
     if progress_entry is not None:
-        progress_entry.update({"status": status, "vip_before": vip_before, "vip_after": vip_after, **progress_extra})
+        progress_entry.update({
+            "status": status,
+            "vip_before": vip_before, "vip_after": vip_after,
+            "mobile_before": mobile_before, "mobile_after": mobile_after,
+            **progress_extra,
+        })
     return result
 
 
@@ -785,7 +798,9 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
 
     # init_client 不再返回 "network_error"，仅 "ok" / "need_login"
     if not client:
-        return _make_claim_result(phone, label, init_status, progress_entry=progress_entry)
+        return _make_claim_result(phone, label, init_status,
+                                  claim_target=claim_target,
+                                  progress_entry=progress_entry)
 
     # 累计两阶段的统计
     total_claimed = 0
@@ -881,7 +896,7 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                 # clamp: user_watch_cnt 是累计 is_verify=true 的调用次数，可超过 video_cnt（实测即使无可发奖励或超额，is_verify 仍返回 true，计数持续递增）
                 # 与 get_account_status/get_account_mobile_status 的 shown_cnt 口径一致，避免总进度超过 100%
                 if progress_entry is not None:
-                    progress_entry["mobile_initial"] = min(watched_before, video_cnt) if video_cnt > 0 else watched_before
+                    progress_entry["mobile_initial"] = _clamp_watch_cnt(watched_before, video_cnt)
                     progress_entry["mobile_total"] = video_cnt
 
                 profile_before = client.fetch_mobile_profile()
@@ -899,7 +914,7 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                     logger.info("  [%s] 手机端开始领取, 已观看: %s/%s, 加速时长: %s",
                                 phone, watched_before, video_cnt, format_duration(mobile_before))
                     if progress_entry is not None:
-                        progress_entry["vip_before"] = mobile_before
+                        progress_entry["mobile_before"] = mobile_before
                         if progress_entry.get("total", 0) == 0 and video_cnt > 0:
                             progress_entry["total"] = video_cnt
 
@@ -918,7 +933,14 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
     except NeedLoginError as e:
         # token 过期且无法重登（无密码/密码错误/已重登过仍失败）
         logger.info("[%s] 领取中 token 失效且无法重登: %s", phone, e)
-        result = _make_claim_result(phone, label, "need_login", progress_entry=progress_entry)
+        result = _make_claim_result(
+            phone, label, "need_login",
+            vip_before=pc_partial["vip_before"] if pc_partial else 0,
+            vip_after=pc_partial["vip_after"] if pc_partial else 0,
+            mobile_before=mobile_before, mobile_after=mobile_after,
+            claim_target=claim_target,
+            progress_entry=progress_entry,
+        )
         # 若 PC 阶段已成功，附加其结果避免丢失已领取数据（前端不解析，仅用于日志/调试）
         if pc_partial is not None:
             result["pc_partial"] = pc_partial
@@ -926,10 +948,21 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
     except requests.RequestException as e:
         # 网络异常（重试 max_retries 次后仍失败）
         logger.warning("[%s] 领取中网络异常: %s", phone, e)
-        result = _make_claim_result(phone, label, "network_error", progress_entry=progress_entry)
+        result = _make_claim_result(
+            phone, label, "network_error",
+            vip_before=pc_partial["vip_before"] if pc_partial else 0,
+            vip_after=pc_partial["vip_after"] if pc_partial else 0,
+            mobile_before=mobile_before, mobile_after=mobile_after,
+            claim_target=claim_target,
+            progress_entry=progress_entry,
+        )
         if pc_partial is not None:
             result["pc_partial"] = pc_partial
         return result
+    finally:
+        # 显式释放 client 的 requests.Session 连接池（client 非 None 时才进入此块）
+        if client:
+            client.close()
 
     # ============ 汇总 ============
     # 整体状态综合判定（规则见 _combine_phase_status）
@@ -970,7 +1003,7 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
     """并发执行多个账号的领取任务。
 
     使用 ThreadPoolExecutor 按 max_concurrent 并发度提交，通过 claim_mgr 追踪进度。
-    返回按 phone 排序的结果列表，便于 CLI 输出与通知顺序稳定。
+    返回按 id 降序排序的结果列表（新加用户靠前），便于 CLI 输出与通知顺序稳定。
 
     Args:
         accounts: 待领取的账号列表。
@@ -978,7 +1011,7 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
         claim_mgr: 可选进度管理器，用于前端实时查询领取进度。
 
     Returns:
-        按 phone 排序的领取结果列表。
+        按 id 降序排序的领取结果列表。
     """
     max_concurrent = settings.get("max_concurrent", 10)
     results = []
@@ -991,10 +1024,18 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
                 entry = {
                     "phone": account["phone"],
                     "status": "running",
+                    "phase": "pc",
                     "current": 0,
                     "total": 0,
                     "vip_before": 0,
                     "vip_after": 0,
+                    "mobile_before": 0,
+                    "mobile_after": 0,
+                    "pc_initial": 0,
+                    "pc_total": 0,
+                    "pc_claimed": 0,
+                    "mobile_initial": 0,
+                    "mobile_total": 0,
                 }
                 claim_mgr.add_progress_entry(entry)
 
@@ -1012,15 +1053,20 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
                     "phone": account["phone"],
                     "label": account_label(account),
                     "status": "error",
+                    "claim_target": account.get("claim_target", "all"),
                     "vip_before": 0,
                     "vip_after": 0,
+                    "mobile_before": 0,
+                    "mobile_after": 0,
                     "claimed": 0,
                     "failed": 0,
+                    "phases": ["error"],
                 }
                 results.append(error_result)
                 if claim_mgr is not None:
                     claim_mgr.update_progress_entry(account["phone"], {"status": "error", "error": str(e)})
 
-    # 按 phone 排序，保证 CLI 输出与通知顺序稳定（与 get_all_status 一致）
-    results.sort(key=lambda r: r.get("phone", ""))
+    # 按 id 降序排序，保证 CLI 输出与通知顺序稳定（与 get_all_status 一致）
+    phone_to_id = {a["phone"]: a.get("id", 0) for a in accounts}
+    results.sort(key=lambda r: phone_to_id.get(r.get("phone", ""), 0), reverse=True)
     return results

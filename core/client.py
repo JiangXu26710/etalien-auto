@@ -2,7 +2,8 @@
 et-api.com Protobuf 接口客户端模块。
 
 纯 API 通信层，封装 HTTP 请求、Protobuf 序列化/反序列化、请求签名、
-3 层重试机制（HTTP 层/认证层/业务层）。不包含业务逻辑或持久化操作。
+2 层重试机制（HTTP 层/认证层）；业务层重试（领取循环）在 service 层实现。
+不包含业务逻辑或持久化操作。
 """
 
 import logging
@@ -84,8 +85,9 @@ class EtAlienClient:
         self._relogin_attempted = False  # 防止循环重登
 
         # 重试机制配置（从 settings.json 注入）
-        self._max_retries = max_retries
-        self._retry_delay = retry_delay
+        # clamp 到 >=0，避免 max_retries 为负数时 range(0) 不执行循环导致 raise None
+        self._max_retries = max(0, int(max_retries))
+        self._retry_delay = max(0.0, float(retry_delay))
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -172,7 +174,7 @@ class EtAlienClient:
         result = self._parse_response(status_code, data)
         # token 过期自动重登重试
         if self._is_auth_error(result):
-            result = self._handle_auth_error_and_retry("POST", url, body, query, retry_on_500)
+            result = self._handle_auth_error_and_retry("POST", path, url, body, query, retry_on_500)
         return result
 
     def _get(self, path: str, query: dict | None = None, body: bytes | None = None, retry_on_500: bool = True) -> dict[str, Any]:
@@ -193,10 +195,10 @@ class EtAlienClient:
         status_code, data = self._request_with_retry("GET", url, data=body, retry_on_500=retry_on_500)
         result = self._parse_response(status_code, data)
         if self._is_auth_error(result):
-            result = self._handle_auth_error_and_retry("GET", url, body, query, retry_on_500)
+            result = self._handle_auth_error_and_retry("GET", path, url, body, query, retry_on_500)
         return result
 
-    def _handle_auth_error_and_retry(self, method: str, url: str,
+    def _handle_auth_error_and_retry(self, method: str, path: str, url: str,
                                       body: bytes | None, query: dict | None,
                                       retry_on_500: bool) -> dict[str, Any]:
         """token 过期时的公共处理流程。
@@ -243,7 +245,7 @@ class EtAlienClient:
 
         # 重登成功：login_by_password 内部已更新 self.auth_token / self.user_id，
         # 并同步到 session.headers["Authorization"]
-        # 这里通过回调持久化新 token 到 accounts.json
+        # 这里通过回调持久化新 token 到 accounts.db（SQLite，由 service 层 _save_login_result 写入）
         if self._on_relogin:
             try:
                 self._on_relogin(new_token=self.auth_token, user_id=self.user_id)
@@ -255,6 +257,8 @@ class EtAlienClient:
 
         # 重试原请求（新 token 已在 session.headers 中）
         # 重试请求走 _request_with_retry，即重登后的请求同样享有"本地原因 max_retries 次重试"兜底
+        # 重新构建 URL 刷新 ts/nonce/sig，避免重登耗时较长时服务端校验 ts 有效期失败
+        url = self._build_url(method, path, query)
         status_code, data = self._request_with_retry(method, url, data=body, retry_on_500=retry_on_500)
         result = self._parse_response(status_code, data)
 
@@ -294,7 +298,7 @@ class EtAlienClient:
                 result.update(err)
             else:
                 result["_error"] = True
-                result["msg"] = f"HTTP {status_code}: {data[:200]}"
+                result["msg"] = f"HTTP {status_code}: {data[:200].decode('utf-8', errors='replace')}"
         else:
             result["_error"] = False
             result["raw"] = data
@@ -310,6 +314,16 @@ class EtAlienClient:
     def is_logged_in(self) -> bool:
         """判断当前客户端是否已登录（是否存在 auth_token）。"""
         return bool(self.auth_token)
+
+    def close(self) -> None:
+        """释放底层 requests.Session 连接池。不强制调用方使用，保持向后兼容。"""
+        self.session.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     @staticmethod
     def _is_auth_error(result: dict[str, Any]) -> bool:
@@ -336,7 +350,13 @@ class EtAlienClient:
         formatted = self._format_phone(phone)
         req = account_pb2.GetLoginVerificationCodeRequest()
         req.phone_number = formatted
-        return self._get("/account/v1/get_login_verification_code", body=req.SerializeToString())
+        # 验证码接口不应携带旧 token，避免被服务端 auth 校验拦截
+        saved_auth = self.session.headers.pop("Authorization", None)
+        try:
+            return self._get("/account/v1/get_login_verification_code", body=req.SerializeToString())
+        finally:
+            if saved_auth is not None and "Authorization" not in self.session.headers:
+                self.session.headers["Authorization"] = saved_auth
 
     def login_by_code(self, code: str, phone: str | None = None) -> dict[str, Any]:
         """验证码登录。
@@ -354,10 +374,17 @@ class EtAlienClient:
         req.phone_number = formatted
         req.verification_code = code
 
-        result = self._post(
-            "/account/v1/login",
-            body=req.SerializeToString(),
-        )
+        # 登录接口不应携带旧 token，避免被服务端 auth 校验拦截
+        # 登录成功后会在下方设置新 token；失败时 finally 恢复旧值
+        saved_auth = self.session.headers.pop("Authorization", None)
+        try:
+            result = self._post(
+                "/account/v1/login",
+                body=req.SerializeToString(),
+            )
+        finally:
+            if saved_auth is not None and "Authorization" not in self.session.headers:
+                self.session.headers["Authorization"] = saved_auth
 
         if not result.get("_error"):
             try:
@@ -393,8 +420,15 @@ class EtAlienClient:
         req = account_pb2.LoginV2Request(phone_number=formatted, password=password)
         body = req.SerializeToString()
 
-        # 密码登录接口对参数/业务错误也返回 500（实测 code=500），不应重试，否则用户要等约 max_retries×retry_delay 秒才看到提示
-        result = self._post("/v2/account/login", body=body, retry_on_500=False)
+        # 登录接口不应携带旧 token，避免被服务端 auth 校验拦截导致重登死循环
+        # 登录成功后会在下方设置新 token；失败时 finally 恢复旧值
+        saved_auth = self.session.headers.pop("Authorization", None)
+        try:
+            # 密码登录接口对参数/业务错误也返回 500（实测 code=500），不应重试，否则用户要等约 max_retries×retry_delay 秒才看到提示
+            result = self._post("/v2/account/login", body=body, retry_on_500=False)
+        finally:
+            if saved_auth is not None and "Authorization" not in self.session.headers:
+                self.session.headers["Authorization"] = saved_auth
 
         if not result.get("_error"):
             try:

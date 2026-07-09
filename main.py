@@ -1,12 +1,16 @@
 """CLI 入口：并发执行账号领取任务并输出结果。"""
 
+import json
 import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-from core.config import load_accounts, reload_settings, CONFIG_DIR
-from core.notify import send_claim_notification
+import requests
+
+from core.config import reload_settings, CONFIG_DIR, load_settings
+from core.db import DbAccountRepository, DB_PATH
+from core.notify import send_claim_notification, send_schan
 from core.service import run_concurrent_claim, format_duration
 
 # CLI 退出码（与 docs/06-cli-and-schedule.md 退出码表一致）
@@ -16,6 +20,9 @@ EXIT_ERROR = 2           # 全部失败
 EXIT_NEED_LOGIN = 3      # 有账号需要登录
 EXIT_NO_ACCOUNTS = 4     # 无启用账号
 EXIT_NETWORK_ERROR = 5   # 网络/服务端错误（有账号因网络或服务端错误未能领取）
+EXIT_ALREADY_RUNNING = 6  # 已有实例在运行（统一 Mutex 已存在）/ 端口文件残留但 GUI 已退出
+EXIT_NO_DB = 7           # 无 db，需用户介入迁移（仅 GUI 能创建 db）
+EXIT_NOTIFIED_GUI = 8    # CLI 通知 GUI 触发领取后退出
 
 
 def _setup_logging(log_file: str | None = None):
@@ -50,17 +57,14 @@ def main(auto_close: bool = False):
 
     无返回值——通过 sys.exit 退出，退出码遵循模块级常量定义。
     """
-    log_file = os.path.join(CONFIG_DIR, "cli.log")
-    _setup_logging(log_file)
     logger = logging.getLogger(__name__)
-    logger.info("日志文件: %s", log_file)
 
     settings = reload_settings()
-    accounts = load_accounts()
-    enabled = [a for a in accounts if a.get("enabled", True)]
+    repo = DbAccountRepository()
+    enabled = repo.list_enabled()
 
     if not enabled:
-        logger.error("没有启用的账号，请在 config/accounts.json 中添加")
+        logger.error("没有启用的账号，请在 config/accounts.db 中添加")
         sys.exit(EXIT_NO_ACCOUNTS)
 
     logger.info("加载 %d 个启用账号", len(enabled))
@@ -152,5 +156,147 @@ def main(auto_close: bool = False):
     sys.exit(EXIT_OK)
 
 
+# 统一 Named Mutex 名（GUI 与 CLI 共用，任何模式只能开一个实例）
+_MUTEX_NAME = "Local\\etalien-auto-mutex"
+_ERROR_ALREADY_EXISTS = 183
+
+
+def _create_mutex():
+    """创建统一 Named Mutex，返回 (handle, already_exists)。
+
+    handle 为 0 表示创建失败；already_exists 为 True 表示已有实例在运行。
+    进程退出时 OS 自动释放 Mutex（崩溃也安全）。
+    """
+    import ctypes
+    # CreateMutexW 返回 HANDLE，0 表示失败
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, _MUTEX_NAME)
+    last_error = ctypes.windll.kernel32.GetLastError()
+    already_exists = (last_error == _ERROR_ALREADY_EXISTS)
+    return handle, already_exists
+
+
+def _cli_exit(code: int, auto_close: bool):
+    """根据退出码与 auto_close 决定是否等待回车后退出。
+
+    退出码 7（EXIT_NO_DB）无论 auto_close 都保留窗口（需用户介入）；
+    退出码 6/8 仅 auto_close=False 时保留窗口。
+    """
+    if code == EXIT_NO_DB or not auto_close:
+        try:
+            input("按回车键退出...")
+        except Exception:
+            pass
+    sys.exit(code)
+
+
+def _notify_gui_trigger_claim() -> int:
+    """通知 GUI 触发一次领取，返回退出码。
+
+    读 .gui_port 文件（JSON 格式：{"port": <int>, "token": <hex str>}）→
+    HTTP POST /api/cli-trigger-claim，携带 Authorization: Bearer <token>。
+    - 文件不存在/空/无效 → EXIT_ALREADY_RUNNING（已运行的是 CLI）
+    - 收到 HTTP 响应（202/409/其他状态码）→ EXIT_NOTIFIED_GUI
+    - 连接失败/超时 → EXIT_ALREADY_RUNNING（端口文件残留但 GUI 已退出）
+    """
+    port_file = os.path.join(CONFIG_DIR, ".gui_port")
+    if not os.path.exists(port_file):
+        print("已有 CLI 实例在运行（无 GUI 端口文件）")
+        return EXIT_ALREADY_RUNNING
+
+    try:
+        with open(port_file, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+    except OSError as e:
+        print(f"读取 GUI 端口文件失败: {e}")
+        return EXIT_ALREADY_RUNNING
+
+    if not content:
+        print("已有 CLI 实例在运行（GUI 端口文件为空）")
+        return EXIT_ALREADY_RUNNING
+
+    # 解析 JSON：{"port": <int>, "token": <hex str>}
+    try:
+        data = json.loads(content)
+        port = int(data["port"])
+        token = data.get("token", "")
+    except (ValueError, KeyError, TypeError):
+        print(f"GUI 端口文件内容无效: {content!r}")
+        return EXIT_ALREADY_RUNNING
+
+    url = f"http://127.0.0.1:{port}/api/cli-trigger-claim"
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        resp = requests.post(url, timeout=5, headers=headers)
+    except (requests.ConnectionError, requests.Timeout) as e:
+        print(f"无法连接 GUI，可能已退出（端口文件残留，下次 GUI 启动会自动覆盖）: {e}")
+        return EXIT_ALREADY_RUNNING
+
+    if resp.status_code == 202:
+        print("已通知 GUI 触发一次领取")
+        return EXIT_NOTIFIED_GUI
+    elif resp.status_code == 409:
+        print("GUI 正在忙碌，已跳过本次触发")
+        return EXIT_NOTIFIED_GUI
+    else:
+        print(f"GUI 响应异常: HTTP {resp.status_code}")
+        return EXIT_NOTIFIED_GUI
+
+
+def _send_no_db_notification():
+    """三管齐下提示无 db：控制台 + cli.log + Server酱。"""
+    msg = "检测到尚未初始化数据库，请先启动一次程序（GUI 模式），完成账号数据迁移操作后再使用 CLI。"
+    # 控制台
+    print(msg)
+    # cli.log（通过 logger）
+    logger = logging.getLogger(__name__)
+    logger.error(msg)
+    # Server酱（未配置 sendkey 则跳过，发送失败不阻塞退出）
+    try:
+        settings = load_settings()
+        sendkey = settings.get("schan_key", "").strip()
+        if sendkey:
+            send_schan(sendkey, "etalien-auto 迁移提醒", msg)
+        else:
+            logger.info("未配置 Server酱 sendkey，跳过推送")
+    except Exception as e:
+        logger.error("Server酱推送失败: %s", e)
+
+
+def cli_entry(auto_close: bool = False):
+    """CLI 入口封装：统一 Mutex → 通知 GUI 或独立运行 → 无 db 发 Server酱 → 调用 main()。
+
+    本函数不捕获 main() 抛出的 SystemExit，让其自然传播至 gui/app.py 外层处理
+    （保留退出码 0-5 的原 if not auto_close: input() 逻辑）。
+    仅对退出码 6/7/8 自行处理 print + input 等待回车。
+    """
+    log_file = os.path.join(CONFIG_DIR, "cli.log")
+    _setup_logging(log_file)
+    logger = logging.getLogger(__name__)
+
+    # 1. 检查统一 Named Mutex
+    handle, already_exists = _create_mutex()
+    if handle == 0:
+        # Mutex 创建失败（罕见，如系统资源耗尽）
+        import ctypes
+        err = ctypes.windll.kernel32.GetLastError()
+        logger.error("创建 Mutex 失败，GetLastError=%s", err)
+        print("程序启动失败：无法创建进程锁")
+        _cli_exit(EXIT_ALREADY_RUNNING, auto_close)
+
+    if already_exists:
+        # 已有实例在运行，进入"通知 GUI"分支
+        code = _notify_gui_trigger_claim()
+        _cli_exit(code, auto_close)
+
+    # 2. 独立运行分支：检查 db 是否存在
+    if not os.path.exists(DB_PATH):
+        _send_no_db_notification()
+        _cli_exit(EXIT_NO_DB, auto_close)
+
+    # 3. db 存在，调用 main() 执行原 CLI 领取流程
+    # 不捕获 main() 抛出的 SystemExit，让其自然传播
+    main(auto_close=auto_close)
+
+
 if __name__ == "__main__":
-    main()
+    cli_entry()

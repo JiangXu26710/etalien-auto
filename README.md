@@ -69,6 +69,9 @@ python main.py
 | 3 | 有账号需要登录 |
 | 4 | 无启用账号 |
 | 5 | 网络/服务端错误 |
+| 6 | 已有实例在运行（统一 Mutex 已存在） |
+| 7 | 无数据库，需用户介入迁移（仅 GUI 能创建 db） |
+| 8 | CLI 通知 GUI 触发领取后退出 |
 
 ### 从源码打包
 
@@ -82,7 +85,6 @@ python build.py
 ## 注意事项
 
 所有数据都是明文存储，绝对不要将`./config/`中的任何内容分享给任何人。
-																								~ps:如果有需要，以后可能会改用轻量数据库存储数据~
 
 项目没有测试过在较多账号情况下的可用性、易用性。
 																								~ps:如果有需要，以后可能会优化~
@@ -103,7 +105,8 @@ etalien-auto/
 │   ├── client.py          # API 客户端
 │   ├── service.py         # 业务逻辑
 │   ├── sign.py            # 请求签名
-│   └── notify.py          # Server酱通知
+│   ├── notify.py          # Server酱通知
+│   └── db.py              # 数据库存储层（SQLite 账号仓库）
 ├── gui/                   # GUI 层
 │   ├── app.py             # 窗口入口
 │   ├── api.py             # REST API
@@ -121,6 +124,8 @@ etalien-auto/
 ├── account_pb2.py         # protobuf 生成（账号）
 ├── apiv2_pb2.py           # protobuf 生成（API v2）
 ├── error_pb2.py           # protobuf 生成（错误码）
+├── docs/                  # 内部文档（.gitignore 排除）
+├── test/                  # 单元测试（.gitignore 排除）
 └── requirements.txt       # Python 依赖
 ```
 
@@ -134,6 +139,7 @@ etalien-auto/
 | Web 框架 | Flask |
 | 桌面窗口 | pywebview (WebView2) |
 | 并发 | ThreadPoolExecutor |
+| 数据存储 | SQLite (sqlite3 标准库) |
 | 打包 | PyInstaller |
 
 ## 免责声明

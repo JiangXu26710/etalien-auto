@@ -4,6 +4,7 @@
     --bg-card: #18181c;
     --bg-card-hover: #1e1e24;
     --bg-elevated: #222228;
+    --bg-locked: #13131a;
     --border: #2a2a32;
     --border-gold: #c9a84c;
     --border-gold-dim: rgba(201, 168, 76, 0.3);
@@ -315,7 +316,7 @@ body {
 
 .btn-primary {
     background: linear-gradient(135deg, var(--gold), #8b6914);
-    color: #0a0a0c;
+    color: var(--bg-deep);
     border-color: var(--gold);
 }
 
@@ -536,6 +537,25 @@ body {
     100% { opacity: 0; transform: translateY(-28px); }
 }
 
+/* 手机端时长增量飘字：与 .vip-float 位置错开（下方），淡青银色区分手机端 */
+.mobile-float {
+    position: absolute;
+    right: 0;
+    bottom: -2px;
+    font-size: 12px;
+    font-weight: 700;
+    color: #b8d4e0;
+    white-space: nowrap;
+    pointer-events: none;
+    animation: mobileFloat 1.5s ease-out forwards;
+    text-shadow: 0 0 8px rgba(184, 212, 224, 0.4);
+}
+
+@keyframes mobileFloat {
+    0% { opacity: 1; transform: translateY(0); }
+    100% { opacity: 0; transform: translateY(28px); }
+}
+
 .account-actions {
     display: flex;
     gap: 6px;
@@ -560,12 +580,6 @@ body {
 .btn-small:hover {
     border-color: var(--border-gold-dim);
     color: var(--gold);
-}
-
-.btn-small.btn-danger:hover {
-    border-color: rgba(207, 92, 92, 0.5);
-    color: var(--error);
-    background: rgba(207, 92, 92, 0.1);
 }
 
 .action-menu-wrap {
@@ -834,7 +848,7 @@ body {
 }
 
 .modal.log-modal {
-    min-width: 616px;
+    min-width: min(616px, 100%);
     max-width: 784px;
     max-height: 70vh;
     display: flex;
@@ -994,6 +1008,65 @@ body {
     box-shadow: 0 0 0 2px var(--gold-dim);
 }
 
+/* 只读锁定输入框：用于不可修改的字段（如编辑账号弹窗中的手机号） */
+.form-group .input-lock-wrap {
+    position: relative;
+}
+
+.form-group .input-lock-wrap input.input-locked,
+.form-group .input-lock-wrap input.input-locked:focus {
+    background: var(--bg-locked);
+    color: var(--text-secondary);
+    border-color: var(--border);
+    cursor: default;
+    box-shadow: none;
+    padding-right: 36px;
+}
+
+/* 输入框右侧独立锁图标，hover 弹出提示（tooltip 样式参考 .info-icon::after） */
+.form-group .lock-tip {
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 14px;
+    height: 14px;
+    cursor: default;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%235a584e' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='11' width='18' height='11' rx='2' ry='2'/%3E%3Cpath d='M7 11V7a5 5 0 0 1 10 0v4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: center;
+    transition: background-image var(--transition);
+}
+
+.form-group .lock-tip::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: calc(100% + 8px);
+    right: 0;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-gold-dim);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 400;
+    font-family: 'Segoe UI', 'SF Pro Display', -apple-system, sans-serif;
+    color: var(--text-primary);
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 10;
+}
+
+.form-group .lock-tip:hover {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23c9a84c' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='3' y='11' width='18' height='11' rx='2' ry='2'/%3E%3Cpath d='M7 11V7a5 5 0 0 1 10 0v4'/%3E%3C/svg%3E");
+}
+
+.form-group .lock-tip:hover::after {
+    opacity: 1;
+}
+
 .form-group input::placeholder {
     color: var(--text-muted);
 }
@@ -1037,13 +1110,9 @@ body {
     box-shadow: 0 0 0 2px var(--gold-dim);
 }
 
+/* 原生日历图标默认为黑色，反转以适配暗色主题 */
 .schedule-time-input::-webkit-calendar-picker-indicator {
     filter: invert(0.7);
-}
-
-.schedule-status {
-    margin-top: 8px;
-    margin-bottom: 4px;
 }
 
 .modal-actions {
@@ -1067,7 +1136,7 @@ body {
 
 .btn-modal-primary {
     background: linear-gradient(135deg, var(--gold), #8b6914);
-    color: #0a0a0c;
+    color: var(--bg-deep);
     border-color: var(--gold);
 }
 

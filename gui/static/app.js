@@ -1,10 +1,12 @@
 let claimPollTimer = null;
+let cliTriggerDetectTimer = null;
 let dragState = null;
 let dragInFlight = false;
 let mouseDownPos = null;
 let isMouseDown = false;
 let dragInitiating = false;
 let cachedStatusList = [];
+let refreshPromise = null;
 let modalMouseDownTarget = null;
 let vipFloatShown = new Set();
 let prevStats = { total: 0, active: 0, watched: 0, items: 0 };
@@ -12,7 +14,7 @@ let hasRenderedOnce = false;
 let logMouseDownTarget = null;
 let menuCounter = 0;
 
-// vipFloatShown: 已显示过 VIP 飘字动画的账号集合，防止轮询重复触发
+// vipFloatShown: 已显示过飘字动画的账号集合（PC/手机端），防止轮询重复触发
 // prevStats: 上一轮统计值（total/active/watched/items），供 animateValue/animateProgress 做滚动计数
 // hasRenderedOnce: 首次渲染标志，控制卡片入场交错动画是否播放
 // logMouseDownTarget: 日志弹窗 mousedown 目标，用于遮罩层点击关闭检测
@@ -48,7 +50,7 @@ function claimSelectHTML(id, selected) {
             </div>
             <div class="claim-select-dropdown">
                 ${opts.map(o => `
-                    <button class="claim-select-option${o.value === sel ? ' selected' : ''}" onclick="pickClaimSelect('${id}', '${o.value}', '${o.label}', this)">
+                    <button type="button" class="claim-select-option${o.value === sel ? ' selected' : ''}" onclick="pickClaimSelect('${id}', '${o.value}', '${o.label}', this)">
                         <span>${o.icon}</span>
                         <span style="flex:1">${o.label}</span>
                         <span class="claim-select-check">${o.value === sel ? '\u2713' : ''}</span>
@@ -119,7 +121,7 @@ async function windowMinimize() {
         await new Promise(r => setTimeout(r, 200));
         await pywebview.api.minimize();
         document.body.classList.remove('win-minimize-out');
-    } catch(e) {}
+    } catch(e) { console.warn('windowMinimize failed:', e); }
 }
 
 async function windowMaximize() {
@@ -140,11 +142,12 @@ async function windowMaximize() {
         }
         const cls = wasMax ? 'win-restore-in' : 'win-maximize-in';
         document.body.classList.add(cls);
-        document.body.addEventListener('animationend', function handler() {
+        document.body.addEventListener('animationend', function handler(e) {
+            if (e.target !== document.body) return;
             document.body.classList.remove(cls);
             document.body.removeEventListener('animationend', handler);
         });
-    } catch(e) {}
+    } catch(e) { console.warn('windowMaximize failed:', e); }
 }
 
 async function windowClose() {
@@ -199,7 +202,8 @@ function initDrag() {
                     if (btn) btn.title = '最大化';
                     document.body.classList.remove('win-state-out');
                     document.body.classList.add('win-restore-in');
-                    document.body.addEventListener('animationend', function handler() {
+                    document.body.addEventListener('animationend', function handler(e) {
+                        if (e.target !== document.body) return;
                         document.body.classList.remove('win-restore-in');
                         document.body.removeEventListener('animationend', handler);
                     });
@@ -214,6 +218,7 @@ function initDrag() {
                     winY: pos.y
                 };
             } catch(err) {
+                console.error('Drag init failed:', err);
             } finally {
                 dragInitiating = false;
             }
@@ -250,7 +255,8 @@ function initDrag() {
 document.addEventListener('visibilitychange', () => {
     if (!document.hidden) {
         document.body.classList.add('win-maximize-in');
-        document.body.addEventListener('animationend', function handler() {
+        document.body.addEventListener('animationend', function handler(e) {
+            if (e.target !== document.body) return;
             document.body.classList.remove('win-maximize-in');
             document.body.removeEventListener('animationend', handler);
         });
@@ -266,14 +272,31 @@ function formatDuration(seconds) {
 
 // 在账号卡片的 VIP 时长位置显示 "+HH:MM:SS" 飘字动画，1.5s 上浮 28px 并淡出
 function showVipFloat(phone, diffSeconds) {
-    const card = document.querySelector(`.account-card[data-phone="${phone}"]`);
+    const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
     if (!card) return;
-    const vipEl = card.querySelector('.account-vip');
+    // 精确定位 .card-front 内的 .account-vip（可见），避免命中 .card-sizer 内的占位元素（visibility:hidden 导致飘字不可见）
+    const vipEl = card.querySelector('.card-front .account-vip');
     if (!vipEl) return;
     const existing = vipEl.querySelector('.vip-float');
     if (existing) existing.remove();
     const float = document.createElement('span');
     float.className = 'vip-float';
+    float.textContent = '+' + formatDuration(diffSeconds);
+    vipEl.appendChild(float);
+    float.addEventListener('animationend', () => float.remove());
+}
+
+// 在账号卡片的 VIP 时长位置显示手机端 "+HH:MM:SS" 飘字动画（与 PC 端飘字位置错开，颜色区分）
+function showMobileFloat(phone, diffSeconds) {
+    const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
+    if (!card) return;
+    // 同 showVipFloat，精确定位 .card-front 内的 .account-vip
+    const vipEl = card.querySelector('.card-front .account-vip');
+    if (!vipEl) return;
+    const existing = vipEl.querySelector('.mobile-float');
+    if (existing) existing.remove();
+    const float = document.createElement('span');
+    float.className = 'mobile-float';
     float.textContent = '+' + formatDuration(diffSeconds);
     vipEl.appendChild(float);
     float.addEventListener('animationend', () => float.remove());
@@ -312,7 +335,7 @@ function animateProgress(el, startW, endW, startT, endT, duration) {
  * 初始进度来自缓存（cachedStatusList 或 mobileStatusCache），叠加本次领取增量。
  */
 function updateCardProgress(phone, current, total, phase) {
-    const card = document.querySelector(`.account-card[data-phone="${phone}"]`);
+    const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
     if (!card) return;
     // phase=mobile 时更新手机端面（card-back），否则更新 PC 面（card-front）
     // 手机端面若未翻过则无进度条 DOM，跳过（翻面时会通过 fetchMobileStatus 获取）
@@ -374,6 +397,12 @@ async function api(path, options = {}) {
         if (!resp.ok && data.error) {
             throw new Error(data.error);
         }
+        if (data.ok === false) {
+            throw new Error(data.error || '请求失败');
+        }
+        if (!resp.ok) {
+            throw new Error(`请求失败 (${resp.status})`);
+        }
         return data;
     } catch (e) {
         throw e;
@@ -386,7 +415,7 @@ function showToast(msg, type = 'info') {
     toast.className = `toast toast-${type}`;
     toast.textContent = msg;
     container.appendChild(toast);
-    // error 类延长到 5 秒，让用户有足够时间阅读错误信息；其他保持 3 秒
+    // error 类型延长到 5 秒，让用户有足够时间阅读错误信息；其他保持 3 秒
     const duration = type === 'error' ? 5000 : 3000;
     let timer = null;
     const startHide = () => {
@@ -434,7 +463,8 @@ function _animateCloseModal() {
     const modal = document.getElementById('modalContent');
     if (!overlay.classList.contains('active')) return;
     modal.classList.add('closing');
-    modal.addEventListener('animationend', function handler() {
+    modal.addEventListener('animationend', function handler(e) {
+        if (e.target !== modal) return;
         modal.classList.remove('closing');
         overlay.classList.remove('active');
         modal.removeEventListener('animationend', handler);
@@ -457,7 +487,8 @@ function _animateCloseLogModal() {
     const modal = document.getElementById('logModalContent');
     if (!overlay.classList.contains('active')) return;
     modal.classList.add('closing');
-    modal.addEventListener('animationend', function handler() {
+    modal.addEventListener('animationend', function handler(e) {
+        if (e.target !== modal) return;
         modal.classList.remove('closing');
         overlay.classList.remove('active');
         modal.removeEventListener('animationend', handler);
@@ -465,22 +496,27 @@ function _animateCloseLogModal() {
 }
 
 async function refreshStatus(withAnimation = true) {
-    try {
-        if (withAnimation) hasRenderedOnce = false;
-        // 全量刷新时清空手机端状态缓存，以获取新数据
-        Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
-        // 停止所有手机端时长自减（翻面卡片重新渲染后会按需重启）
-        mobileCountdownPhones.clear();
-        if (mobileCountdownTimer) {
-            clearInterval(mobileCountdownTimer);
-            mobileCountdownTimer = null;
+    if (refreshPromise) return refreshPromise;
+    refreshPromise = (async () => {
+        try {
+            if (withAnimation) hasRenderedOnce = false;
+            // 全量刷新时清空手机端状态缓存，以获取新数据
+            Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
+            // 停止所有手机端时长自减（翻面卡片重新渲染后会按需重启）
+            mobileCountdownPhones.clear();
+            if (mobileCountdownTimer) {
+                clearInterval(mobileCountdownTimer);
+                mobileCountdownTimer = null;
+            }
+            const data = await api('/api/status');
+            cachedStatusList = data.status || [];
+            renderAccounts(cachedStatusList);
+        } catch (e) {
+            console.error('refreshStatus error:', e);
+            showToast('刷新状态失败：' + (e.message || '未知错误'), 'error');
         }
-        const data = await api('/api/status');
-        cachedStatusList = data.status || [];
-        renderAccounts(cachedStatusList);
-    } catch (e) {
-        console.error('refreshStatus error:', e);
-    }
+    })().finally(() => { refreshPromise = null; });
+    return refreshPromise;
 }
 
 async function refreshAccountsLight() {
@@ -514,6 +550,7 @@ async function refreshAccountsLight() {
         renderAccounts(merged);
     } catch (e) {
         console.error('refreshAccountsLight error:', e);
+        showToast('刷新账号失败：' + (e.message || '未知错误'), 'error');
     }
 }
 
@@ -544,14 +581,19 @@ function renderAccounts(statusList) {
             const phoneLine = [displayPhone, displayRemark].filter(Boolean).join(' · ');
 
             const vipStr = s.token_valid ? formatDuration(s.vip_duration) : '--:--:--';
-            const progressStr = s.token_valid ? s.progress : '-/-';
+            // PC 端接口查询失败时显示"查询失败"占位，避免误导性的 0/0（与 mobile_error 对称）
+            const progressStr = s.token_valid
+                ? (s.pc_error
+                    ? '<span style="color:var(--text-muted)">查询失败</span>'
+                    : (s.progress ? escapeHtml(s.progress) : '-/-'))
+                : '-/-';
 
             // idle 总进度口径对齐领取中：只统计 enabled 账号，且按 claim_target 过滤阶段
             // （领取中只对 enabled 执行、且只统计 claim_target 配置的阶段，避免领取开始时数值跳变）
             if (s.token_valid && s.enabled) {
                 const ct = s.claim_target || 'all';
                 if (ct !== 'mobile') {
-                    const [w, t] = s.progress.split('/').map(Number);
+                    const [w, t] = (s.progress || '0/0').split('/').map(Number);
                     if (!isNaN(w) && !isNaN(t)) {
                         totalWatched += w;
                         totalItems += t;
@@ -609,15 +651,15 @@ function renderAccounts(statusList) {
 
             let actionsHtml = '';
             if (!s.logged_in || s.token_expired) {
-                actionsHtml = `<button class="btn-small" onclick="showLogin(${jsStr(s.phone)})">登录</button>`;
+                actionsHtml = `<button type="button" class="btn-small" onclick="showLogin(${jsStr(s.phone)})">登录</button>`;
             }
             actionsHtml += `
             <div class="action-menu-wrap" data-phone="${escapeHtml(s.phone)}">
-                <button class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this)">⋯</button>
+                <button type="button" class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this, event)">⋯</button>
                 <div class="action-menu">
-                    <button class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
-                    <button class="action-menu-item" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
-                    <button class="action-menu-item action-menu-danger" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
+                    <button type="button" class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
+                    <button type="button" class="action-menu-item" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
+                    <button type="button" class="action-menu-item action-menu-danger" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
                 </div>
             </div>`;
 
@@ -642,7 +684,7 @@ function renderAccounts(statusList) {
                             </div>` : ''}
                         </div>
                     </div>
-                    <div class="card-front" onclick="flipCard(this)">
+                    <div class="card-front" onclick="flipCard(this, event)">
                         <div class="account-avatar">${initial}</div>
                         <div class="account-info">
                             <div class="account-name-row">
@@ -658,7 +700,7 @@ function renderAccounts(statusList) {
                         </div>
                         <div class="account-actions">${actionsHtml}</div>
                     </div>
-                    <div class="card-back" onclick="flipCard(this)">
+                    <div class="card-back" onclick="flipCard(this, event)">
                         <div class="card-back-content">
                             <div class="account-avatar">${initial}</div>
                             <div class="card-back-info" data-phone="${escapeHtml(s.phone)}">
@@ -736,10 +778,11 @@ function showAddAccount() {
             ${claimSelectHTML('addClaimSelect', 'all')}
         </div>
         <div class="modal-actions">
-            <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-            <button class="btn-modal btn-modal-primary" onclick="doAddAccountStep1()">下一步</button>
+            <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+            <button type="button" class="btn-modal btn-modal-primary" onclick="doAddAccountStep1()">下一步</button>
         </div>
     `, true);
+    document.getElementById('addPhone').focus();
 }
 
 async function sendLoginCode(phone, btnGetId, btnLoginId, btnResendId) {
@@ -800,8 +843,8 @@ async function doAddAccountStep1() {
         openModal(`
             <h3>验证手机号 ${escapeHtml(phone)}</h3>
             <div class="login-method-tabs">
-                <button class="login-method-tab active" onclick="switchLoginTab(this, 'add-sms-panel')">短信验证码</button>
-                <button class="login-method-tab" onclick="switchLoginTab(this, 'add-pwd-panel')">账号密码</button>
+                <button type="button" class="login-method-tab active" onclick="switchLoginTab(this, 'add-sms-panel')">短信验证码</button>
+                <button type="button" class="login-method-tab" onclick="switchLoginTab(this, 'add-pwd-panel')">账号密码</button>
             </div>
             <div class="login-form-panel active" id="add-sms-panel">
                 <p class="login-hint">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
@@ -810,10 +853,10 @@ async function doAddAccountStep1() {
                     <input type="text" id="addLoginCode" placeholder="请输入收到的验证码" maxlength="6">
                 </div>
                 <div class="modal-actions">
-                    <button class="btn-modal btn-modal-cancel" id="btnResendAdd" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendAdd')">重新获取</button>
-                    <button class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
-                    <button class="btn-modal btn-modal-primary" id="btnGetCodeAdd" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeAdd', 'btnLoginAdd', 'btnResendAdd')">获取</button>
-                    <button class="btn-modal btn-modal-primary" id="btnLoginAdd" style="display:none" onclick="doAddAccountStep2(${jsStr(phone)})">登录</button>
+                    <button type="button" class="btn-modal btn-modal-cancel" id="btnResendAdd" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendAdd')">重新获取</button>
+                    <button type="button" class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
+                    <button type="button" class="btn-modal btn-modal-primary" id="btnGetCodeAdd" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeAdd', 'btnLoginAdd', 'btnResendAdd')">获取</button>
+                    <button type="button" class="btn-modal btn-modal-primary" id="btnLoginAdd" style="display:none" onclick="doAddAccountStep2(${jsStr(phone)})">登录</button>
                 </div>
             </div>
             <div class="login-form-panel" id="add-pwd-panel">
@@ -823,11 +866,12 @@ async function doAddAccountStep1() {
                     <input type="password" id="addLoginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码">
                 </div>
                 <div class="modal-actions">
-                    <button class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
-                    <button class="btn-modal btn-modal-primary" onclick="doAddAccountStep2Pwd(${jsStr(phone)})">登录</button>
+                    <button type="button" class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
+                    <button type="button" class="btn-modal btn-modal-primary" onclick="doAddAccountStep2Pwd(${jsStr(phone)})">登录</button>
                 </div>
             </div>
         `, true);
+        document.getElementById('addLoginCode').focus();
     } catch (e) { showToast(e.message || '添加账号失败', 'error'); }
 }
 
@@ -888,6 +932,14 @@ function switchLoginTab(btn, panelId) {
     btn.classList.add('active');
     modal.querySelectorAll('.login-form-panel').forEach(p => p.classList.remove('active'));
     document.getElementById(panelId).classList.add('active');
+    const focusMap = {
+        'add-sms-panel': 'addLoginCode',
+        'add-pwd-panel': 'addLoginPwd',
+        'login-sms-panel': 'loginCode',
+        'login-pwd-panel': 'loginPwd',
+    };
+    const focusId = focusMap[panelId];
+    if (focusId) document.getElementById(focusId)?.focus();
 }
 
 async function toggleAccount(phone, enabled) {
@@ -915,8 +967,8 @@ function closeAllActionMenus() {
 }
 
 // 翻转账号卡片，显示正面（PC 权益）或背面（手机权益）。翻面时懒加载手机端状态。
-function flipCard(el) {
-    if (event.target.closest('.account-actions')) return;
+function flipCard(el, e) {
+    if (e.target.closest('.account-actions')) return;
     closeAllActionMenus();
     const card = el.closest('.account-card');
     const phone = card.dataset.phone;
@@ -941,16 +993,21 @@ async function fetchMobileStatus(card) {
         return;
     }
 
+    // 请求标识符去重：快速翻面期间旧请求返回后通过此标记丢弃，避免覆盖新数据
+    const reqId = Symbol();
+    card._fetchReqId = reqId;
     backInfo.innerHTML = '<div class="card-back-loading"></div>';
 
     try {
         const data = await api(`/api/accounts/${encodeURIComponent(phone)}/mobile_status`);
+        if (card._fetchReqId !== reqId) return;
         if (data.status) {
             data.status.mobile_expire_ts = Math.floor(Date.now() / 1000) + (data.status.mobile_duration || 0);
             mobileStatusCache[phone] = data.status;
             renderMobileBack(backInfo, data.status);
         }
     } catch (e) {
+        if (card._fetchReqId !== reqId) return;
         backInfo.innerHTML = `<div class="card-back-row"><span class="card-back-label">加载失败</span></div>`;
     }
 }
@@ -975,14 +1032,14 @@ function renderMobileBack(backInfo, status) {
         ? Math.max(0, status.mobile_expire_ts - Math.floor(Date.now() / 1000))
         : (status.mobile_duration || 0);
     const duration = formatDuration(remain);
-    const progress = status.mobile_progress || '-/-';
+    const progress = status.mobile_progress ? escapeHtml(status.mobile_progress) : '-/-';
     const progressParts = progress.split('/');
     const pct = progressParts[1] > 0 ? (progressParts[0] / progressParts[1] * 100) : 0;
 
     backInfo.innerHTML = `
         <div class="card-back-row">
             <span class="card-back-label">手机端时长</span>
-            <span class="card-back-value">${duration}</span>
+            <span class="card-back-value">${escapeHtml(duration)}</span>
         </div>
         <div class="account-progress-wrap">
             <div class="progress-bar"><div class="progress-bar-fill${pct >= 100 ? ' complete' : ''}" style="width:${pct}%"></div></div>
@@ -1009,17 +1066,19 @@ function ensureMobileCountdown() {
 // 单次 tick：遍历所有需递减的账号，基于 mobile_expire_ts 重算剩余秒数并更新 DOM
 function updateAllMobileCountdowns() {
     const now = Math.floor(Date.now() / 1000);
+    const toRemove = [];
     for (const phone of mobileCountdownPhones) {
         const cache = mobileStatusCache[phone];
         if (!cache || !cache.mobile_expire_ts) continue;
         const card = document.querySelector(
-            `.account-card[data-phone="${phone}"] .card-back .card-back-value`
+            `.account-card[data-phone="${CSS.escape(phone)}"] .card-back .card-back-value`
         );
         if (!card) continue;
         const remain = Math.max(0, cache.mobile_expire_ts - now);
         card.textContent = formatDuration(remain);
-        if (remain <= 0) mobileCountdownPhones.delete(phone);
+        if (remain <= 0) toRemove.push(phone);
     }
+    toRemove.forEach(p => mobileCountdownPhones.delete(p));
     if (mobileCountdownPhones.size === 0) {
         clearInterval(mobileCountdownTimer);
         mobileCountdownTimer = null;
@@ -1040,8 +1099,8 @@ function stopMobileCountdown(phone) {
  * menu 位置在 body 中管理（避免 preserve-3d containing block 问题），
  * 含视口边界自适应（右边界超出向左偏移、下边界超出向上展开）。
  */
-function toggleActionMenu(btn) {
-    if (event) event.stopPropagation();
+function toggleActionMenu(btn, e) {
+    if (e) e.stopPropagation();
     const wrap = btn.closest('.action-menu-wrap');
     if (!wrap.id) wrap.id = 'amw-' + (++menuCounter);
     
@@ -1120,7 +1179,10 @@ function showEditAccount(phone) {
             <h3>编辑账号</h3>
             <div class="form-group">
                 <label>手机号 *</label>
-                <input type="text" id="editPhone" value="${escapeHtml(account.phone)}" maxlength="11">
+                <div class="input-lock-wrap">
+                    <input type="text" id="editPhone" class="input-locked" value="${escapeHtml(account.phone)}" maxlength="11" readonly>
+                    <span class="lock-tip" data-tooltip="手机号不允许修改，请删除后重新添加"></span>
+                </div>
             </div>
             <div class="form-group">
                 <label>用户名（选填）</label>
@@ -1152,8 +1214,8 @@ function showEditAccount(phone) {
                 </div>
             </div>
             <div class="modal-actions">
-                <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" onclick="doEditAccount(${jsStr(phone)})">保存</button>
+                <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+                <button type="button" class="btn-modal btn-modal-primary" onclick="doEditAccount(${jsStr(phone)})">保存</button>
             </div>
         `, true);
 
@@ -1166,21 +1228,15 @@ function showEditAccount(phone) {
 }
 
 async function doEditAccount(originalPhone) {
-    const newPhone = document.getElementById('editPhone').value.trim();
     const name = document.getElementById('editName').value.trim();
     const remark = document.getElementById('editRemark').value.trim();
     const enabled = document.getElementById('editEnabled').checked;
     const password = document.getElementById('editPwd').value;
 
-    if (!newPhone) {
-        showToast('手机号不能为空', 'error');
-        return;
-    }
-
     try {
         const claimTarget = document.getElementById('editClaimSelect')?.dataset.value || 'all';
-        const body = { phone: newPhone, name, remark, enabled, claim_target: claimTarget };
-        if (password !== undefined) body.password = password;
+        const body = { name, remark, enabled, claim_target: claimTarget };
+        if (password) body.password = password;
         await api(`/api/accounts/${encodeURIComponent(originalPhone)}`, {
             method: 'PUT',
             body,
@@ -1198,8 +1254,8 @@ async function deleteAccount(phone) {
         <p style="color:var(--text-secondary);font-size:13px;margin-bottom:4px">确定删除账号 <strong style="color:var(--gold-light)">${escapeHtml(phone)}</strong> ？</p>
         <p style="color:var(--text-muted);font-size:12px">此操作不可撤销</p>
         <div class="modal-actions">
-            <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-            <button class="btn-modal btn-modal-danger" onclick="doDeleteAccount(${jsStr(phone)})">删除</button>
+            <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+            <button type="button" class="btn-modal btn-modal-danger" onclick="doDeleteAccount(${jsStr(phone)})">删除</button>
         </div>
     `);
 }
@@ -1208,15 +1264,20 @@ async function doDeleteAccount(phone) {
     try {
         await api(`/api/accounts/${encodeURIComponent(phone)}`, { method: 'DELETE' });
 
-        const card = document.querySelector(`.account-card[data-phone="${phone}"]`);
+        const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
         if (card) {
             const list = document.getElementById('accountsList');
+            // FLIP 补位动画：删除卡片后让剩余卡片平滑滑入新位置
+            // First（记录旧位置）→ 卡片淡出 display:none 触发重排 → Last（新位置）
+            // → Invert（transform 移回旧位置）→ Play（transition 过渡到新位置）
             const siblings = [...list.querySelectorAll('.account-card:not(.removing)')];
             const firstRects = new Map();
             siblings.forEach(s => firstRects.set(s, s.getBoundingClientRect()));
 
+            card.style.animation = '';  // 清除内联残留（onanimationend 设的 'none'），让 .removing 的 cardRemove 能生效
             card.classList.add('removing');
-            card.addEventListener('animationend', () => {
+            card.addEventListener('animationend', (e) => {
+                if (e.target !== card) return;
                 card.style.display = 'none';
 
                 const remaining = [...list.querySelectorAll('.account-card:not(.removing)')];
@@ -1229,7 +1290,7 @@ async function doDeleteAccount(phone) {
                     if (dx === 0 && dy === 0) return;
                     el.style.transition = 'none';
                     el.style.transform = `translate(${dx}px, ${dy}px)`;
-                    el.offsetHeight;
+                    el.offsetHeight;  // 强制 reflow，确保 Invert 的 transform 生效后再启动 Play 过渡
                     el.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
                     el.style.transform = '';
                     el.addEventListener('transitionend', function handler(e) {
@@ -1246,8 +1307,9 @@ async function doDeleteAccount(phone) {
         showToast('账号已删除', 'success');
         closeModalForce();
         stopMobileCountdown(phone);
+        flippedPhones.delete(phone);
         delete mobileStatusCache[phone];
-        setTimeout(() => refreshAccountsLight(), 400);
+        setTimeout(() => refreshAccountsLight(), 850);  // 等 cardRemove(350)+FLIP(350)+card.remove()(400) 完成，避免打断补位动画
     } catch (e) { showToast(e.message || '删除失败', 'error'); }
 }
 
@@ -1255,8 +1317,8 @@ function showLogin(phone) {
     openModal(`
         <h3>登录 ${escapeHtml(phone)}</h3>
         <div class="login-method-tabs" style="margin-top:4px">
-            <button class="login-method-tab active" onclick="switchLoginTab(this, 'login-sms-panel')">短信验证码</button>
-            <button class="login-method-tab" onclick="switchLoginTab(this, 'login-pwd-panel')">账号密码</button>
+            <button type="button" class="login-method-tab active" onclick="switchLoginTab(this, 'login-sms-panel')">短信验证码</button>
+            <button type="button" class="login-method-tab" onclick="switchLoginTab(this, 'login-pwd-panel')">账号密码</button>
         </div>
         <div class="login-form-panel active" id="login-sms-panel">
             <p class="login-hint" style="margin-top:12px">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
@@ -1265,10 +1327,10 @@ function showLogin(phone) {
                 <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6">
             </div>
             <div class="modal-actions">
-                <button class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
-                <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" id="btnGetCodeLogin" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeLogin', 'btnLoginVerify', 'btnResendLogin')">获取</button>
-                <button class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify(${jsStr(phone)})">登录</button>
+                <button type="button" class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
+                <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+                <button type="button" class="btn-modal btn-modal-primary" id="btnGetCodeLogin" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeLogin', 'btnLoginVerify', 'btnResendLogin')">获取</button>
+                <button type="button" class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify(${jsStr(phone)})">登录</button>
             </div>
         </div>
         <div class="login-form-panel" id="login-pwd-panel">
@@ -1278,11 +1340,12 @@ function showLogin(phone) {
                 <input type="password" id="loginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码">
             </div>
             <div class="modal-actions">
-                <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" onclick="doVerifyPwd(${jsStr(phone)})">登录</button>
+                <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+                <button type="button" class="btn-modal btn-modal-primary" onclick="doVerifyPwd(${jsStr(phone)})">登录</button>
             </div>
         </div>
     `);
+    document.getElementById('loginCode').focus();
 }
 
 async function doVerify(phone) {
@@ -1390,7 +1453,7 @@ function pollClaimProgress() {
                     }
                 }
 
-                let entry = logList.querySelector(`[data-phone="${item.phone}"]`);
+                let entry = logList.querySelector(`[data-phone="${CSS.escape(item.phone)}"]`);
                 const now = new Date().toLocaleTimeString();
 
                 if (!entry) {
@@ -1412,32 +1475,37 @@ function pollClaimProgress() {
                     entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-gold">${escapeHtml(item.phone)}</span> 领取中 ${current}/${total}`;
                 } else if (item.status === 'done') {
                     const diff = item.vip_after - item.vip_before;
+                    const mobileDiff = (item.mobile_after || 0) - (item.mobile_before || 0);
                     const total = item.total || '?';
                     const current = item.current || 0;
                     entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-gold">${escapeHtml(item.phone)}</span> 完成 ${current}/${total} +${formatDuration(diff)}`;
-                    if (diff > 0 && !vipFloatShown.has(item.phone)) {
+                    if ((diff > 0 || mobileDiff > 0) && !vipFloatShown.has(item.phone)) {
                         vipFloatShown.add(item.phone);
-                        showVipFloat(item.phone, diff);
+                        if (diff > 0) showVipFloat(item.phone, diff);
+                        if (mobileDiff > 0) showMobileFloat(item.phone, mobileDiff);
                     }
                 } else if (item.status === 'already_done') {
                     entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-gold">${escapeHtml(item.phone)}</span> 已全部完成`;
                 } else if (item.status === 'partial') {
                     const diff = item.vip_after - item.vip_before;
+                    const mobileDiff = (item.mobile_after || 0) - (item.mobile_before || 0);
                     const total = item.total || '?';
                     const current = item.current || 0;
                     entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-warning">${escapeHtml(item.phone)}</span> 部分完成 ${current}/${total} +${formatDuration(diff)}`;
-                    if (diff > 0 && !vipFloatShown.has(item.phone)) {
+                    if ((diff > 0 || mobileDiff > 0) && !vipFloatShown.has(item.phone)) {
                         vipFloatShown.add(item.phone);
-                        showVipFloat(item.phone, diff);
+                        if (diff > 0) showVipFloat(item.phone, diff);
+                        if (mobileDiff > 0) showMobileFloat(item.phone, mobileDiff);
                     }
                 }
 
                 logList.scrollTop = logList.scrollHeight;
                 updateCardProgress(item.phone, item.current || 0, item.total || 0, item.phase);
                 if (['done', 'partial', 'already_done'].includes(item.status) && item.vip_after > 0) {
-                    const claimCard = document.querySelector(`.account-card[data-phone="${item.phone}"]`);
+                    const claimCard = document.querySelector(`.account-card[data-phone="${CSS.escape(item.phone)}"]`);
                     if (claimCard) {
-                        const vipEl = claimCard.querySelector('.account-vip');
+                        // 精确定位 .card-front 内的 .account-vip，避免更新到 .card-sizer 占位元素
+                        const vipEl = claimCard.querySelector('.card-front .account-vip');
                         if (vipEl && vipEl.firstChild) {
                             vipEl.firstChild.textContent = formatDuration(item.vip_after);
                         }
@@ -1486,6 +1554,47 @@ function pollClaimProgress() {
     claimPollTimer = setTimeout(_poll, 1000);
 }
 
+/**
+ * CLI 触发检测心跳：每 2s 检测一次后端领取状态。
+ * 仅当 claimPollTimer === null（当前不在领取轮询）时实际查询 /api/claim/progress，
+ * 发现 running=true 但前端无感知（CLI 触发的领取）时自动接管 UI，
+ * 切换到与"用户点击开始领取"一致的领取中状态并启动进度轮询。
+ * 与正常轮询互斥：用户手动点击或接管后 pollClaimProgress 在跑时，心跳跳过查询仅递归调度。
+ */
+const CLI_TRIGGER_DETECT_INTERVAL = 2000;
+
+function startCliTriggerDetect() {
+    if (cliTriggerDetectTimer) clearTimeout(cliTriggerDetectTimer);
+    cliTriggerDetectTimer = setTimeout(detectCliTrigger, CLI_TRIGGER_DETECT_INTERVAL);
+}
+
+async function detectCliTrigger() {
+    cliTriggerDetectTimer = null;
+    // 正在领取轮询中，跳过本次检测（与 pollClaimProgress 互斥，避免重复请求）
+    if (claimPollTimer !== null) {
+        startCliTriggerDetect();
+        return;
+    }
+    try {
+        const data = await api('/api/claim/progress');
+        if (data.running) {
+            // 后端在领取但前端无感知（CLI 触发），接管 UI 至领取中状态
+            document.getElementById('logList').innerHTML = '';
+            document.getElementById('claimStatus').textContent = '进行中...';
+            vipFloatShown.clear();
+            const btn = document.getElementById('btnClaim');
+            btn.disabled = false;
+            btn.textContent = '查看日志';
+            btn.onclick = showLogModal;
+            pollClaimProgress();
+        }
+    } catch (e) {
+        // 查询失败忽略，继续下次检测
+    }
+    // 无论是否接管，继续安排下次检测
+    startCliTriggerDetect();
+}
+
 // 翻转设置弹窗中的"最大轮数"卡片，在 PC 端和手机端配置之间切换。
 function flipSettingsCard(btn) {
     const card = btn.closest('.settings-flip-card');
@@ -1510,11 +1619,11 @@ function showSettings() {
             <h3>设置</h3>
             <div class="form-group">
                 <label>最大账号并发数</label>
-                <input type="number" id="setMaxConcurrent" value="${settings.max_concurrent}" min="1" max="50">
+                <input type="number" id="setMaxConcurrent" value="${settings.max_concurrent}" min="1" max="999">
             </div>
             <div class="form-group">
                 <label>单账号请求间隔（秒）</label>
-                <input type="number" id="setInterval" value="${settings.request_interval}" min="0.1" max="30" step="0.1">
+                <input type="number" id="setInterval" value="${settings.request_interval}" min="0.01" max="30" step="0.01">
             </div>
             <div class="settings-flip-card">
                 <div class="settings-flip-inner">
@@ -1557,8 +1666,8 @@ function showSettings() {
                 </div>
             </div>
             <div class="modal-actions">
-                <button class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button class="btn-modal btn-modal-primary" onclick="doSaveSettings()">保存</button>
+                <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+                <button type="button" class="btn-modal btn-modal-primary" onclick="doSaveSettings()">保存</button>
             </div>
             <div class="modal-footer-info">
                 <span class="footer-version">etalien-auto <code>v${escapeHtml(ver)}</code></span>
@@ -1575,6 +1684,8 @@ function showSettings() {
 
 // 保存设置：含风控预警（理论请求频率 > 50次/秒时弹二次确认），同步更新计划任务。
 async function doSaveSettings() {
+    const btn = document.querySelector('.btn-modal-primary');
+    if (btn) btn.disabled = true;
     const maxConcurrent = parseInt(document.getElementById('setMaxConcurrent').value);
     const requestInterval = parseFloat(document.getElementById('setInterval').value);
     const maxRounds = parseInt(document.getElementById('setMaxRounds').value);
@@ -1583,6 +1694,18 @@ async function doSaveSettings() {
     const scheduleTime = document.getElementById('setScheduleTime').value;
     const schanEnabled = document.getElementById('setSchanEnabled').checked;
     const schanKey = document.getElementById('setSchanKey').value;
+
+    if ([maxConcurrent, requestInterval, maxRounds, mobileMaxRounds].some(Number.isNaN)) {
+        showToast('请填写有效的数值', 'error');
+        if (btn) btn.disabled = false;
+        return;
+    }
+    if (maxConcurrent < 1 || maxConcurrent > 999 || requestInterval < 0.01 || requestInterval > 30 ||
+        maxRounds < 1 || maxRounds > 200 || mobileMaxRounds < 1 || mobileMaxRounds > 200) {
+        showToast('数值超出允许范围', 'error');
+        if (btn) btn.disabled = false;
+        return;
+    }
 
     if (requestInterval > 0) {
         const totalRps = maxConcurrent / requestInterval;
@@ -1593,7 +1716,10 @@ async function doSaveSettings() {
                 '确认保存',
                 '我再想想'
             );
-            if (!confirmed) return;
+            if (!confirmed) {
+                if (btn) btn.disabled = false;
+                return;
+            }
         }
     }
 
@@ -1628,6 +1754,7 @@ async function doSaveSettings() {
         showToast('设置已保存', 'success');
         closeModalForce();
     } catch (e) { showToast(e.message || '保存失败', 'error'); }
+    finally { if (btn) btn.disabled = false; }
 }
 
 // 弹出确认对话框，返回 Promise<boolean>。用户点击确认按钮 resolve(true)，取消按钮 resolve(false)。
@@ -1640,8 +1767,8 @@ function showConfirmDialog(title, message, confirmText, cancelText) {
                 <h3>${escapeHtml(title)}</h3>
                 <p style="color:var(--text-secondary);font-size:13px;margin-bottom:4px;line-height:1.6">${escapeHtml(message)}</p>
                 <div class="modal-actions">
-                    <button class="btn-modal btn-modal-cancel" id="confirmCancel">${escapeHtml(cancelText)}</button>
-                    <button class="btn-modal btn-modal-primary" id="confirmOk">${escapeHtml(confirmText)}</button>
+                    <button type="button" class="btn-modal btn-modal-cancel" id="confirmCancel">${escapeHtml(cancelText)}</button>
+                    <button type="button" class="btn-modal btn-modal-primary" id="confirmOk">${escapeHtml(confirmText)}</button>
                 </div>
             </div>
         `;
@@ -1661,6 +1788,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initDrag();
     initRipple();
     refreshStatus();
+    startCliTriggerDetect();
     setTimeout(() => {
         const splash = document.getElementById('splash');
         if (splash) {

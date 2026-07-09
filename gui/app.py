@@ -8,16 +8,28 @@ import socket
 import time
 import ctypes
 import winreg
+import json
+import secrets
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 MB_OK = 0x00000000
 MB_OKCANCEL = 0x00000001
+MB_YESNO = 0x00000004
 MB_ICONERROR = 0x00000010
+MB_ICONQUESTION = 0x00000020
 MB_ICONWARNING = 0x00000030
 MB_ICONINFORMATION = 0x00000040
 IDOK = 1
 IDCANCEL = 2
+IDYES = 6
+IDNO = 7
+
+# SetWindowPos 标志位（Win32 API 命名常量，避免魔数）
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_FRAMECHANGED = 0x0020
 
 
 def _check_dotnet_framework() -> tuple[bool, str]:
@@ -169,7 +181,7 @@ if is_cli_mode:
         _kernel32.SetConsoleMode(_h_in, _new_mode)
         _kernel32.CloseHandle(_h_in)
 
-    from main import main as cli_main
+    from main import cli_entry
     auto_close = "--auto-close" in sys.argv
     # 移除 CLI 专属参数，避免传递给 main.py
     if "--cli" in sys.argv:
@@ -186,10 +198,12 @@ if is_cli_mode:
         sys.stderr = _cli_stderr
         sys.stdin = _cli_stdin
         try:
-            cli_main(auto_close=auto_close)
+            cli_entry(auto_close=auto_close)
         except SystemExit as e:
             exit_code = e.code if isinstance(e.code, int) else 0
-            if not auto_close:
+            # 退出码 6/7/8（EXIT_ALREADY_RUNNING / EXIT_NO_DB / EXIT_NOTIFIED_GUI）
+            # 由 cli_entry 内部已按窗口保留策略处理 print + input，此处跳过避免双重回车
+            if exit_code not in (6, 7, 8) and not auto_close:
                 print("\n按回车键关闭...")
                 try:
                     input()
@@ -222,7 +236,8 @@ logger = logging.getLogger(__name__)
 
 import webview
 import gui.api as gui_api
-from core.config import reload_settings
+from core.config import reload_settings, CONFIG_DIR, ACCOUNTS_FILE
+from core.db import DB_PATH, is_db_valid, migrate_from_json
 from werkzeug.serving import make_server
 
 
@@ -290,8 +305,19 @@ class WindowApi:
         Args:
             x: 目标 x 坐标。
             y: 目标 y 坐标。
+
+        Returns:
+            bool: 移动成功返回 True，参数非法返回 False。
         """
-        self._window.move(int(x), int(y))
+        try:
+            x, y = int(x), int(y)
+        except (TypeError, ValueError):
+            return False
+        # 限制坐标在合理范围，避免窗口被移出可见区域
+        x = max(-10000, min(10000, x))
+        y = max(-10000, min(10000, y))
+        self._window.move(x, y)
+        return True
 
     def _shutdown(self):
         if self._shutdown_called:
@@ -310,6 +336,9 @@ class WindowApi:
                 logger.warning("有领取任务正在运行，等待任务完成...")
             time.sleep(1)
             waited += 1
+
+        # 删除端口文件（CLI 通知 GUI 的依据，退出时清理）
+        _delete_gui_port()
 
         if self._server:
             try:
@@ -347,11 +376,163 @@ def find_available_port(start_port: int = 52137, max_port: int = 52200) -> int:
     raise RuntimeError(f"无法在端口范围 {start_port}-{max_port} 中找到可用端口")
 
 
+def _perform_db_migration():
+    """GUI 启动时检查 db 是否存在并执行迁移流程。
+
+    流程：
+    1. db 存在且 schema 校验通过 → 跳过迁移
+    2. db 不存在或损坏 + accounts.json 存在 → 弹窗询问是否迁移
+       - "是" → 迁移 + 重命名 json 为 .bak
+       - "否" → 退出程序
+    3. db 不存在或损坏 + 无 json + 有 .bak → 弹窗询问是否从备份恢复
+       - "是" → 从 .bak 迁移
+       - "否" → 建空表
+    4. db 不存在或损坏 + 无 json + 无 .bak → 直接建空表
+    5. 迁移失败 → 弹窗报错 + 退出程序
+    """
+    # db 存在且健康 → 跳过迁移
+    if os.path.exists(DB_PATH) and is_db_valid(DB_PATH):
+        return
+
+    bak_path = ACCOUNTS_FILE + ".bak"
+
+    if os.path.exists(ACCOUNTS_FILE):
+        # 有 accounts.json → 弹窗询问是否迁移
+        msg = (
+            '检测到现有账号数据（accounts.json），是否迁移到数据库？\n\n'
+            '点击"是"：迁移数据到 accounts.db（迁移完成后原 json 文件重命名为 .bak 备份）\n'
+            '点击"否"：退出程序（程序运行时必须使用数据库，无数据库无法运行）'
+        )
+        result = ctypes.windll.user32.MessageBoxW(
+            0, msg, "etalien-auto - 数据迁移", MB_YESNO | MB_ICONQUESTION
+        )
+        if result != IDYES:
+            # 用户选"否"或关闭弹窗（X/ESC 等同 IDNO）→ 退出程序
+            logger.info("用户取消迁移，GUI 退出")
+            sys.exit(0)
+        # 用户选"是" → 迁移
+        try:
+            migrate_from_json(ACCOUNTS_FILE, DB_PATH)
+        except Exception as e:
+            _show_migration_error(str(e))
+            sys.exit(1)
+        # 迁移成功 → 重命名 json 为 .bak
+        _rename_json_to_bak(ACCOUNTS_FILE, bak_path)
+        return
+
+    # 无 json → 检查 .bak
+    if os.path.exists(bak_path):
+        msg = (
+            '数据库损坏且无 JSON 源，检测到备份文件 accounts.json.bak，是否从备份恢复？\n\n'
+            '点击"是"：从 .bak 文件迁移数据到 accounts.db\n'
+            '点击"否"：建空表启动（无账号数据）'
+        )
+        result = ctypes.windll.user32.MessageBoxW(
+            0, msg, "etalien-auto - 数据恢复", MB_YESNO | MB_ICONQUESTION
+        )
+        if result == IDYES:
+            # 从 .bak 恢复（不重命名 .bak，避免链式覆盖）
+            try:
+                migrate_from_json(bak_path, DB_PATH)
+            except Exception as e:
+                _show_migration_error(str(e))
+                sys.exit(1)
+            return
+        # 用户选"否" → 建空表（不询问）
+        try:
+            migrate_from_json(ACCOUNTS_FILE, DB_PATH)  # ACCOUNTS_FILE 不存在 → 建空表
+        except Exception as e:
+            _show_migration_error(str(e))
+            sys.exit(1)
+        return
+
+    # 无 json 无 .bak → 建空表（不询问）
+    logger.info("无 json 与 .bak，直接建空表")
+    try:
+        migrate_from_json(ACCOUNTS_FILE, DB_PATH)  # ACCOUNTS_FILE 不存在 → 建空表
+    except Exception as e:
+        _show_migration_error(str(e))
+        sys.exit(1)
+
+
+def _rename_json_to_bak(json_path: str, bak_path: str):
+    """将 accounts.json 重命名为 .bak 备份（Windows 标准命名规则）。
+
+    accounts.json.bak 已存在 → accounts.json (1).bak → accounts.json (2).bak → ...
+    重命名失败仅记日志，不影响 GUI 启动（db 已有完整数据）。
+    """
+    if not os.path.exists(bak_path):
+        target = bak_path
+    else:
+        # accounts.json.bak → accounts.json (1).bak → accounts.json (2).bak → ...
+        base, ext = os.path.splitext(bak_path)  # ("accounts.json", ".bak")
+        i = 1
+        while True:
+            target = f"{base} ({i}){ext}"
+            if not os.path.exists(target):
+                break
+            i += 1
+    try:
+        os.rename(json_path, target)
+        logger.info("已重命名 %s → %s", json_path, target)
+    except OSError as e:
+        # 重命名失败（权限问题等）→ 不影响数据完整性（db 已有完整数据），仅记日志
+        logger.warning("重命名 json 为 .bak 失败（不影响 db 数据）: %s", e)
+
+
+def _show_migration_error(error_msg: str):
+    """弹窗提示迁移失败。"""
+    msg = f"数据迁移失败：{error_msg}\n\n请检查文件权限或联系技术支持。"
+    ctypes.windll.user32.MessageBoxW(
+        0, msg, "etalien-auto - 迁移失败", MB_OK | MB_ICONERROR
+    )
+
+
+def _write_gui_port(port: int, token: str):
+    """写入 GUI 端口文件（CLI 通过此文件找到 GUI 端口与认证 token）。
+
+    文件格式为 JSON：{"port": <int>, "token": <hex str>}。
+    token 用于 CLI 请求 /api/cli-trigger-claim 时的 Bearer 认证。
+
+    写入失败仅记日志，不影响 GUI 启动（CLI 通知失败时 CLI 自身会退出）。
+    """
+    port_file = os.path.join(CONFIG_DIR, ".gui_port")
+    try:
+        with open(port_file, "w", encoding="utf-8") as f:
+            json.dump({"port": port, "token": token}, f)
+    except OSError as e:
+        logger.warning("写入端口文件 %s 失败: %s", port_file, e)
+
+
+def _delete_gui_port():
+    """删除 GUI 端口文件（GUI 退出时调用）。
+
+    文件不存在或删除失败均忽略（下次 GUI 启动会覆盖写）。
+    """
+    port_file = os.path.join(CONFIG_DIR, ".gui_port")
+    try:
+        if os.path.exists(port_file):
+            os.unlink(port_file)
+    except OSError as e:
+        logger.warning("删除端口文件 %s 失败: %s", port_file, e)
+
+
 def main():
-    """GUI 主流程：初始化设置、查找可用端口、启动本地服务并创建 WebView 窗口。"""
+    """GUI 主流程：检查实例锁、迁移数据、启动本地服务并创建 WebView 窗口。"""
+
+    # 统一 Named Mutex 检查（与 CLI 共用，任何模式只能开一个实例）
+    from main import _create_mutex
+    mutex_handle, already_exists = _create_mutex()
+    if mutex_handle == 0 or already_exists:
+        # 已有实例在运行（GUI 或 CLI），直接退出（方案要求不弹窗、不区分实例类型）
+        logger.info("已有实例在运行，GUI 退出")
+        sys.exit(0)
 
     # 初始化 settings 缓存（整个进程生命周期内首次读取）
     reload_settings()
+
+    # db 迁移流程（GUI 启动时执行，CLI 不迁移）
+    _perform_db_migration()
 
     # 查找可用端口
     try:
@@ -362,8 +543,27 @@ def main():
         logger.error("%s", e)
         sys.exit(1)
 
-    # 启动服务器
-    server = make_server('127.0.0.1', port, gui_api.app, threaded=True)
+    # 启动服务器：make_server 与 find_available_port 之间存在 TOCTOU 竞态，
+    # 失败时从当前端口+1 开始重试，最多 3 次
+    server = None
+    for attempt in range(3):
+        try:
+            server = make_server('127.0.0.1', port, gui_api.app, threaded=True)
+            break
+        except OSError as e:
+            logger.warning("make_server 端口 %d 失败（attempt %d/3）: %s", port, attempt + 1, e)
+            if attempt == 2:
+                logger.error("无法绑定端口，GUI 启动失败")
+                sys.exit(1)
+            port += 1
+            if port > 52200:
+                logger.error("超出端口范围，GUI 启动失败")
+                sys.exit(1)
+    # 写入端口文件（CLI 通过此文件找到 GUI 端口，在 serve_forever 之前写入）
+    # 同时生成随机 token 用于 CLI→GUI 触发领取的 Bearer 认证
+    cli_trigger_token = secrets.token_hex(16)
+    gui_api._cli_trigger_token = cli_trigger_token
+    _write_gui_port(port, cli_trigger_token)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     logger.info("服务器已启动在 http://127.0.0.1:%d", port)
@@ -409,7 +609,7 @@ def main():
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style | WS_MINIMIZEBOX)
             ctypes.windll.user32.SetWindowPos(
                 hwnd, 0, 0, 0, 0, 0,
-                0x0020 | 0x0002 | 0x0001 | 0x0004,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
             )
             logger.info("已添加 WS_MINIMIZEBOX 样式")
         except Exception as e:
@@ -422,6 +622,7 @@ def main():
     # webview.start 返回后窗口已关闭；若 _shutdown 未被调用过（如异常退出路径），
     # 此处补充关闭 Flask 服务器，避免与窗口关闭按钮触发的 _shutdown 重复关闭
     if not api._shutdown_called:
+        _delete_gui_port()
         if api._server:
             try:
                 api._server.shutdown()

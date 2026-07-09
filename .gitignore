@@ -29,6 +29,9 @@ debug.log
 
 # Config (keep directory structure)
 config/accounts.json
+config/accounts.json*.bak
+config/accounts.db*
+config/.gui_port
 config/settings.json
 
 # Internal docs

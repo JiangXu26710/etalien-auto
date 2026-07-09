@@ -17,7 +17,7 @@
 </style>
 </head>
 <body>
-<div id="splash"><div id="splash-inner"><img id="splash-logo" src="logo.png" alt=""><div id="splash-bar"></div></div></div>
+<div id="splash"><div id="splash-inner"><img id="splash-logo" src="logo.png" alt="外星仔加速器"><div id="splash-bar"></div></div></div>
 <div id="app">
   <header class="title-bar" id="titleBar">
     <div class="title-bar-drag" id="titleBarDrag">
@@ -25,9 +25,9 @@
       <div class="title-bar-text">外星仔加速器 - 免广告自动领时长 F</div>
     </div>
     <div class="title-bar-controls">
-      <button class="title-btn title-btn-min" onclick="windowMinimize()" title="最小化"></button>
-      <button class="title-btn title-btn-max" onclick="windowMaximize()" title="最大化"></button>
-      <button class="title-btn title-btn-close" onclick="windowClose()" title="关闭"></button>
+      <button type="button" class="title-btn title-btn-min" onclick="windowMinimize()" title="最小化"></button>
+      <button type="button" class="title-btn title-btn-max" onclick="windowMaximize()" title="最大化"></button>
+      <button type="button" class="title-btn title-btn-close" onclick="windowClose()" title="关闭"></button>
     </div>
   </header>
 
@@ -49,18 +49,18 @@
 
     <section class="action-bar">
       <div class="action-bar-left">
-        <button class="btn-primary" id="btnClaim" onclick="startClaim()">
+        <button type="button" class="btn-primary" id="btnClaim" onclick="startClaim()">
           开始领取
         </button>
-        <button class="btn-secondary" onclick="refreshStatus()">
+        <button type="button" class="btn-secondary" onclick="refreshStatus()">
           刷新状态
         </button>
-        <button class="btn-accent" onclick="showAddAccount()">
+        <button type="button" class="btn-accent" onclick="showAddAccount()">
           添加账号
         </button>
       </div>
       <div class="action-bar-right">
-        <button class="btn-secondary" onclick="showSettings()">
+        <button type="button" class="btn-secondary" onclick="showSettings()">
           设置
         </button>
       </div>
