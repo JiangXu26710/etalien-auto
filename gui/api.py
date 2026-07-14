@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from core.config import load_settings, save_settings, reload_settings, validate_settings, VERSION, SETTINGS_SCHEMA
 from core.db import DbAccountRepository
-from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, get_all_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule
+from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, batch_get_account_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,9 @@ repo = DbAccountRepository()
 
 # 敏感字段过滤列表：禁止下发给前端，防止 auth_token / user_id / saved_at / password 泄露。
 SENSITIVE_FIELDS = ("auth_token", "user_id", "saved_at", "password")
+
+# 基础字段白名单（只返回这些字段给前端，过滤敏感字段与状态字段）
+BASE_FIELDS = ("phone", "name", "remark", "enabled", "claim_target")
 
 # 密码格式校验正则：6-20 位字母/数字/下划线/点号（与前端 PWD_RE 一致）
 PWD_RE = re.compile(r'^[A-Za-z0-9_.]{6,20}$')
@@ -222,14 +225,39 @@ def static_files(path):
 
 @app.route("/api/accounts", methods=["GET"])
 def get_accounts():
-    """获取所有账号列表，过滤敏感字段后返回。"""
-    accounts = repo.list_all()
-    # Repository 已按 id DESC 排序，无需再 sort
-    filtered_accounts = []
-    for account in accounts:
-        filtered = {k: v for k, v in account.items() if k not in SENSITIVE_FIELDS}
-        filtered_accounts.append(filtered)
-    return jsonify({"accounts": filtered_accounts})
+    """分页查询账号列表，仅返回基础字段（不含敏感字段、不含状态字段）。
+
+    必传 offset/limit；未传任一返回 400；非数字值返回 400；数字型非法值走 clamp：
+    - limit clamp 到 [1, 200]（limit=0 或负数 clamp 到 1；超上限 clamp 到 200）
+    - offset 负数 clamp 到 0；offset >= total 时返回空 accounts 列表（total 仍正确返回）
+    """
+    # 必传校验
+    if "offset" not in request.args or "limit" not in request.args:
+        return error_response("缺少 offset/limit 参数", 400)
+
+    # 非数字值返回 400
+    try:
+        offset = int(request.args.get("offset"))
+        limit = int(request.args.get("limit"))
+    except (TypeError, ValueError):
+        return error_response("offset/limit 必须是整数", 400)
+
+    # clamp
+    if limit < 1:
+        limit = 1
+    elif limit > 200:
+        limit = 200
+    if offset < 0:
+        offset = 0
+
+    accounts, total = repo.list_page(offset, limit)
+    filtered_accounts = [{k: v for k, v in acc.items() if k in BASE_FIELDS} for acc in accounts]
+    return jsonify({
+        "accounts": filtered_accounts,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    })
 
 
 @app.route("/api/accounts/<phone>", methods=["GET"])
@@ -399,11 +427,35 @@ def verify_code(phone):
     return jsonify({"ok": True})
 
 
-@app.route("/api/status", methods=["GET"])
-def get_status():
-    """获取所有账号状态。"""
+@app.route("/api/accounts/status", methods=["POST"])
+def get_accounts_status():
+    """批量查询账号状态（懒加载用，启用密码重登兜底）。
+
+    请求体：{"phones": ["138...", ...]}，phones 数量上限 clamp 到 50。
+    - phones 为空数组：返回 200 + 空 statuses 列表
+    - 未传 phones 参数：返回 400
+    - 后端总超时 90s，超时未完成的 phone 填 query_timeout=true 占位
+    - phone 不存在的占位项含 phone_not_found=true
+    """
+    data = request.get_json(silent=True) or {}
+    if "phones" not in data:
+        return error_response("缺少 phones 参数", 400)
+
+    phones = data.get("phones")
+    # 非列表类型（字符串/数字等）拒绝：len() 和切片在字符串上的语义与列表不同，
+    # 会导致逐字符处理而非逐手机号处理
+    if not isinstance(phones, list):
+        return error_response("phones 必须是数组", 400)
+    # clamp 到上限 50
+    if len(phones) > 50:
+        phones = phones[:50]
+
     settings = load_settings()
-    return jsonify({"status": get_all_status(max_workers=settings.get("max_concurrent", 10))})
+    statuses = batch_get_account_status(
+        phones,
+        max_workers=settings.get("max_concurrent", 10),
+    )
+    return jsonify({"statuses": statuses})
 
 
 def _start_claim_thread(enabled, settings, tag=""):

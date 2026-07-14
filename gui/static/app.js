@@ -5,7 +5,6 @@ let dragInFlight = false;
 let mouseDownPos = null;
 let isMouseDown = false;
 let dragInitiating = false;
-let cachedStatusList = [];
 let refreshPromise = null;
 let modalMouseDownTarget = null;
 let vipFloatShown = new Set();
@@ -16,7 +15,7 @@ let menuCounter = 0;
 
 // vipFloatShown: 已显示过飘字动画的账号集合（PC/手机端），防止轮询重复触发
 // prevStats: 上一轮统计值（total/active/watched/items），供 animateValue/animateProgress 做滚动计数
-// hasRenderedOnce: 首次渲染标志，控制卡片入场交错动画是否播放
+// hasRenderedOnce: 首批卡片渲染标志，控制卡片入场交错动画是否播放（虚拟滚动下滚动替换不重置）
 // logMouseDownTarget: 日志弹窗 mousedown 目标，用于遮罩层点击关闭检测
 // menuCounter: 自增计数器，为 action-menu-wrap 生成唯一 ID
 
@@ -26,6 +25,55 @@ const flippedPhones = new Set();
 // 手机端时长自减：追踪需要递减的 phone 集合，由单个全局定时器统一处理
 const mobileCountdownPhones = new Set();
 let mobileCountdownTimer = null;
+
+// ===== 虚拟滚动 + 分页 + 懒加载（方案 4.x）=====
+// 分页缓存：按 offset 缓存已加载的页（基础字段）
+const pageCache = new Map();
+// 状态缓存：按 phone 缓存状态（懒加载写入）
+const statusCache = new Map();
+// 已查询标记：phone -> 已尝试加载状态（含成功/失败/超时，乐观标记防轮询重复收集）
+const queriedPhones = new Set();
+// 虚拟滚动总数（来自后端 total）
+let totalCount = 0;
+// 当前渲染区间 [start, end)，end 为排除语义；初始 end=24 为最大化兜底，首次 resize 后修正
+let visibleRange = { start: 0, end: 24 };
+// 纯视口区间 [start, end)（不含缓冲），懒加载只查此范围内的卡片
+let viewportRange = { start: 0, end: 0 };
+// 全量刷新代际：每次 refreshAll 递增，使飞行中的懒加载响应失效
+let refreshGeneration = 0;
+// 领取中标志位：true 时暂停懒加载轮询、禁用刷新按钮
+let isClaiming = false;
+// 单卡基准高度（从 CSS 变量 --card-base-height 读取，默认 98 = 正常账号卡片自然高度估算值）
+let cardBaseHeight = 98;
+// 卡片行间距（与 CSS .virtual-render 的 gap 一致，用于按行计算虚拟滚动）
+const CARD_GAP = 8;
+// 懒加载轮询 timer
+let lazyLoadTimer = null;
+// 懒加载待查请求飞行中的 phone 集合（避免同一 phone 重复发请求）
+const inFlightPhones = new Set();
+// 批量查询飞行中标志：上一批 queryPhonesBatched 未完成时跳过新 tick，避免跨 tick 并发批次
+let isBatchInFlight = false;
+// 批量查询的 AbortController（模块级，供 refreshAll 中止飞行中请求，避免旧批次最长 100s 占用 isBatchInFlight）
+let batchAbortController = null;
+// pageCache 版本号：每次 pageCache 变更递增，供 renderViewport 早退判断数据是否变化
+let pageCacheVersion = 0;
+// renderViewport 上次渲染的关键输入快照（均为 -1 时强制首次渲染）
+let lastRender = { start: -1, end: -1, total: -1, pageVer: -1, gen: -1 };
+// resize 防抖 timer
+let resizeTimer = null;
+// wheel 接管：每次事件跳一行，preventDefault 阻止原生滚动避免中间态
+let wheelTargetRow = -1; // 当前目标行（-1 表示未初始化）
+let wheelAnimating = false; // 短动画是否进行中
+let wheelAnimStartTop = 0; // 动画起始 scrollTop
+let wheelAnimTargetTop = 0; // 动画目标 scrollTop
+let wheelAnimStartTime = 0; // 动画开始时间戳
+const WHEEL_ANIM_DURATION = 150; // 动画时长 ms（比浏览器默认 smooth 快 2-3 倍，兼顾平滑与快速响应）
+// refreshAll 防抖 timer
+let refreshAllTimer = null;
+// 视口容量（动态计算，8/24 为兜底）
+let viewportCapacity = 24;
+// 飞行中的分页请求 offset 集合（避免快速滚动时同页重复请求）
+const pendingPageRequests = new Set();
 
 // SVG 图标辅助常量
 const SVG_PC = '<svg viewBox="0 0 24 24"><path d="M20 18c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2H4c-1.1 0-2 .9-2 2v10c0 1.1.9 2 2 2H0v2h24v-2h-4zM4 6h16v10H4V6z"/></svg>';
@@ -332,7 +380,7 @@ function animateProgress(el, startW, endW, startT, endT, duration) {
 /**
  * 更新账号卡片的进度条与进度文本。
  * phase='mobile' 时更新手机端面（card-back），否则更新 PC 面（card-front）。
- * 初始进度来自缓存（cachedStatusList 或 mobileStatusCache），叠加本次领取增量。
+ * 初始进度来自缓存（statusCache 或 mobileStatusCache），叠加本次领取增量。
  */
 function updateCardProgress(phone, current, total, phase) {
     const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
@@ -355,8 +403,8 @@ function updateCardProgress(phone, current, total, phase) {
             if (!isNaN(parts[0])) initialWatched = parts[0];
         }
     } else {
-        // PC 端初始进度来自 cachedStatusList
-        const cached = cachedStatusList.find(s => s.phone === phone);
+        // PC 端初始进度来自 statusCache
+        const cached = statusCache.get(phone);
         if (cached && cached.progress && cached.token_valid) {
             const parts = cached.progress.split('/').map(Number);
             if (!isNaN(parts[0])) initialWatched = parts[0];
@@ -495,101 +543,522 @@ function _animateCloseLogModal() {
     });
 }
 
-async function refreshStatus(withAnimation = true) {
-    if (refreshPromise) return refreshPromise;
-    refreshPromise = (async () => {
-        try {
-            if (withAnimation) hasRenderedOnce = false;
-            // 全量刷新时清空手机端状态缓存，以获取新数据
-            Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
-            // 停止所有手机端时长自减（翻面卡片重新渲染后会按需重启）
-            mobileCountdownPhones.clear();
-            if (mobileCountdownTimer) {
-                clearInterval(mobileCountdownTimer);
-                mobileCountdownTimer = null;
-            }
-            const data = await api('/api/status');
-            cachedStatusList = data.status || [];
-            renderAccounts(cachedStatusList);
-        } catch (e) {
-            console.error('refreshStatus error:', e);
-            showToast('刷新状态失败：' + (e.message || '未知错误'), 'error');
+// 全量刷新流程（方案 4.3）：清除懒加载相关缓存与翻转态，由懒加载机制重新加载可见账号状态。
+// 含 500ms 防抖（方案 6.11）；领取中（isClaiming=true）禁止点击。
+function refreshAll() {
+    if (isClaiming) return;
+    if (refreshAllTimer) {
+        clearTimeout(refreshAllTimer);
+    }
+    refreshAllTimer = setTimeout(() => {
+        refreshAllTimer = null;
+        // R3-004: 防抖窗口内可能已开始领取（t=0 点击刷新，t=200ms 开始领取），此时放弃本次刷新
+        if (isClaiming) return;
+        // R3-002: 中止飞行中批量请求（旧 AbortController 为局部变量无法中止，最长 100s 占用 isBatchInFlight 导致刷新无效）
+        if (batchAbortController) {
+            batchAbortController.abort();
+            batchAbortController = null;
         }
-    })().finally(() => { refreshPromise = null; });
-    return refreshPromise;
+        // 清空飞行中 phone（避免下个 tick 因 inFlightPhones 跳过这些 phone）
+        // 注意：不重置 isBatchInFlight —— 旧 queryPhonesBatched 的 .finally 会处理，避免与旧 promise 的 .finally 竞态
+        inFlightPhones.clear();
+        // 1. 清除所有账号的"已查询"标记，触发懒加载重新查询可见 phone
+        queriedPhones.clear();
+        // 2. 保留 pageCache 与 statusCache 不清空（兜底渲染，避免占位闪烁）
+        // 3. 清除 mobileStatusCache 并重置 flippedPhones（所有卡片回到正面）
+        Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
+        flippedPhones.clear();
+        // 4. 停止所有手机端时长自减
+        mobileCountdownPhones.clear();
+        if (mobileCountdownTimer) {
+            clearInterval(mobileCountdownTimer);
+            mobileCountdownTimer = null;
+        }
+        // 5. 全量刷新代际递增，使飞行中的懒加载响应失效
+        refreshGeneration++;
+        // 6/7. 不主动拉取任何状态数据，由懒加载机制重新加载可见账号状态
+        // 8. 分页列表数据仍由 /api/accounts 分页接口提供，不受影响
+        // 重渲染当前视口（用 statusCache 兜底，未命中走 not_queried 占位）
+        renderViewport();
+        // 触发一次懒加载 tick，立即收集待查 phone（不等下一个 1s tick）
+        scheduleLazyLoadTick(true);
+        // 确保 timer 运行（queriedPhones.clear() 后视口内卡片需重新查询；timer 可能因空闲态被停止）
+        startLazyLoadPolling();
+    }, 500);
 }
 
-async function refreshAccountsLight() {
-    try {
-        const data = await api('/api/accounts');
-        const accounts = data.accounts || [];
-        const merged = accounts.map(acc => {
-            const cached = cachedStatusList.find(s => s.phone === acc.phone);
-            if (cached) {
-                return {
-                    ...cached,
-                    name: acc.name,
-                    remark: acc.remark,
-                    enabled: acc.enabled,
-                    claim_target: acc.claim_target,
-                };
-            }
-            return {
-                phone: acc.phone,
-                name: acc.name || '',
-                remark: acc.remark || '',
-                enabled: acc.enabled,
-                logged_in: false,
-                token_valid: false,
-                vip_duration: 0,
-                free_duration: 0,
-                progress: '0/0',
-            };
-        });
-        cachedStatusList = merged;
-        renderAccounts(merged);
-    } catch (e) {
-        console.error('refreshAccountsLight error:', e);
-        showToast('刷新账号失败：' + (e.message || '未知错误'), 'error');
+// 构造默认占位状态（statusCache 未命中时用，标记 not_queried:true）
+function buildDefaultPlaceholder(phone) {
+    return {
+        phone,
+        logged_in: false,
+        token_valid: false,
+        token_expired: false,
+        vip_duration: 0,
+        free_duration: 0,
+        progress: '0/0',
+        mobile_duration: 0,
+        mobile_progress: '0/0',
+        mobile_rewarded_count: 0,
+        mobile_claimed_count: 0,
+        mobile_not_get_ad_duration: 0,
+        mobile_error: false,
+        mobile_tasks: [],
+        pc_error: false,
+        not_queried: true,
+    };
+}
+
+// 合并基础字段（pageCache）与状态字段（statusCache）
+function mergeAccountWithStatus(acc, status) {
+    return {
+        ...status,
+        phone: acc.phone,
+        name: acc.name || '',
+        remark: acc.remark || '',
+        enabled: acc.enabled,
+        claim_target: acc.claim_target,
+    };
+}
+
+// 拉取分页数据并写入 pageCache（方案 3.1 接口）
+async function fetchAccountsPage(offset, limit) {
+    const data = await api(`/api/accounts?offset=${offset}&limit=${limit}`);
+    const accounts = data.accounts || [];
+    pageCache.set(offset, accounts);
+    pageCacheVersion++;
+    if (typeof data.total === 'number') totalCount = data.total;
+    return accounts;
+}
+
+// 在 pageCache 中查找 phone 所在页 + 页内索引（未找到返回 null）
+function findInPageCache(phone) {
+    for (const [offset, page] of pageCache) {
+        const idx = page.findIndex(a => a.phone === phone);
+        if (idx >= 0) return { offset, idxInPage: idx, page };
+    }
+    return null;
+}
+
+// 局部更新 pageCache 中某 phone 的字段（启停/编辑后用）
+function updatePageCacheEntry(phone, patch) {
+    const found = findInPageCache(phone);
+    if (!found) return false;
+    Object.assign(found.page[found.idxInPage], patch);
+    return true;
+}
+
+// 从 CSS 变量 --card-base-height 读取单卡基准高度
+function initCardBaseHeight() {
+    const v = getComputedStyle(document.documentElement).getPropertyValue('--card-base-height').trim();
+    if (v) {
+        const n = parseFloat(v);
+        if (!isNaN(n) && n > 0) cardBaseHeight = n;
     }
 }
 
-/**
- * 根据 statusList 渲染账号卡片列表。
- * 含翻转状态恢复、action-menu 迁移到 body（避免 preserve-3d 撑大父级）、
- * 统计聚合（总账号数/已启用/总进度，按 claim_target 过滤阶段）。
- */
-function renderAccounts(statusList) {
-    let totalWatched = 0;
-    let totalItems = 0;
-    let activeCount = 0;
+// 读取 .virtual-render 的实际列数（grid auto-fill 实际渲染列数）
+// 降级：基于容器可用宽度（扣除 padding）和 CSS minmax(400px, 1fr) + gap:8px 推算
+function getColumns() {
+    const renderEl = document.querySelector('.accounts-list .virtual-render');
+    if (!renderEl) return 1;
+    const cols = getComputedStyle(renderEl).gridTemplateColumns.split(' ').filter(s => s.trim());
+    if (cols.length > 0) return Math.max(1, cols.length);
+    const cs = getComputedStyle(renderEl);
+    const padL = parseFloat(cs.paddingLeft) || 0;
+    const padR = parseFloat(cs.paddingRight) || 0;
+    const availableWidth = renderEl.clientWidth - padL - padR;
+    return Math.max(1, Math.floor((availableWidth + CARD_GAP) / (400 + CARD_GAP)));
+}
 
+// 单行高度 = 单卡高度 + 行间距（用于按行计算虚拟滚动定位）
+function getRowHeight() {
+    return cardBaseHeight + CARD_GAP;
+}
+
+// 确保虚拟滚动容器结构（撑高层 + 渲染层）
+function ensureVirtualStructure(listEl) {
+    let spacer = listEl.querySelector('.virtual-spacer');
+    let render = listEl.querySelector('.virtual-render');
+    if (!spacer) {
+        // 首次初始化：清理 #accountsList 下的静态子节点（如 index.html 中的初始 .empty-state），
+        // 避免其与虚拟滚动结构并存导致有账号时仍显示"暂无账号"占位（position:absolute 永远浮在卡片之上）
+        Array.from(listEl.children).forEach(child => {
+            if (!child.classList.contains('virtual-spacer') && !child.classList.contains('virtual-render')) {
+                child.remove();
+            }
+        });
+        spacer = document.createElement('div');
+        spacer.className = 'virtual-spacer';
+        listEl.appendChild(spacer);
+    }
+    if (!render) {
+        render = document.createElement('div');
+        render.className = 'virtual-render';
+        listEl.appendChild(render);
+    }
+    return { spacer, render };
+}
+
+// clamp scrollTop 到 [0, max(0, 总高度 - viewportH)]
+// 总高度按"总行数 × 行高"计算，考虑多列并排布局
+function clampScrollTop(scrollTop, viewportH) {
+    const columns = getColumns();
+    const rowHeight = getRowHeight();
+    const totalRows = Math.ceil(totalCount / columns);
+    const totalH = Math.max(0, totalRows * rowHeight - CARD_GAP);
+    const maxScroll = Math.max(0, totalH - viewportH);
+    return Math.max(0, Math.min(scrollTop, maxScroll));
+}
+
+// 计算渲染区间 [start, end)，含上下各 1 屏缓冲（按行计算，区间边界对齐到整行）
+// 多列布局下：visibleRows = floor(viewportH / rowHeight)，capacity = visibleRows * columns
+// 同时返回纯视口区间 viewport（无缓冲），懒加载只查 viewport 范围
+function computeVisibleRange(scrollTop, viewportH) {
+    if (totalCount === 0) return { visible: { start: 0, end: 0 }, viewport: { start: 0, end: 0 } };
+    const columns = getColumns();
+    const rowHeight = getRowHeight();
+    const visibleRows = Math.max(1, Math.floor(viewportH / rowHeight));
+    const capacity = visibleRows * columns;
+    viewportCapacity = capacity;
+    const bufferRows = visibleRows; // 上下各 1 屏缓冲（按行）
+    const firstVisibleRow = Math.floor(scrollTop / rowHeight);
+    const startRow = Math.max(0, firstVisibleRow - bufferRows);
+    const endRow = Math.min(Math.ceil(totalCount / columns), firstVisibleRow + visibleRows + bufferRows);
+    // 纯视口区间（无缓冲）：基于 scrollTop + viewportH 计算最后像素可见行，
+    // 避免 totalCount 不满整数屏时 maxScroll 不足以让 firstVisibleRow 跨行，
+    // 导致最后一行卡片永远进不了 viewportRange（懒加载漏查）
+    const lastVisibleRow = Math.floor((scrollTop + viewportH - 1) / rowHeight);
+    const vpEndRow = Math.min(Math.ceil(totalCount / columns), lastVisibleRow + 1);
+    return {
+        visible: {
+            start: startRow * columns,
+            end: Math.min(totalCount, endRow * columns)
+        },
+        viewport: {
+            start: firstVisibleRow * columns,
+            end: Math.min(totalCount, vpEndRow * columns)
+        }
+    };
+}
+
+// 清理被虚拟滚动回收的卡片的翻转态与定时器（mobileStatusCache 保留供下次翻面复用）
+function cleanupFlippedOutsideRange() {
+    const renderEl = document.querySelector('.accounts-list .virtual-render');
+    if (!renderEl) return;
+    const toClean = [];
+    for (const phone of flippedPhones) {
+        const card = renderEl.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
+        if (!card) toClean.push(phone);
+    }
+    toClean.forEach(p => {
+        flippedPhones.delete(p);
+        stopMobileCountdown(p);
+    });
+}
+
+// wheel 短动画步进：ease-out cubic，150ms 到达目标（比浏览器默认 smooth 快 2-3 倍）
+function wheelAnimStep() {
     const listEl = document.getElementById('accountsList');
+    if (!listEl) {
+        wheelAnimating = false;
+        return;
+    }
+    const rowHeight = getRowHeight();
+    const now = performance.now();
+    const elapsed = now - wheelAnimStartTime;
+    const progress = Math.min(1, elapsed / WHEEL_ANIM_DURATION);
+    // ease-out cubic：开始快、结束慢
+    const eased = 1 - Math.pow(1 - progress, 3);
+    listEl.scrollTop = wheelAnimStartTop + (wheelAnimTargetTop - wheelAnimStartTop) * eased;
 
-    // 重渲染会清空 accountsList（含 .action-menu-wrap），但曾被移到 body 的 .action-menu
-    // 不会随之销毁，会变成孤儿堆积在 body 中。重渲染前主动清理。
-    document.body.querySelectorAll(':scope > .action-menu').forEach(m => m.remove());
-
-    if (statusList.length === 0) {
-        listEl.innerHTML = '<div class="empty-state">暂无账号，点击"添加账号"开始</div>';
+    if (progress < 1) {
+        requestAnimationFrame(wheelAnimStep);
     } else {
-        listEl.innerHTML = statusList.map((s, idx) => {
-            const initial = escapeHtml((s.name || s.phone).charAt(0).toUpperCase());
-            const displayName = escapeHtml(s.name || maskPhone(s.phone));
-            const displayPhone = s.name ? escapeHtml(maskPhone(s.phone)) : '';
-            const displayRemark = s.remark ? escapeHtml(s.remark) : '';
-            const phoneLine = [displayPhone, displayRemark].filter(Boolean).join(' · ');
+        wheelAnimating = false;
+        // 动画结束后检查 wheelTargetRow 是否又变化（动画进行中收到新 wheel 累积）
+        const finalTarget = wheelTargetRow * rowHeight;
+        if (Math.abs(finalTarget - wheelAnimTargetTop) > 0.5) {
+            startWheelAnim();
+        }
+    }
+}
 
-            const vipStr = s.token_valid ? formatDuration(s.vip_duration) : '--:--:--';
-            // PC 端接口查询失败时显示"查询失败"占位，避免误导性的 0/0（与 mobile_error 对称）
-            const progressStr = s.token_valid
-                ? (s.pc_error
-                    ? '<span style="color:var(--text-muted)">查询失败</span>'
-                    : (s.progress ? escapeHtml(s.progress) : '-/-'))
-                : '-/-';
+function startWheelAnim() {
+    const listEl = document.getElementById('accountsList');
+    if (!listEl) return;
+    const rowHeight = getRowHeight();
+    wheelAnimStartTop = listEl.scrollTop;
+    wheelAnimTargetTop = wheelTargetRow * rowHeight;
+    wheelAnimStartTime = performance.now();
+    if (!wheelAnimating) {
+        wheelAnimating = true;
+        requestAnimationFrame(wheelAnimStep);
+    }
+}
 
-            // idle 总进度口径对齐领取中：只统计 enabled 账号，且按 claim_target 过滤阶段
-            // （领取中只对 enabled 执行、且只统计 claim_target 配置的阶段，避免领取开始时数值跳变）
+// wheel 接管：阻止原生滚动，每次事件跳一行，150ms ease-out 动画平滑过渡
+function handleWheel(e) {
+    e.preventDefault();
+    const listEl = document.getElementById('accountsList');
+    if (!listEl) return;
+    const rowHeight = getRowHeight();
+    if (rowHeight <= 0) return;
+
+    // 首次 wheel 或拖动滚动条/删除账号导致 scrollTop 与目标行偏差过大时重置
+    if (wheelTargetRow < 0 || Math.abs(listEl.scrollTop - wheelTargetRow * rowHeight) > rowHeight) {
+        wheelTargetRow = Math.round(listEl.scrollTop / rowHeight);
+    }
+
+    // 每次事件跳一行（鼠标滚轮一格 = 一次事件 = 一行，不受 Windows 滚动速度设置影响）
+    wheelTargetRow += Math.sign(e.deltaY);
+
+    // clamp 到 [0, totalRows-1]
+    const totalRows = Math.ceil(totalCount / getColumns());
+    wheelTargetRow = Math.max(0, Math.min(wheelTargetRow, Math.max(0, totalRows - 1)));
+
+    // 启动或更新动画
+    if (wheelAnimating) {
+        // 动画进行中：只更新目标，不重置开始时间（避免快速连滚时动画永远不结束）
+        wheelAnimTargetTop = wheelTargetRow * rowHeight;
+    } else {
+        startWheelAnim();
+    }
+}
+
+// scroll 事件处理
+function handleScroll() {
+    renderViewport();
+    // 用户滚动可能渲染新卡片到 DOM，确保懒加载 timer 处于运行态（空闲态会被 stopLazyLoadPolling 停止）
+    startLazyLoadPolling();
+}
+
+// resize 防抖 200ms（方案 6.10）
+function handleResize() {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+        resizeTimer = null;
+        const listEl = document.getElementById('accountsList');
+        if (!listEl) return;
+        const viewportH = listEl.clientHeight;
+        // 按行重算容量（多列布局：capacity = visibleRows * columns）
+        const columns = getColumns();
+        const rowHeight = getRowHeight();
+        const visibleRows = Math.max(1, Math.floor(viewportH / rowHeight));
+        const newCapacity = visibleRows * columns;
+        // 视口容量变化时清空 pageCache（页大小变化导致旧缓存对齐错位）
+        if (newCapacity !== viewportCapacity) {
+            pageCache.clear();
+            pageCacheVersion++;
+        }
+        listEl.scrollTop = clampScrollTop(listEl.scrollTop, viewportH);
+        renderViewport();
+        // 视口尺寸变化可能引入新卡片，确保懒加载 timer 运行
+        startLazyLoadPolling();
+    }, 200);
+}
+
+// 初始化虚拟滚动（首次调用时绑定事件、读取 CSS 变量）
+let _virtualScrollInited = false;
+function initVirtualScrollOnce() {
+    if (_virtualScrollInited) return;
+    _virtualScrollInited = true;
+    initCardBaseHeight();
+    const listEl = document.getElementById('accountsList');
+    if (!listEl) return;
+    ensureVirtualStructure(listEl);
+    listEl.addEventListener('scroll', handleScroll, { passive: true });
+    listEl.addEventListener('wheel', handleWheel, { passive: false });
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('beforeunload', () => {
+        stopLazyLoadPolling();
+        if (cliTriggerDetectTimer) {
+            clearTimeout(cliTriggerDetectTimer);
+            cliTriggerDetectTimer = null;
+        }
+    });
+}
+
+// 基于 visibleRange 渲染当前视口（含分页缺失时按需请求）
+function renderViewport() {
+    const listEl = document.getElementById('accountsList');
+    if (!listEl) return;
+    const { spacer, render } = ensureVirtualStructure(listEl);
+
+    // 空列表
+    if (totalCount === 0) {
+        // 无卡片时清理 body 中残留的 menu 孤儿
+        document.body.querySelectorAll(':scope > .action-menu').forEach(m => m.remove());
+        spacer.style.height = '0px';
+        render.style.transform = 'translateY(0px)';
+        render.innerHTML = '<div class="empty-state">暂无账号，点击"添加账号"开始</div>';
+        updateStats(0, 0, 0, 0);
+        hasRenderedOnce = true;
+        // 失效渲染快照，确保下次非空列表时不被早退跳过
+        lastRender = { start: -1, end: -1, total: -1, pageVer: -1, gen: -1 };
+        return;
+    }
+
+    const viewportH = listEl.clientHeight;
+    const ranges = computeVisibleRange(listEl.scrollTop, viewportH);
+    const range = ranges.visible;
+    viewportRange = ranges.viewport;
+    // 早退：range/totalCount/pageCache/refreshGen 均未变化时跳过 innerHTML 重建
+    // wheel 动画期间每帧可能调用 renderViewport 但 range 未跨行变化，避免无谓 DOM 重建
+    if (range.start === lastRender.start && range.end === lastRender.end
+        && totalCount === lastRender.total
+        && pageCacheVersion === lastRender.pageVer
+        && refreshGeneration === lastRender.gen) {
+        return;
+    }
+    // 重建 DOM 前清理 body 中的 .action-menu 孤儿（早退分支保留 menu，避免 ⋯ 呼不出）
+    document.body.querySelectorAll(':scope > .action-menu').forEach(m => m.remove());
+    const prevStart = visibleRange.start;
+    const prevEnd = visibleRange.end;
+    visibleRange = range;
+    lastRender = { start: range.start, end: range.end, total: totalCount, pageVer: pageCacheVersion, gen: refreshGeneration };
+
+    // 撑高层 + 渲染层偏移（按行计算，考虑多列并排）
+    const columns = getColumns();
+    const rowHeight = getRowHeight();
+    const totalRows = Math.ceil(totalCount / columns);
+    spacer.style.height = Math.max(0, totalRows * rowHeight - CARD_GAP) + 'px';
+    const startRow = Math.floor(range.start / columns);
+    render.style.transform = `translateY(${startRow * rowHeight}px)`;
+
+    // 范围变化时清理被回收卡片的翻转态
+    if (range.start !== prevStart || range.end !== prevEnd) {
+        cleanupFlippedOutsideRange();
+    }
+
+    // 收集区间内的账号（按页对齐拉取，缺失页异步请求）
+    const capacity = viewportCapacity;
+    const pendingPages = new Set();
+    const slots = [];
+    for (let i = range.start; i < range.end; i++) {
+        const pageOffset = Math.floor(i / capacity) * capacity;
+        if (pageCache.has(pageOffset)) {
+            const page = pageCache.get(pageOffset);
+            const idxInPage = i - pageOffset;
+            slots.push({ acc: page[idxInPage] || null, absoluteIdx: i });
+        } else {
+            slots.push({ acc: null, absoluteIdx: i });
+            // 同一次 renderViewport 内去重（pendingPages）+ 跨次去重（pendingPageRequests）
+            // 快速滚动时 renderViewport 被多次调用，pageCache 未写入前会重复请求同页
+            if (!pendingPages.has(pageOffset) && !pendingPageRequests.has(pageOffset)) {
+                pendingPages.add(pageOffset);
+                pendingPageRequests.add(pageOffset);
+                fetchAccountsPage(pageOffset, capacity).then(() => {
+                    pendingPageRequests.delete(pageOffset);
+                    renderViewport();
+                    // 新卡片已渲染到 DOM，确保懒加载 timer 运行（空闲态 timer 可能已被停止）
+                    startLazyLoadPolling();
+                }).catch(e => {
+                    pendingPageRequests.delete(pageOffset);
+                    console.error('fetchAccountsPage error:', e);
+                    // 标记该页对应的占位卡片为加载失败（点击触发 refreshAll 恢复）
+                    const renderEl = document.querySelector('.accounts-list .virtual-render');
+                    if (!renderEl) return;
+                    for (let i = pageOffset; i < pageOffset + capacity; i++) {
+                        const card = renderEl.querySelector(`.account-card.is-placeholder[data-phone="__pending_${i}"]`);
+                        if (!card) continue;
+                        card.setAttribute('data-load-error', '1');
+                        const spinner = card.querySelector('.placeholder-spinner');
+                        if (spinner) spinner.remove();
+                        const textEl = card.querySelector('.placeholder-text');
+                        if (textEl) textEl.textContent = '加载失败，点击重试';
+                        card.onclick = () => refreshAll();
+                    }
+                });
+            }
+        }
+    }
+
+    // 渲染卡片 + 聚合统计
+    let totalWatched = 0, totalItems = 0, activeCount = 0;
+    render.innerHTML = slots.map(({ acc, absoluteIdx }) => {
+        if (!acc) {
+            // 该位置分页加载中，渲染加载占位
+            return buildPlaceholderCardHTML(absoluteIdx);
+        }
+        const status = statusCache.get(acc.phone) || buildDefaultPlaceholder(acc.phone);
+        const s = mergeAccountWithStatus(acc, status);
+        // 聚合统计（口径与原 renderAccounts 一致）
+        if (s.token_valid && s.enabled) {
+            const ct = s.claim_target || 'all';
+            if (ct !== 'mobile') {
+                const [w, t] = (s.progress || '0/0').split('/').map(Number);
+                if (!isNaN(w) && !isNaN(t)) {
+                    totalWatched += w;
+                    totalItems += t;
+                }
+            }
+            if (ct !== 'pc' && s.mobile_progress) {
+                const [mw, mt] = s.mobile_progress.split('/').map(Number);
+                if (!isNaN(mw) && !isNaN(mt)) {
+                    totalWatched += mw;
+                    totalItems += mt;
+                }
+            }
+        }
+        if (s.enabled) activeCount++;
+        return buildCardHTML(s, absoluteIdx);
+    }).join('');
+
+    // 恢复翻转态（mobileStatusCache 优先，未命中时调 fetchMobileStatus）
+    if (flippedPhones.size > 0) {
+        render.querySelectorAll('.account-card').forEach(card => {
+            const phone = card.dataset.phone;
+            if (flippedPhones.has(phone)) {
+                card.classList.add('flipped');
+                const backInfo = card.querySelector('.card-back-info');
+                if (backInfo) {
+                    if (mobileStatusCache[phone]) {
+                        renderMobileBack(backInfo, mobileStatusCache[phone]);
+                    } else {
+                        fetchMobileStatus(card);
+                    }
+                }
+            }
+        });
+    }
+
+    // 将 .action-menu 从卡片内部迁到 body（避免 preserve-3d 撑大父级）
+    render.querySelectorAll('.action-menu-wrap').forEach(wrap => {
+        if (!wrap.id) wrap.id = 'amw-' + (++menuCounter);
+        const menu = wrap.querySelector('.action-menu');
+        if (menu) {
+            menu.dataset.originWrapId = wrap.id;
+            document.body.appendChild(menu);
+        }
+    });
+
+    updateStats(totalCount, activeCount, totalWatched, totalItems);
+    // 仅当当前视口内所有分页都已加载（无 acc=null 占位）时才标记 hasRenderedOnce。
+    // 否则异步分页加载完成的二次 renderViewport 会因 hasRenderedOnce=true 给所有卡片加 no-anim，
+    // 经 render.innerHTML 重建 DOM 后覆盖掉首批卡片的进场动画。
+    const hasPendingPlaceholder = slots.some(({ acc }) => !acc);
+    if (!hasPendingPlaceholder) {
+        hasRenderedOnce = true;
+    }
+}
+
+// 更新顶部统计数字
+function updateStats(total, active, watched, items) {
+    const dur = 300;
+    animateValue(document.getElementById('totalAccounts'), prevStats.total, total, dur);
+    animateValue(document.getElementById('activeAccounts'), prevStats.active, active, dur);
+    animateProgress(document.getElementById('totalProgress'), prevStats.watched, watched, prevStats.items, items, dur);
+    prevStats = { total, active, watched, items };
+}
+
+// 重新聚合统计数字（局部更新后用，遍历已加载的 pageCache）
+function reaggregateStats() {
+    let totalWatched = 0, totalItems = 0, activeCount = 0;
+    for (const [, page] of pageCache) {
+        for (const acc of page) {
+            const status = statusCache.get(acc.phone) || buildDefaultPlaceholder(acc.phone);
+            const s = mergeAccountWithStatus(acc, status);
             if (s.token_valid && s.enabled) {
                 const ct = s.claim_target || 'all';
                 if (ct !== 'mobile') {
@@ -599,7 +1068,6 @@ function renderAccounts(statusList) {
                         totalItems += t;
                     }
                 }
-                // claim_target !== 'pc' 时累加手机端进度（mobile_progress 字段独立于 PC 端 progress）
                 if (ct !== 'pc' && s.mobile_progress) {
                     const [mw, mt] = s.mobile_progress.split('/').map(Number);
                     if (!isNaN(mw) && !isNaN(mt)) {
@@ -608,139 +1076,178 @@ function renderAccounts(statusList) {
                     }
                 }
             }
-
             if (s.enabled) activeCount++;
+        }
+    }
+    updateStats(totalCount, activeCount, totalWatched, totalItems);
+}
 
-            // 同步手机端数据到 mobileStatusCache（避免翻面时重复请求 /api/accounts/<phone>/mobile_status）
-            if (s.token_valid && s.mobile_progress) {
-                const oldCache = mobileStatusCache[s.phone];
-                const newDuration = s.mobile_duration || 0;
-                // mobile_duration 未变化时保留旧 mobile_expire_ts，避免轻量刷新重置自减基线
-                const expireTs = (oldCache && oldCache.mobile_duration === newDuration && oldCache.mobile_expire_ts)
-                    ? oldCache.mobile_expire_ts
-                    : Math.floor(Date.now() / 1000) + newDuration;
-                mobileStatusCache[s.phone] = {
-                    phone: s.phone,
-                    mobile_duration: newDuration,
-                    mobile_expire_ts: expireTs,
-                    mobile_progress: s.mobile_progress,
-                    mobile_rewarded_count: s.mobile_rewarded_count || 0,
-                    mobile_claimed_count: s.mobile_claimed_count || 0,
-                    mobile_not_get_ad_duration: s.mobile_not_get_ad_duration || 0,
-                    mobile_tasks: s.mobile_tasks || [],
-                    mobile_error: s.mobile_error || false,
-                    token_valid: true,
-                };
-            } else {
-                // token 失效或未登录时清除旧缓存，避免显示过期数据
-                stopMobileCountdown(s.phone);
-                delete mobileStatusCache[s.phone];
-            }
+// 构建分页加载中的占位卡片（pageCache 未加载时用，区别于状态占位）
+function buildPlaceholderCardHTML(absoluteIdx) {
+    return `
+    <div class="account-card is-placeholder no-anim" data-phone="__pending_${absoluteIdx}">
+        <div class="card-inner">
+            <div class="card-sizer"></div>
+            <div class="card-front">
+                <div class="placeholder-spinner"></div>
+                <div class="placeholder-text">加载中</div>
+            </div>
+            <div class="card-back"></div>
+        </div>
+    </div>`;
+}
 
-            let cardClass = 'account-card';
-            if (s.token_expired) cardClass += ' token-expired';
-            if (!s.enabled || !s.token_valid) cardClass += ' account-disabled';
+// 构建单张账号卡片 HTML（含占位渲染优先级判定，方案 4.4）
+function buildCardHTML(s, idx) {
+    const initial = escapeHtml((s.name || s.phone).charAt(0).toUpperCase());
+    const displayName = escapeHtml(s.name || maskPhone(s.phone));
+    const displayPhone = s.name ? escapeHtml(maskPhone(s.phone)) : '';
+    const displayRemark = s.remark ? escapeHtml(s.remark) : '';
+    const phoneLine = [displayPhone, displayRemark].filter(Boolean).join(' · ');
 
-            let cardStyle = '';
-            if (!hasRenderedOnce) {
-                const staggerDelay = Math.min(idx * 0.05, 0.4);
-                cardStyle = `animation-delay:${staggerDelay}s`;
-            } else {
-                cardClass += ' no-anim';
-            }
-
-            let actionsHtml = '';
-            if (!s.logged_in || s.token_expired) {
-                actionsHtml = `<button type="button" class="btn-small" onclick="showLogin(${jsStr(s.phone)})">登录</button>`;
-            }
-            actionsHtml += `
-            <div class="action-menu-wrap" data-phone="${escapeHtml(s.phone)}">
-                <button type="button" class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this, event)">⋯</button>
-                <div class="action-menu">
-                    <button type="button" class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
-                    <button type="button" class="action-menu-item" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
-                    <button type="button" class="action-menu-item action-menu-danger" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
-                </div>
-            </div>`;
-
-            const progressParts = s.progress ? s.progress.split('/') : [0, 0];
-            const progressPct = progressParts[1] > 0 ? (progressParts[0] / progressParts[1] * 100) : 0;
-
-            return `
-            <div class="${cardClass}" data-phone="${escapeHtml(s.phone)}" ${cardStyle ? `style="${cardStyle}"` : ''} onanimationend="this.style.animation='none'">
-                <div class="card-inner">
-                    <div class="card-sizer">
-                        <div class="account-avatar">${initial}</div>
-                        <div class="account-info">
-                            <div class="account-name-row">
-                                <span class="account-name">${displayName}</span>
-                                <span class="account-vip">${vipStr}</span>
-                            </div>
-                            ${phoneLine ? `<div class="account-phone">${phoneLine}</div>` : ''}
-                            ${s.token_valid ? `
-                            <div class="account-progress-wrap">
-                                <div class="progress-bar"><div class="progress-bar-fill${progressPct >= 100 ? ' complete' : ''}" style="width:${progressPct}%"></div><div class="progress-bar-glow" style="width:${progressPct}%"></div></div>
-                                <span class="account-progress-label">${progressStr}</span>
-                            </div>` : ''}
-                        </div>
-                    </div>
-                    <div class="card-front" onclick="flipCard(this, event)">
-                        <div class="account-avatar">${initial}</div>
-                        <div class="account-info">
-                            <div class="account-name-row">
-                                <span class="account-name">${displayName}</span>
-                                <span class="account-vip">${vipStr}</span>
-                            </div>
-                            ${phoneLine ? `<div class="account-phone">${phoneLine}</div>` : ''}
-                            ${s.token_valid ? `
-                            <div class="account-progress-wrap">
-                                <div class="progress-bar"><div class="progress-bar-fill${progressPct >= 100 ? ' complete' : ''}" style="width:${progressPct}%"></div><div class="progress-bar-glow" style="width:${progressPct}%"></div></div>
-                                <span class="account-progress-label">${progressStr}</span>
-                            </div>` : ''}
-                        </div>
-                        <div class="account-actions">${actionsHtml}</div>
-                    </div>
-                    <div class="card-back" onclick="flipCard(this, event)">
-                        <div class="card-back-content">
-                            <div class="account-avatar">${initial}</div>
-                            <div class="card-back-info" data-phone="${escapeHtml(s.phone)}">
-                                <div class="card-back-loading"></div>
-                            </div>
-                            <div class="account-actions">${actionsHtml}</div>
-                        </div>
-                    </div>
-                </div>
-            </div>`;
-        }).join('');
+    // 占位渲染优先级：phone_not_found > query_timeout（not_queried 走正常渲染，显示本地 db 基础信息 + 状态占位）
+    if (s.phone_not_found || s.query_timeout) {
+        let placeholderContent = '';
+        let cardClass = 'account-card is-placeholder';
+        if (s.phone_not_found) {
+            placeholderContent = '<div class="placeholder-text">账号不存在</div>';
+        } else if (s.query_timeout) {
+            placeholderContent = '<div class="placeholder-text">查询超时</div><div class="placeholder-text placeholder-link" onclick="refreshAll()">重试</div>';
+        } else {
+            placeholderContent = '<div class="placeholder-spinner"></div><div class="placeholder-text">加载中</div>';
+        }
+        // !s.enabled 触发的 account-disabled 保留（enabled 是 pageCache 已知字段，占位期间仍显示禁用样式）
+        if (!s.enabled) cardClass += ' account-disabled';
+        let cardStyle = '';
+        if (!hasRenderedOnce) {
+            const staggerDelay = Math.min(idx * 0.05, 0.4);
+            cardStyle = `animation-delay:${staggerDelay}s`;
+        } else {
+            cardClass += ' no-anim';
+        }
+        return `
+        <div class="${cardClass}" data-phone="${escapeHtml(s.phone)}" ${cardStyle ? `style="${cardStyle}"` : ''} onanimationend="this.style.animation='none'">
+            <div class="card-inner">
+                <div class="card-sizer"></div>
+                <div class="card-front">${placeholderContent}</div>
+                <div class="card-back"></div>
+            </div>
+        </div>`;
     }
 
-    // 重新渲染后恢复翻转状态
-    if (flippedPhones.size > 0) {
-        listEl.querySelectorAll('.account-card').forEach(card => {
-            const phone = card.dataset.phone;
-            if (flippedPhones.has(phone)) {
-                card.classList.add('flipped');
-                const backInfo = card.querySelector('.card-back-info');
-                if (backInfo) {
-                    if (mobileStatusCache[phone]) {
-                        renderMobileBack(backInfo, mobileStatusCache[phone]);
-                    } else {
-                        // 缓存已被 refresh 清空 — 重新获取手机端状态
-                        fetchMobileStatus(card);
-                    }
-                }
-            }
-        });
+    // 正常渲染
+    const vipStr = s.token_valid ? formatDuration(s.vip_duration) : '--:--:--';
+    // PC 端接口查询失败时显示"查询失败"占位（与 mobile_error 对称）
+    const progressStr = s.token_valid
+        ? (s.pc_error
+            ? '<span style="color:var(--text-muted)">查询失败</span>'
+            : (s.progress ? escapeHtml(s.progress) : '-/-'))
+        : '-/-';
+
+    let cardClass = 'account-card';
+    if (s.token_expired) cardClass += ' token-expired';
+    // not_queried 时不加 account-disabled（状态未查回不代表账号禁用，避免卡片变暗误导）
+    if (!s.enabled || (!s.token_valid && !s.not_queried)) cardClass += ' account-disabled';
+
+    let cardStyle = '';
+    if (!hasRenderedOnce) {
+        const staggerDelay = Math.min(idx * 0.05, 0.4);
+        cardStyle = `animation-delay:${staggerDelay}s`;
+    } else {
+        cardClass += ' no-anim';
     }
 
-    // 将所有 .action-menu 从卡片内部迁到 body，避免 .card-inner 的
-    // transform-style: preserve-3d 使其成为 position:fixed 后代的 containing block，
-    // 导致 menu 尺寸计入 card-inner.scrollHeight（未翻面时撑出约 63px）。
-    // 当同行卡片全部翻面时，card-inner 的 3D transform 改变 scrollHeight 计算，
-    // 这部分溢出消失（翻面后卡片计算高度比实际更矮）；矮卡片会对齐高卡片，
-    // 只有同行全部翻面时才触发，导致 body.scrollHeight 异常减少（页面高度抖动）。
-    // card-front/card-back 的 menu 均在 card-inner 内同样受影响，统一迁出。
-    listEl.querySelectorAll('.action-menu-wrap').forEach(wrap => {
+    let actionsHtml = '';
+    // not_queried 时不显示登录按钮（状态未查回，还不知道 token 是否过期，避免状态查回后按钮消失闪烁）
+    if ((!s.logged_in || s.token_expired) && !s.not_queried) {
+        actionsHtml = `<button type="button" class="btn-small" onclick="showLogin(${jsStr(s.phone)})">登录</button>`;
+    }
+    actionsHtml += `
+    <div class="action-menu-wrap" data-phone="${escapeHtml(s.phone)}">
+        <button type="button" class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this, event)">⋯</button>
+        <div class="action-menu">
+            <button type="button" class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
+            <button type="button" class="action-menu-item" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
+            <button type="button" class="action-menu-item action-menu-danger" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
+        </div>
+    </div>`;
+
+    const progressParts = s.progress ? s.progress.split('/') : [0, 0];
+    const progressPct = progressParts[1] > 0 ? (progressParts[0] / progressParts[1] * 100) : 0;
+    // 进度条区域：token_valid 或 not_queried 时渲染；not_queried 时进度条 0% + 文字 -/-
+    const progressWrapHtml = (s.token_valid || s.not_queried) ? `
+                    <div class="account-progress-wrap">
+                        <div class="progress-bar"><div class="progress-bar-fill${progressPct >= 100 ? ' complete' : ''}" style="width:${progressPct}%"></div><div class="progress-bar-glow" style="width:${progressPct}%"></div></div>
+                        <span class="account-progress-label">${progressStr}</span>
+                    </div>` : '';
+
+    return `
+    <div class="${cardClass}" data-phone="${escapeHtml(s.phone)}" ${cardStyle ? `style="${cardStyle}"` : ''} onanimationend="this.style.animation='none'">
+        <div class="card-inner">
+            <div class="card-sizer">
+                <div class="account-avatar">${initial}</div>
+                <div class="account-info">
+                    <div class="account-name-row">
+                        <span class="account-name">${displayName}</span>
+                        <span class="account-vip">${vipStr}</span>
+                    </div>
+                    ${phoneLine ? `<div class="account-phone">${phoneLine}</div>` : ''}
+                    ${progressWrapHtml}
+                </div>
+            </div>
+            <div class="card-front" onclick="flipCard(this, event)">
+                <div class="account-avatar">${initial}</div>
+                <div class="account-info">
+                    <div class="account-name-row">
+                        <span class="account-name">${displayName}</span>
+                        <span class="account-vip">${vipStr}</span>
+                    </div>
+                    ${phoneLine ? `<div class="account-phone">${phoneLine}</div>` : ''}
+                    ${progressWrapHtml}
+                </div>
+                <div class="account-actions">${actionsHtml}</div>
+            </div>
+            <div class="card-back" onclick="flipCard(this, event)">
+                <div class="card-back-content">
+                    <div class="account-avatar">${initial}</div>
+                    <div class="card-back-info" data-phone="${escapeHtml(s.phone)}">
+                        <div class="card-back-loading"></div>
+                    </div>
+                    <div class="account-actions">${actionsHtml}</div>
+                </div>
+            </div>
+        </div>
+    </div>`;
+}
+
+// 重渲染单张可见卡片（启停/编辑/懒加载返回后局部刷新，避免整列表重渲染打断滚动）
+function rerenderCardByPhone(phone) {
+    const renderEl = document.querySelector('.accounts-list .virtual-render');
+    if (!renderEl) return;
+    const card = renderEl.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
+    if (!card) return;
+    const found = findInPageCache(phone);
+    if (!found) return;
+    const acc = found.page[found.idxInPage];
+    const absoluteIdx = found.offset + found.idxInPage;
+    const status = statusCache.get(phone) || buildDefaultPlaceholder(phone);
+    const s = mergeAccountWithStatus(acc, status);
+    const html = buildCardHTML(s, absoluteIdx);
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html.trim();
+    const newCard = tmp.firstElementChild;
+    if (!newCard) return;
+    // 局部刷新（懒加载状态返回/启停/编辑）不是进场，强制禁用进场动画，
+    // 避免 hasRenderedOnce 仍为 false 时误播 stagger 动画导致卡片闪烁
+    newCard.classList.add('no-anim');
+    if (flippedPhones.has(phone)) newCard.classList.add('flipped');
+    // 替换前记录旧 wrap.id，用于清理 body 中对应的旧 menu 孤儿
+    const oldWrapIds = Array.from(card.querySelectorAll('.action-menu-wrap'))
+        .map(w => w.id).filter(Boolean);
+    card.replaceWith(newCard);
+    // 重新迁移该卡片的 action-menu 到 body（front + back 都迁，与 renderAccounts 一致；
+    // 原仅迁移首个 wrap，翻转态下 card-back 的 menu 留在 wrap 内受 preserve-3d 影响定位错乱）
+    newCard.querySelectorAll('.action-menu-wrap').forEach(wrap => {
         if (!wrap.id) wrap.id = 'amw-' + (++menuCounter);
         const menu = wrap.querySelector('.action-menu');
         if (menu) {
@@ -748,13 +1255,219 @@ function renderAccounts(statusList) {
             document.body.appendChild(menu);
         }
     });
+    // 清理旧 card 残留的 menu 孤儿（旧 wrap 已销毁，originWrapId 失效）
+    oldWrapIds.forEach(id => {
+        document.body.querySelectorAll(`:scope > .action-menu[data-origin-wrap-id="${CSS.escape(id)}"]`).forEach(m => m.remove());
+    });
+    // 翻面态：恢复 back-info 渲染
+    if (flippedPhones.has(phone)) {
+        const backInfo = newCard.querySelector('.card-back-info');
+        if (backInfo) {
+            if (mobileStatusCache[phone]) {
+                renderMobileBack(backInfo, mobileStatusCache[phone]);
+            } else {
+                fetchMobileStatus(newCard);
+            }
+        }
+    }
+}
 
-    const dur = 300;
-    animateValue(document.getElementById('totalAccounts'), prevStats.total, statusList.length, dur);
-    animateValue(document.getElementById('activeAccounts'), prevStats.active, activeCount, dur);
-    animateProgress(document.getElementById('totalProgress'), prevStats.watched, totalWatched, prevStats.items, totalItems, dur);
-    prevStats = { total: statusList.length, active: activeCount, watched: totalWatched, items: totalItems };
-    hasRenderedOnce = true;
+// 重新拉取当前可见 offset 对应分页并渲染（删除账号后步骤 7 用）
+async function refreshAccountsLight() {
+    try {
+        const capacity = viewportCapacity || 24;
+        const pageOffset = Math.floor(visibleRange.start / capacity) * capacity;
+        await fetchAccountsPage(pageOffset, capacity);
+        renderViewport();
+        // 删除账号后视口可能补位进新卡片，确保懒加载轮询在运行（空闲态 timer 已停止时需要重启）
+        startLazyLoadPolling();
+    } catch (e) {
+        console.error('refreshAccountsLight error:', e);
+        showToast('刷新账号失败：' + (e.message || '未知错误'), 'error');
+    }
+}
+
+// ===== 懒加载轮询（方案 4.2）=====
+const LAZY_LOAD_INTERVAL = 200;
+const LAZY_LOAD_BATCH_MAX = 50;
+const LAZY_LOAD_FETCH_TIMEOUT = 100000; // 100s（≥后端 90s + 10s 网络余量）
+
+// 启动懒加载轮询 timer（首次分页请求完成、首批卡片渲染到 DOM 后调用）
+function startLazyLoadPolling() {
+    if (isClaiming) return; // 领取中不启动懒加载轮询（lazyLoadTick 内亦有兜底）
+    if (lazyLoadTimer) return;
+    lazyLoadTimer = setInterval(lazyLoadTick, LAZY_LOAD_INTERVAL);
+}
+
+// 停止懒加载轮询 timer（beforeunload 时调用）
+function stopLazyLoadPolling() {
+    if (lazyLoadTimer) {
+        clearInterval(lazyLoadTimer);
+        lazyLoadTimer = null;
+    }
+}
+
+// 立即触发一次 tick（refreshAll 后用，不等下一个 1s tick）
+function scheduleLazyLoadTick(immediate) {
+    if (immediate) lazyLoadTick();
+}
+
+// 单次轮询：收集纯视口范围内（viewportRange，不含缓冲）未标记"已查询"且未飞行中的 phone，拆分多批串行查询
+// 不扫描 DOM，改为按索引遍历 pageCache，确保只查视口可见卡片（缓冲区卡片预取数据但不触发外网状态查询）
+function lazyLoadTick() {
+    if (isClaiming) return; // 领取中暂停
+    if (totalCount === 0) return;
+    if (isBatchInFlight) return; // 上一批仍在飞行，跳过避免跨 tick 并发
+    const capacity = viewportCapacity;
+    if (capacity <= 0) return;
+    const pendingPhones = [];
+    for (let i = viewportRange.start; i < viewportRange.end; i++) {
+        const pageOffset = Math.floor(i / capacity) * capacity;
+        const page = pageCache.get(pageOffset);
+        if (!page) continue; // 视口内分页未加载，等下次 tick（fetchAccountsPage 完成后会重新 renderViewport）
+        const acc = page[i - pageOffset];
+        if (!acc) continue;
+        const phone = acc.phone;
+        if (!phone || phone.startsWith('__pending_')) continue;
+        if (queriedPhones.has(phone)) continue;
+        if (inFlightPhones.has(phone)) continue;
+        pendingPhones.push(phone);
+    }
+    if (pendingPhones.length === 0) {
+        // 空闲态：视口内所有卡片均已查询，停止 timer 避免无谓轮询；由 scroll/resize/refreshAll 重启
+        stopLazyLoadPolling();
+        return;
+    }
+    isBatchInFlight = true;
+    queryPhonesBatched(pendingPhones).finally(() => { isBatchInFlight = false; });
+}
+
+// 批量查询调度：拆分多批（每批最多 50），串行发送，避免多批并行导致后端并发翻倍
+async function queryPhonesBatched(phones) {
+    const batches = [];
+    for (let i = 0; i < phones.length; i += LAZY_LOAD_BATCH_MAX) {
+        batches.push(phones.slice(i, i + LAZY_LOAD_BATCH_MAX));
+    }
+    for (const batch of batches) {
+        // 乐观标记已查询 + 飞行中（请求发送时标记，失败/超时也标记，不自动重试）
+        batch.forEach(p => {
+            queriedPhones.add(p);
+            inFlightPhones.add(p);
+        });
+        const gen = refreshGeneration;
+        try {
+            batchAbortController = new AbortController();
+            const timeoutId = setTimeout(() => batchAbortController.abort(), LAZY_LOAD_FETCH_TIMEOUT);
+            const resp = await fetch('/api/accounts/status', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ phones: batch }),
+                signal: batchAbortController.signal,
+            });
+            clearTimeout(timeoutId);
+            if (!resp.ok) {
+                // HTTP 错误：整批走查询超时占位
+                batch.forEach(p => {
+                    statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
+                    inFlightPhones.delete(p);
+                    rerenderCardByPhone(p);
+                });
+                continue;
+            }
+            const data = await resp.json();
+            // 全量刷新代际不匹配则丢弃响应（避免过期数据覆盖刷新后的新状态）
+            if (gen !== refreshGeneration) {
+                batch.forEach(p => inFlightPhones.delete(p));
+                continue;
+            }
+            const statuses = data.statuses || [];
+            const statusMap = new Map();
+            statuses.forEach(s => statusMap.set(s.phone, s));
+            batch.forEach(p => {
+                const s = statusMap.get(p);
+                if (s) {
+                    statusCache.set(p, s);
+                } else {
+                    // 后端未返回该 phone（异常）：走查询超时占位
+                    statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
+                }
+                inFlightPhones.delete(p);
+                rerenderCardByPhone(p);
+            });
+            reaggregateStats();
+        } catch (e) {
+            if (e.name === 'AbortError' && gen !== refreshGeneration) {
+                // refreshAll 主动中止（gen 已变）：静默退出，不标记 query_timeout
+                // refreshAll 已清 queriedPhones/inFlightPhones，剩余批次也无需处理（直接 return）
+                return;
+            }
+            // 其他异常（含真实 100s 超时 abort）：整批走查询超时占位
+            batch.forEach(p => {
+                inFlightPhones.delete(p);
+                statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
+                rerenderCardByPhone(p);
+            });
+        }
+    }
+}
+
+// 页面加载初始化：拉取首页分页、渲染视口、启动懒加载轮询
+async function initAccountsView() {
+    initVirtualScrollOnce();
+    try {
+        const listEl = document.getElementById('accountsList');
+        const viewportH = listEl ? listEl.clientHeight : 600;
+        // 按行计算容量（多列布局：capacity = visibleRows * columns）
+        const columns = getColumns();
+        const rowHeight = getRowHeight();
+        const visibleRows = Math.max(1, Math.floor(viewportH / rowHeight));
+        const capacity = visibleRows * columns;
+        viewportCapacity = capacity;
+        await fetchAccountsPage(0, capacity);
+        renderViewport();
+        startLazyLoadPolling();
+    } catch (e) {
+        console.error('initAccountsView error:', e);
+        showToast('加载账号列表失败：' + (e.message || '未知错误'), 'error');
+    }
+}
+
+// 添加账号成功后：递增 totalCount 撑高虚拟滚动总高度；末尾在当前视口内主动请求末页分页
+// 否则等用户滚动到末尾触发新页分页请求时新账号自然进入 pageCache，再由懒加载补状态
+function onAccountAdded() {
+    totalCount++;
+    const capacity = viewportCapacity || 24;
+    // 新账号在末尾，所在页 offset = (totalCount-1) 减去对 capacity 取模
+    const lastIdx = totalCount - 1;
+    const lastPageOffset = Math.floor(lastIdx / capacity) * capacity;
+    // 末尾在当前视口内：检查旧 totalCount（totalCount 已递增，故用 totalCount - 1 等价旧值）
+    // visibleRange.end 由 computeVisibleRange 钳位到旧 totalCount，递增后需用 totalCount - 1 比较
+    if (visibleRange.end >= totalCount - 1) {
+        fetchAccountsPage(lastPageOffset, capacity).then(() => {
+            renderViewport();
+            // 懒加载下一 tick 自动补状态
+            // 确保 timer 运行（新卡片已渲染到 DOM 需查询状态；timer 可能因空闲态被停止）
+            startLazyLoadPolling();
+        }).catch(e => console.error('onAccountAdded fetchAccountsPage error:', e));
+    } else {
+        // 末尾不在视口内：清空末页缓存确保下次滚动到末尾时重新拉取（避免拿到旧空页缓存）
+        pageCache.delete(lastPageOffset);
+        pageCacheVersion++;
+        // 仅撑高总高度（renderViewport 会基于 scrollTop 重算 visibleRange，若用户没滚动 visibleRange 不变）
+        const listEl = document.getElementById('accountsList');
+        if (listEl) {
+            const spacer = listEl.querySelector('.virtual-spacer');
+            if (spacer) {
+                // 按总行数撑高（多列并排）
+                const columns = getColumns();
+                const rowHeight = getRowHeight();
+                const totalRows = Math.ceil(totalCount / columns);
+                spacer.style.height = Math.max(0, totalRows * rowHeight - CARD_GAP) + 'px';
+            }
+        }
+        // 更新总数统计
+        updateStats(totalCount, prevStats.active, prevStats.watched, prevStats.items);
+    }
 }
 
 function showAddAccount() {
@@ -893,7 +1606,7 @@ async function doAddAccountStep2(phone) {
         });
         showToast('登录成功，账号已添加', 'success');
         closeModalForce();
-        refreshStatus();
+        onAccountAdded();
     } catch (e) { showToast(e.message || '登录失败', 'error'); }
 }
 
@@ -922,7 +1635,7 @@ async function doAddAccountStep2Pwd(phone) {
         });
         showToast('登录成功，账号已添加', 'success');
         closeModalForce();
-        refreshStatus();
+        onAccountAdded();
     } catch (e) { showToast(e.message || '登录失败', 'error'); }
 }
 
@@ -948,7 +1661,10 @@ async function toggleAccount(phone, enabled) {
             method: 'PUT',
             body: { enabled },
         });
-        refreshAccountsLight();
+        // 局部更新 pageCache 中该 phone 的 enabled 字段，不重新请求分页（方案 4.4）
+        updatePageCacheEntry(phone, { enabled });
+        rerenderCardByPhone(phone);
+        reaggregateStats();
     } catch (e) { showToast(e.message || '切换失败', 'error'); }
 }
 
@@ -1001,14 +1717,15 @@ async function fetchMobileStatus(card) {
     try {
         const data = await api(`/api/accounts/${encodeURIComponent(phone)}/mobile_status`);
         if (card._fetchReqId !== reqId) return;
+        // 卡片被虚拟滚动回收时丢弃 renderMobileBack 调用，但仍写 mobileStatusCache 供下次翻面复用
         if (data.status) {
             data.status.mobile_expire_ts = Math.floor(Date.now() / 1000) + (data.status.mobile_duration || 0);
             mobileStatusCache[phone] = data.status;
-            renderMobileBack(backInfo, data.status);
+            if (card.isConnected) renderMobileBack(backInfo, data.status);
         }
     } catch (e) {
         if (card._fetchReqId !== reqId) return;
-        backInfo.innerHTML = `<div class="card-back-row"><span class="card-back-label">加载失败</span></div>`;
+        if (card.isConnected) backInfo.innerHTML = `<div class="card-back-row"><span class="card-back-label">加载失败</span></div>`;
     }
 }
 
@@ -1243,7 +1960,10 @@ async function doEditAccount(originalPhone) {
         });
         showToast('账号已更新', 'success');
         closeModalForce();
-        refreshAccountsLight();
+        // 局部更新 pageCache 中该 phone 所在页的对应字段，不重新请求分页（方案 4.4）
+        updatePageCacheEntry(originalPhone, { name, remark, enabled, claim_target: claimTarget });
+        rerenderCardByPhone(originalPhone);
+        reaggregateStats();
     } catch (e) { showToast(e.message || '更新失败', 'error'); }
 }
 
@@ -1261,6 +1981,9 @@ async function deleteAccount(phone) {
 }
 
 async function doDeleteAccount(phone) {
+    // 步骤 1：删除触发时从 pageCache 计算 deletedIndex（避免 setTimeout 期间 visibleRange 变化）
+    const found = findInPageCache(phone);
+    const deletedIndex = found ? found.offset + found.idxInPage : null;
     try {
         await api(`/api/accounts/${encodeURIComponent(phone)}`, { method: 'DELETE' });
 
@@ -1306,10 +2029,39 @@ async function doDeleteAccount(phone) {
 
         showToast('账号已删除', 'success');
         closeModalForce();
+        // 步骤 2：清除被删账号相关缓存（含 statusCache、queriedPhones 等所有相关项）
         stopMobileCountdown(phone);
         flippedPhones.delete(phone);
         delete mobileStatusCache[phone];
-        setTimeout(() => refreshAccountsLight(), 850);  // 等 cardRemove(350)+FLIP(350)+card.remove()(400) 完成，避免打断补位动画
+        statusCache.delete(phone);
+        queriedPhones.delete(phone);
+        inFlightPhones.delete(phone);
+
+        // 等 cardRemove(350)+FLIP(350)+card.remove()(400) 完成，避免打断补位动画
+        setTimeout(() => {
+            // 步骤 3：totalCount--
+            totalCount = Math.max(0, totalCount - 1);
+            // 步骤 6a：删除唯一账号的特殊处理
+            if (totalCount === 0) {
+                visibleRange = { start: 0, end: 0 };
+                pageCache.clear();
+                pageCacheVersion++;
+                renderViewport();
+                return;
+            }
+            // 步骤 4：清空整个 pageCache（位置已偏移，旧缓存失效）
+            pageCache.clear();
+            pageCacheVersion++;
+            // 步骤 5/6：补偿偏移（依据 deletedIndex 与当前 visibleRange 关系）
+            const listEl = document.getElementById('accountsList');
+            if (listEl && deletedIndex !== null && deletedIndex < visibleRange.start) {
+                // 删除在视口前面：scrollTop 上移一格，visibleRange 各减 1
+                listEl.scrollTop = Math.max(0, listEl.scrollTop - cardBaseHeight);
+                visibleRange = { start: visibleRange.start - 1, end: visibleRange.end - 1 };
+            }
+            // 步骤 7：重新请求当前 offset 对应分页并渲染
+            refreshAccountsLight();
+        }, 850);
     } catch (e) { showToast(e.message || '删除失败', 'error'); }
 }
 
@@ -1366,7 +2118,12 @@ async function doVerify(phone) {
         });
         showToast('登录成功', 'success');
         closeModalForce();
-        refreshStatus();
+        // token 已更新 → 清除该 phone 的 queriedPhones 标记触发懒加载重查
+        queriedPhones.delete(phone);
+        // 立即用 statusCache 兜底重渲染（无缓存则显示 not_queried 占位，等懒加载补状态）
+        rerenderCardByPhone(phone);
+        // 确保 timer 运行（queriedPhones.delete 后该 phone 需重新查询；timer 可能因空闲态被停止）
+        startLazyLoadPolling();
     } catch (e) { showToast(e.message || '登录失败', 'error'); }
 }
 
@@ -1388,7 +2145,12 @@ async function doVerifyPwd(phone) {
         });
         showToast('登录成功', 'success');
         closeModalForce();
-        refreshStatus();
+        // token 已更新 → 清除该 phone 的 queriedPhones 标记触发懒加载重查
+        queriedPhones.delete(phone);
+        // 立即用 statusCache 兜底重渲染（无缓存则显示 not_queried 占位，等懒加载补状态）
+        rerenderCardByPhone(phone);
+        // 确保 timer 运行（queriedPhones.delete 后该 phone 需重新查询；timer 可能因空闲态被停止）
+        startLazyLoadPolling();
     } catch (e) { showToast(e.message || '登录失败', 'error'); }
 }
 
@@ -1397,6 +2159,8 @@ async function startClaim() {
     const btn = document.getElementById('btnClaim');
     btn.disabled = true;
     btn.textContent = '领取中...';
+    isClaiming = true;
+    document.getElementById('btnRefresh').disabled = true;
 
     try {
         await api('/api/claim', { method: 'POST' });
@@ -1416,6 +2180,8 @@ async function startClaim() {
         btn.disabled = false;
         btn.textContent = '开始领取';
         btn.onclick = startClaim;
+        isClaiming = false;
+        document.getElementById('btnRefresh').disabled = false;
         showToast(e.message || '启动领取失败', 'error');
     }
 }
@@ -1510,10 +2276,8 @@ function pollClaimProgress() {
                             vipEl.firstChild.textContent = formatDuration(item.vip_after);
                         }
                     }
-                    const cachedEntry = cachedStatusList.find(s => s.phone === item.phone);
-                    if (cachedEntry) {
-                        cachedEntry.vip_duration = item.vip_after;
-                    }
+                    // 领取期间进度更新只直接操作 DOM，不写 statusCache
+                    // 领取结束后走全量刷新流程（refreshAll），queriedPhones.clear() 触发懒加载重新查询覆盖旧数据
                 }
             });
 
@@ -1526,8 +2290,10 @@ function pollClaimProgress() {
                 btn.disabled = false;
                 btn.textContent = '开始领取';
                 btn.onclick = startClaim;
+                isClaiming = false;
+                document.getElementById('btnRefresh').disabled = false;
 
-                refreshStatus(false);
+                refreshAll();
             } else {
                 claimPollTimer = setTimeout(_poll, 1000);
             }
@@ -1544,6 +2310,8 @@ function pollClaimProgress() {
                 btn.disabled = false;
                 btn.textContent = '开始领取';
                 btn.onclick = startClaim;
+                isClaiming = false;
+                document.getElementById('btnRefresh').disabled = false;
                 showToast('领取状态查询连续失败，已停止轮询，请刷新页面', 'error');
             } else {
                 claimPollTimer = setTimeout(_poll, 1000);
@@ -1586,6 +2354,9 @@ async function detectCliTrigger() {
             btn.disabled = false;
             btn.textContent = '查看日志';
             btn.onclick = showLogModal;
+            // 与 startClaim 行为对齐：暂停懒加载轮询、禁用刷新按钮（pollClaimProgress 停止时恢复）
+            isClaiming = true;
+            document.getElementById('btnRefresh').disabled = true;
             pollClaimProgress();
         }
     } catch (e) {
@@ -1787,7 +2558,7 @@ function showConfirmDialog(title, message, confirmText, cancelText) {
 document.addEventListener('DOMContentLoaded', () => {
     initDrag();
     initRipple();
-    refreshStatus();
+    initAccountsView();
     startCliTriggerDetect();
     setTimeout(() => {
         const splash = document.getElementById('splash');

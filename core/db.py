@@ -128,6 +128,21 @@ class DbAccountRepository:
             cur = self._conn.execute("SELECT * FROM accounts ORDER BY id DESC")
             return [_row_to_dict(r) for r in cur.fetchall()]
 
+    def list_page(self, offset: int, limit: int) -> tuple[list[dict], int]:
+        """分页查询账号列表，返回 (accounts, total)。
+
+        按 id ASC 排序（与 list_all 的 DESC 相反，新账号排在末尾）。
+        SELECT + COUNT(*) 在 _db_lock 期间执行，保证两 SQL 间无其他 Repository 操作插入。
+        """
+        with _db_lock:
+            cur = self._conn.execute(
+                "SELECT * FROM accounts ORDER BY id ASC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+            rows = [_row_to_dict(r) for r in cur.fetchall()]
+            total = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+            return rows, total
+
     def list_enabled(self) -> list[dict]:
         """列出启用账号（领取用），按 id DESC 排序。"""
         with _db_lock:

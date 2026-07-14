@@ -22,6 +22,10 @@
     --radius-lg: 12px;
     --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
     --titlebar-h: 38px;
+    /* 虚拟滚动单卡基准高度：等于"正常账号卡片"的自然高度（token_valid=true + 有 name + 有 phone + 含进度条）。
+       其他状态（未登录无进度条/token_expired 等）由 .account-card 的 min-height 撑高到此基准。
+       理论估算：padding 32 + max(avatar 40, name-row 24 + phone 20 + progress 22.5 = 66.5) = 98.5px，取 98px */
+    --card-base-height: 98px;
 }
 
 body {
@@ -72,15 +76,18 @@ body {
     background: var(--bg-deep);
     color: var(--text-primary);
     line-height: 1.5;
-    overflow-x: hidden;
-    min-height: 100vh;
+    overflow: hidden;
+    height: 100vh;
 }
 
 #app {
     width: 100%;
     max-width: 1400px;
     margin: 0 auto;
-    padding: 0 32px;
+    padding: 0 32px 20px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
 }
 
 .title-bar {
@@ -95,6 +102,7 @@ body {
     position: sticky;
     top: 0;
     z-index: 1000;
+    flex-shrink: 0;
 }
 
 .title-bar::after {
@@ -218,6 +226,13 @@ body {
     border-radius: 10px;
     box-shadow: 0 2px 12px rgba(201, 168, 76, 0.2);
     object-fit: contain;
+}
+
+.main-content {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
 }
 
 .stats-bar {
@@ -369,13 +384,41 @@ body {
 }
 
 .accounts-section {
-    margin-bottom: 24px;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
 }
 
 .accounts-list {
+    position: relative;
+    overflow-y: auto;
+    overflow-x: hidden;
+    flex: 1;
+    min-height: 240px;
+    overscroll-behavior: contain;
+}
+
+/* 虚拟滚动撑高层（占位，仅用于撑出 scrollHeight） */
+.virtual-spacer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    pointer-events: none;
+}
+
+/* 虚拟滚动渲染层（grid 排列实际卡片，用 translateY 定位避免重排） */
+.virtual-render {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+    grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
     gap: 8px;
+    padding: 0 20px;
+    will-change: transform;
 }
 
 .account-card {
@@ -384,6 +427,7 @@ body {
     transition: var(--transition);
     position: relative;
     animation: cardIn 0.3s ease-out both;
+    min-height: var(--card-base-height);
 }
 
 .account-card.no-anim {
@@ -845,6 +889,76 @@ body {
     padding: 40px;
     color: var(--text-muted);
     font-size: 13px;
+}
+
+/* 虚拟滚动下空状态：覆盖 grid-column 规则，作为唯一子节点居中 */
+.accounts-list .empty-state {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    grid-column: auto;
+}
+
+/* 占位卡片容器：撑高到基准高度，内容居中 */
+.account-card.is-placeholder .card-inner,
+.account-card.is-placeholder .card-front,
+.account-card.is-placeholder .card-back {
+    min-height: var(--card-base-height);
+}
+
+.account-card.is-placeholder .card-front {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 6px;
+}
+
+/* 占位文字：加载中 / 查询超时 / 账号不存在 / PC 端查询失败 */
+.placeholder-text {
+    font-size: 13px;
+    color: var(--text-muted);
+    text-align: center;
+    line-height: 1.5;
+}
+
+.placeholder-text.placeholder-link {
+    color: var(--gold);
+    cursor: pointer;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.placeholder-text.placeholder-link:hover {
+    color: var(--gold-light);
+}
+
+/* 分页加载失败占位：可点击触发 refreshAll，鼠标悬停高亮 */
+.account-card.is-placeholder[data-load-error="1"] {
+    cursor: pointer;
+}
+
+.account-card.is-placeholder[data-load-error="1"]:hover {
+    background: rgba(207, 92, 92, 0.06);
+}
+
+.account-card.is-placeholder[data-load-error="1"] .placeholder-text {
+    color: var(--error);
+}
+
+/* 加载中脉冲动画（与 card-back-loading 风格协调） */
+.placeholder-spinner {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    border: 2px solid var(--border);
+    border-top-color: var(--gold);
+    animation: placeholderSpin 0.8s linear infinite;
+}
+
+@keyframes placeholderSpin {
+    to { transform: rotate(360deg); }
 }
 
 .modal.log-modal {

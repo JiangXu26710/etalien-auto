@@ -183,19 +183,28 @@ def _clamp_watch_cnt(user_watch_cnt: int, video_cnt: int) -> int:
     return min(user_watch_cnt, video_cnt) if video_cnt > 0 else user_watch_cnt
 
 
-def get_account_status(account: dict) -> dict:
-    """查询单个账号的完整状态（PC + 手机端时长、任务进度、登录态）。
+def get_account_status(account: dict, enable_relogin: bool = False) -> dict:
+    """查询单个账号的 PC 端状态（时长、任务进度、登录态）。
 
-    内部使用 ThreadPoolExecutor(max_workers=4) 并发查询 4 个接口：
-    fetch_pc_duration、fetch_pc_ad_config、fetch_mobile_ad_activity、fetch_mobile_profile。
+    仅查询 PC 端接口（fetch_pc_duration + fetch_pc_ad_config），手机端数据由
+    get_account_mobile_status 按需查询（翻面时前端调
+    /api/accounts/<phone>/mobile_status 触发），避免全量刷新拉取冗余数据。
+    内部使用 ThreadPoolExecutor(max_workers=2) 并发查询 2 个接口。
     token 过期时捕获 NeedLoginError 标记 token_expired，不抛异常。
+
+    Args:
+        account: 账号字典，需包含 phone、auth_token、device_id。
+        enable_relogin: 是否注入 token 过期自动重登能力（含密码与持久化回调）。
+            领取流程传 True；状态查询传 False（默认），token 过期时由公共流程抛
+            NeedLoginError，状态查询函数捕获后标记 token_expired。
+            批量懒加载查询传 True（密码重登兜底，副作用已知见方案文档 3.2）。
 
     Returns:
         dict 包含以下字段:
         - phone, name, remark, enabled, logged_in, token_valid
         - vip_duration, free_duration, progress（PC 端）
-        - mobile_duration, mobile_progress, mobile_rewarded_count, mobile_claimed_count
-        - mobile_not_get_ad_duration, mobile_error, claim_target
+        - mobile_*（保留默认值 0/0/0/false，由 get_account_mobile_status 按需填充）
+        - claim_target
         - token_expired（仅 token 失效时出现）
     """
     phone = account["phone"]
@@ -209,7 +218,7 @@ def get_account_status(account: dict) -> dict:
         "vip_duration": 0,
         "free_duration": 0,
         "progress": "0/0",
-        # 手机端字段（合并查询，供总进度累加用）
+        # 手机端字段保留默认值，由 get_account_mobile_status 按需查询填充
         "mobile_duration": 0,
         "mobile_progress": "0/0",
         "mobile_rewarded_count": 0,
@@ -220,27 +229,25 @@ def get_account_status(account: dict) -> dict:
         # 暴露给前端，使 idle 总进度口径与领取中对齐（只统计 claim_target 配置的阶段）
         "claim_target": account.get("claim_target", "all"),
     }
-    client = get_client_for_account(account)
+    client = get_client_for_account(account, enable_relogin=enable_relogin)
     if client:
         info["logged_in"] = True
         try:
-            # 4 个接口并发：PC duration + PC ad_config + mobile activity + mobile profile
+            # 2 个接口并发：PC duration + PC ad_config
             # token 过期时，第一个 result() 即抛 NeedLoginError，跳到 except
             # 其余 futures 会快速失败：_handle_auth_error_and_retry 立即抛 NeedLoginError（无重试），
             # 无需共享取消标志；ThreadPoolExecutor.__exit__ 的 shutdown(wait=True) 等待全部完成
-            with ThreadPoolExecutor(max_workers=4) as ex:
+            # 手机端接口（mobile activity / profile）由 get_account_mobile_status 按需查询，
+            # 翻面时前端调 /api/accounts/<phone>/mobile_status 触发，避免全量刷新拉取冗余数据
+            with ThreadPoolExecutor(max_workers=2) as ex:
                 dur_future = ex.submit(client.fetch_pc_duration)
                 tasks_future = ex.submit(client.fetch_pc_ad_config)
-                mob_act_future = ex.submit(client.fetch_mobile_ad_activity)
-                mob_prof_future = ex.submit(client.fetch_mobile_profile)
                 # token 过期时 result() 抛 NeedLoginError，其余 futures 仍在飞行中；
                 # 在 except 块显式 cancel（仅能取消未开始的提交，已发出的 HTTP 请求
                 # 无法中断——requests 库限制，属可接受权衡，避免新增请求被调度）
-                futures = [dur_future, tasks_future, mob_act_future, mob_prof_future]
+                futures = [dur_future, tasks_future]
                 dur = dur_future.result()
                 tasks_result = tasks_future.result()
-                mob_activity = mob_act_future.result()
-                mob_profile = mob_prof_future.result()
         except NeedLoginError:
             for f in futures:
                 f.cancel()
@@ -266,23 +273,6 @@ def get_account_status(account: dict) -> dict:
             info["tasks"] = tasks
         else:
             info["pc_error"] = True
-        # 手机端进度（与 PC 端共用同一 token，token 有效时直接查手机端接口）
-        if not mob_activity.get("_error"):
-            video_cnt = mob_activity.get("video_cnt", 0)
-            user_watch_cnt = mob_activity.get("user_watch_cnt", 0)
-            info["mobile_rewarded_count"] = mob_activity.get("rewarded_count", 0)
-            info["mobile_claimed_count"] = mob_activity.get("claimed_count", 0)
-            # 进度按总任务数统计（含无奖励任务），因领取需按顺序进行
-            shown_cnt = _clamp_watch_cnt(user_watch_cnt, video_cnt)
-            info["mobile_progress"] = f"{shown_cnt}/{video_cnt}"
-            info["mobile_tasks"] = mob_activity.get("video_bar", [])
-        else:
-            info["mobile_error"] = True
-        if not mob_profile.get("_error"):
-            info["mobile_duration"] = mob_profile.get("remaining_seconds", 0)
-            info["mobile_not_get_ad_duration"] = mob_profile.get("mobile_not_get_ad_duration", 0)
-        else:
-            info["mobile_error"] = True
         client.close()
     return info
 
@@ -353,24 +343,113 @@ def get_account_mobile_status(account: dict) -> dict:
     return info
 
 
-def get_all_status(max_workers: int = 10) -> list[dict]:
-    """并发查询所有账号状态，并按 id 降序返回（新加用户靠前）。
+def batch_get_account_status(phones: list[str], max_workers: int = 10, total_timeout: float = 90.0) -> list[dict]:
+    """批量查询多个账号状态（供懒加载接口使用，启用密码重登兜底）。
 
-    list_all() 已按 id DESC 返回，但 as_completed 会打乱顺序，故这里按
-    phone→id 映射重新排序，保持与 db 主键顺序一致。
+    phones 之间用 ThreadPoolExecutor 并发（max_workers），单账号内部仍走
+    get_account_status 的 4 接口并发（enable_relogin=True 启用密码重登兜底）。
+
+    Args:
+        phones: 待查手机号列表。**调用方需在 clamp 后传入**（本函数不做 clamp）。
+        max_workers: phones 之间的并发度，与 run_concurrent_claim 口径一致
+                     （settings.max_concurrent）。
+        total_timeout: 总超时秒数。超时未完成的 future 取消等待并填占位
+                       （query_timeout=true）；已启动的 future 无法中断，结果被丢弃。
+
+    Returns:
+        list[dict]：与 phones 顺序无关，每个 status 项含 phone 字段用于前端匹配。
+        真实 status 项会补全 mobile_tasks/token_expired 等条件性字段的默认值，
+        与占位项字段集对齐；占位项含 phone_not_found 或 query_timeout 标记。
     """
-    accounts = repo.list_all()
-    phone_to_id = {a["phone"]: a.get("id", 0) for a in accounts}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(get_account_status, a): a for a in accounts}
-        results = []
-        for future in as_completed(futures):
-            try:
-                results.append(future.result())
-            except Exception:
-                logger.exception("get_account_status failed for %s", futures[future]["phone"])
-        results.sort(key=lambda r: phone_to_id.get(r.get("phone", ""), 0), reverse=True)
+    # 占位项默认字段集（与 phone_not_found 占位一致）
+    def _placeholder(phone: str, marker: str | None = None) -> dict:
+        item = {
+            "phone": phone,
+            "logged_in": False,
+            "token_valid": False,
+            "token_expired": False,
+            "vip_duration": 0,
+            "free_duration": 0,
+            "progress": "0/0",
+            "mobile_duration": 0,
+            "mobile_progress": "0/0",
+            "mobile_rewarded_count": 0,
+            "mobile_claimed_count": 0,
+            "mobile_not_get_ad_duration": 0,
+            "mobile_error": False,
+            "mobile_tasks": [],
+            "pc_error": False,
+        }
+        if marker:
+            item[marker] = True
+        return item
+
+    # 真实 status 项字段补全（与占位项字段集对齐）
+    _default_for_real = {
+        "token_expired": False,
+        "mobile_tasks": [],
+    }
+
+    results: list[dict] = []
+    if not phones:
         return results
+
+    phone_to_account: dict[str, dict | None] = {p: repo.get(p) for p in phones}
+    pending_phones = [p for p, a in phone_to_account.items() if a is not None]
+    not_found_phones = [p for p, a in phone_to_account.items() if a is None]
+
+    # 占位项：phone 不存在
+    for p in not_found_phones:
+        results.append(_placeholder(p, marker="phone_not_found"))
+
+    if not pending_phones:
+        return results
+
+    deadline = time.monotonic() + total_timeout
+    # 不用 with 语句：退出时 shutdown(wait=True) 会阻塞等待已启动的 future 完成，
+    # 违反"超时未完成的 future 放弃等待"的设计（方案 3.2）。手动管理 executor，
+    # 超时后用 shutdown(wait=False, cancel_futures=True) 立即返回（已启动的 future
+    # 在后台继续执行至完成，结果被丢弃；未启动的 future 被取消）。
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {executor.submit(get_account_status, phone_to_account[p], True): p for p in pending_phones}
+    try:
+        # as_completed 传 timeout 防止无限阻塞：剩余 future 全部慢时，无 timeout 的
+        # as_completed 会一直阻塞到所有 future 完成，导致 90s 总超时失效。
+        # timeout 到期后 __next__() 抛 TimeoutError，由外层 except 捕获处理剩余 future。
+        remaining = max(0.1, deadline - time.monotonic())
+        try:
+            for future in as_completed(futures, timeout=remaining):
+                phone = futures[future]
+                # 防御性兜底：as_completed yield 的 future 可能已完成但 deadline 已过
+                if time.monotonic() >= deadline:
+                    future.cancel()
+                    results.append(_placeholder(phone, marker="query_timeout"))
+                    continue
+                try:
+                    info = future.result()  # future 已完成，不会阻塞
+                    # 补全条件性字段默认值，与占位项字段集对齐
+                    for k, v in _default_for_real.items():
+                        info.setdefault(k, v)
+                    # 过滤掉基础字段（name/remark/enabled/claim_target）和 tasks
+                    # phone 作为标识符保留
+                    status_item = {k: v for k, v in info.items()
+                                   if k not in ("name", "remark", "enabled", "claim_target", "tasks")}
+                    results.append(status_item)
+                except Exception:
+                    logger.exception("batch_get_account_status failed for %s", phone)
+                    # 单账号内部异常 → 占位（不含 query_timeout / phone_not_found 标记，
+                    # 前端按 token_valid=false 走 account-disabled 样式，由设计文档 4.2 失败处理定义）
+                    results.append(_placeholder(phone))
+        except TimeoutError:
+            # as_completed 总超时：剩余未完成的 future 填 query_timeout 占位
+            for future, phone in futures.items():
+                if not future.done():
+                    future.cancel()
+                    results.append(_placeholder(phone, marker="query_timeout"))
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    return results
 
 
 def _get_cli_exe_path() -> str:
@@ -1003,7 +1082,7 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
     """并发执行多个账号的领取任务。
 
     使用 ThreadPoolExecutor 按 max_concurrent 并发度提交，通过 claim_mgr 追踪进度。
-    返回按 id 降序排序的结果列表（新加用户靠前），便于 CLI 输出与通知顺序稳定。
+    返回按 id 升序排序的结果列表（新加用户靠后），便于 CLI 输出与通知顺序稳定。
 
     Args:
         accounts: 待领取的账号列表。
@@ -1011,7 +1090,7 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
         claim_mgr: 可选进度管理器，用于前端实时查询领取进度。
 
     Returns:
-        按 id 降序排序的领取结果列表。
+        按 id 升序排序的领取结果列表。
     """
     max_concurrent = settings.get("max_concurrent", 10)
     results = []
@@ -1066,7 +1145,7 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
                 if claim_mgr is not None:
                     claim_mgr.update_progress_entry(account["phone"], {"status": "error", "error": str(e)})
 
-    # 按 id 降序排序，保证 CLI 输出与通知顺序稳定（与 get_all_status 一致）
+    # 按 id 升序排序，保证 CLI 输出与通知顺序稳定
     phone_to_id = {a["phone"]: a.get("id", 0) for a in accounts}
-    results.sort(key=lambda r: phone_to_id.get(r.get("phone", ""), 0), reverse=True)
+    results.sort(key=lambda r: phone_to_id.get(r.get("phone", ""), 0), reverse=False)
     return results

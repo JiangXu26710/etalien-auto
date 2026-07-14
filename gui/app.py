@@ -568,8 +568,8 @@ def main():
     server_thread.start()
     logger.info("服务器已启动在 http://127.0.0.1:%d", port)
 
-    # 窗口默认尺寸 960×720，居中显示
-    win_w, win_h = 960, 720
+    # 窗口默认尺寸 960×740，居中显示
+    win_w, win_h = 960, 740
     screen_w = ctypes.windll.user32.GetSystemMetrics(0)
     screen_h = ctypes.windll.user32.GetSystemMetrics(1)
     x = (screen_w - win_w) // 2
