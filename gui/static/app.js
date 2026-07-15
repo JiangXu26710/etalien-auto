@@ -9,6 +9,8 @@ let refreshPromise = null;
 let modalMouseDownTarget = null;
 let vipFloatShown = new Set();
 let prevStats = { total: 0, active: 0, watched: 0, items: 0 };
+// 顶部"已启用"卡片数字来自后端 /api/accounts/stats（前端分页缓存无法统计全部账号）
+let statsFromBackend = { enabled: 0 };
 let hasRenderedOnce = false;
 let logMouseDownTarget = null;
 let menuCounter = 0;
@@ -578,6 +580,8 @@ function refreshAll() {
         refreshGeneration++;
         // 6/7. 不主动拉取任何状态数据，由懒加载机制重新加载可见账号状态
         // 8. 分页列表数据仍由 /api/accounts 分页接口提供，不受影响
+        // 9. 重新拉取后端账号统计（已启用数）
+        fetchStats();
         // 重渲染当前视口（用 statusCache 兜底，未命中走 not_queried 占位）
         renderViewport();
         // 触发一次懒加载 tick，立即收集待查 phone（不等下一个 1s tick）
@@ -629,6 +633,19 @@ async function fetchAccountsPage(offset, limit) {
     pageCacheVersion++;
     if (typeof data.total === 'number') totalCount = data.total;
     return accounts;
+}
+
+// 拉取后端账号统计（总数 + 启用数），刷新顶部"已启用"卡片。
+// total/totalProgress 用 prevStats 占位，仅更新 enabled，避免与 renderViewport 的聚合值打架。
+async function fetchStats() {
+    try {
+        const data = await api('/api/accounts/stats');
+        if (typeof data.total === 'number') totalCount = data.total;
+        if (typeof data.enabled === 'number') {
+            statsFromBackend.enabled = data.enabled;
+            updateStats(totalCount, data.enabled, prevStats.watched, prevStats.items);
+        }
+    } catch (e) { /* 统计失败静默，不影响主流程 */ }
 }
 
 // 在 pageCache 中查找 phone 所在页 + 页内索引（未找到返回 null）
@@ -974,8 +991,8 @@ function renderViewport() {
         }
     }
 
-    // 渲染卡片 + 聚合统计
-    let totalWatched = 0, totalItems = 0, activeCount = 0;
+    // 渲染卡片 + 聚合统计（已启用数由后端 /api/accounts/stats 提供，前端不再聚合）
+    let totalWatched = 0, totalItems = 0;
     render.innerHTML = slots.map(({ acc, absoluteIdx }) => {
         if (!acc) {
             // 该位置分页加载中，渲染加载占位
@@ -1001,7 +1018,6 @@ function renderViewport() {
                 }
             }
         }
-        if (s.enabled) activeCount++;
         return buildCardHTML(s, absoluteIdx);
     }).join('');
 
@@ -1033,7 +1049,7 @@ function renderViewport() {
         }
     });
 
-    updateStats(totalCount, activeCount, totalWatched, totalItems);
+    updateStats(totalCount, statsFromBackend.enabled, totalWatched, totalItems);
     // 仅当当前视口内所有分页都已加载（无 acc=null 占位）时才标记 hasRenderedOnce。
     // 否则异步分页加载完成的二次 renderViewport 会因 hasRenderedOnce=true 给所有卡片加 no-anim，
     // 经 render.innerHTML 重建 DOM 后覆盖掉首批卡片的进场动画。
@@ -1053,8 +1069,9 @@ function updateStats(total, active, watched, items) {
 }
 
 // 重新聚合统计数字（局部更新后用，遍历已加载的 pageCache）
+// 注：仅聚合总进度（watched/items），已启用数由 fetchStats() 从后端获取
 function reaggregateStats() {
-    let totalWatched = 0, totalItems = 0, activeCount = 0;
+    let totalWatched = 0, totalItems = 0;
     for (const [, page] of pageCache) {
         for (const acc of page) {
             const status = statusCache.get(acc.phone) || buildDefaultPlaceholder(acc.phone);
@@ -1076,10 +1093,9 @@ function reaggregateStats() {
                     }
                 }
             }
-            if (s.enabled) activeCount++;
         }
     }
-    updateStats(totalCount, activeCount, totalWatched, totalItems);
+    updateStats(totalCount, statsFromBackend.enabled, totalWatched, totalItems);
 }
 
 // 构建分页加载中的占位卡片（pageCache 未加载时用，区别于状态占位）
@@ -1423,7 +1439,7 @@ async function initAccountsView() {
         const visibleRows = Math.max(1, Math.floor(viewportH / rowHeight));
         const capacity = visibleRows * columns;
         viewportCapacity = capacity;
-        await fetchAccountsPage(0, capacity);
+        await Promise.all([fetchAccountsPage(0, capacity), fetchStats()]);
         renderViewport();
         startLazyLoadPolling();
     } catch (e) {
@@ -1448,6 +1464,8 @@ function onAccountAdded() {
             // 懒加载下一 tick 自动补状态
             // 确保 timer 运行（新卡片已渲染到 DOM 需查询状态；timer 可能因空闲态被停止）
             startLazyLoadPolling();
+            // 新账号默认启用，已启用数 +1 需从后端确认
+            fetchStats();
         }).catch(e => console.error('onAccountAdded fetchAccountsPage error:', e));
     } else {
         // 末尾不在视口内：清空末页缓存确保下次滚动到末尾时重新拉取（避免拿到旧空页缓存）
@@ -1465,8 +1483,8 @@ function onAccountAdded() {
                 spacer.style.height = Math.max(0, totalRows * rowHeight - CARD_GAP) + 'px';
             }
         }
-        // 更新总数统计
-        updateStats(totalCount, prevStats.active, prevStats.watched, prevStats.items);
+        // 新账号默认启用，已启用数需从后端确认（fetchStats 内部会用最新 enabled 调 updateStats）
+        fetchStats();
     }
 }
 
@@ -1665,6 +1683,8 @@ async function toggleAccount(phone, enabled) {
         updatePageCacheEntry(phone, { enabled });
         rerenderCardByPhone(phone);
         reaggregateStats();
+        // 启用/禁用直接影响"已启用"卡片数字，从后端确认
+        fetchStats();
     } catch (e) { showToast(e.message || '切换失败', 'error'); }
 }
 
@@ -1964,6 +1984,8 @@ async function doEditAccount(originalPhone) {
         updatePageCacheEntry(originalPhone, { name, remark, enabled, claim_target: claimTarget });
         rerenderCardByPhone(originalPhone);
         reaggregateStats();
+        // 编辑表单可切换 enabled，需从后端确认"已启用"卡片数字
+        fetchStats();
     } catch (e) { showToast(e.message || '更新失败', 'error'); }
 }
 
@@ -2047,6 +2069,7 @@ async function doDeleteAccount(phone) {
                 pageCache.clear();
                 pageCacheVersion++;
                 renderViewport();
+                fetchStats();
                 return;
             }
             // 步骤 4：清空整个 pageCache（位置已偏移，旧缓存失效）
@@ -2061,6 +2084,8 @@ async function doDeleteAccount(phone) {
             }
             // 步骤 7：重新请求当前 offset 对应分页并渲染
             refreshAccountsLight();
+            // 步骤 8：被删账号可能是启用状态，已启用数需从后端确认
+            fetchStats();
         }, 850);
     } catch (e) { showToast(e.message || '删除失败', 'error'); }
 }

@@ -242,6 +242,12 @@ class DbAccountRepository:
             cur = self._conn.execute("SELECT COUNT(*) FROM accounts")
             return cur.fetchone()[0]
 
+    def count_enabled(self) -> int:
+        """启用账号数（供前端统计卡片用，与 list_enabled 等价的计数形式）。"""
+        with _db_lock:
+            cur = self._conn.execute("SELECT COUNT(*) FROM accounts WHERE enabled = 1")
+            return cur.fetchone()[0]
+
 
 def is_db_valid(db_path: str = DB_PATH) -> bool:
     """检查 db 文件是否健康（合法 sqlite + accounts 表存在）。

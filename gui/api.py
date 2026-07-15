@@ -260,6 +260,18 @@ def get_accounts():
     })
 
 
+@app.route("/api/accounts/stats", methods=["GET"])
+def get_accounts_stats():
+    """返回账号统计数（顶部统计卡片用，避免前端遍历分页缓存导致数字不准）。
+
+    纯本地 DB 查询，不依赖 status，瞬时返回。
+    """
+    return jsonify({
+        "total": repo.count(),
+        "enabled": repo.count_enabled(),
+    })
+
+
 @app.route("/api/accounts/<phone>", methods=["GET"])
 def get_account(phone):
     """获取单个账号详情，过滤敏感字段后返回。"""
