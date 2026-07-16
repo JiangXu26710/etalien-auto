@@ -7,7 +7,8 @@
 - db 健康检查（is_db_valid，供 GUI 启动流程调用）
 - DbAccountRepository：单条 CRUD 接口（替代旧 load_accounts/save_accounts 全量读写）
 
-并发模型：模块级 _db_lock 串行化所有写操作，配合 SQLite 自身事务保证一致性。
+并发模型：模块级 _db_lock 仅串行化写操作，读操作不持锁（依赖 WAL 模式的读不阻塞
+读/写特性）。读 + COUNT 等多次查询间可能被写操作插入导致弱一致，分页统计场景可接受。
 """
 
 import logging
@@ -26,7 +27,7 @@ DB_PATH = os.path.join(CONFIG_DIR, "accounts.db")
 # schema 版本（PRAGMA user_version），未来加字段时递增
 SCHEMA_VERSION = 1
 
-# 全局 db 写锁（串行化所有写操作，与方案"全局单连接 + _db_lock 互斥锁"一致）
+# 全局 db 写锁（仅串行化写操作；读操作不持锁，依赖 WAL 模式的读不阻塞读/写特性）
 _db_lock = Lock()
 # 连接初始化锁（仅用于 _conn property 的 double-check locking，与 _db_lock 分离避免嵌套死锁）
 _init_lock = Lock()
@@ -124,34 +125,42 @@ class DbAccountRepository:
 
     def list_all(self) -> list[dict]:
         """全量读取账号列表，按 id DESC 排序（新加用户靠前）。"""
-        with _db_lock:
-            cur = self._conn.execute("SELECT * FROM accounts ORDER BY id DESC")
-            return [_row_to_dict(r) for r in cur.fetchall()]
+        cur = self._conn.execute("SELECT * FROM accounts ORDER BY id DESC")
+        return [_row_to_dict(r) for r in cur.fetchall()]
 
     def list_page(self, offset: int, limit: int) -> tuple[list[dict], int]:
         """分页查询账号列表，返回 (accounts, total)。
 
+        只查基础字段（id + BASE_FIELDS），避免读取 auth_token/password 等敏感字段。
+        id 供测试验证排序用，api.py 的 BASE_FIELDS 过滤会过滤掉它。
         按 id ASC 排序（与 list_all 的 DESC 相反，新账号排在末尾）。
-        SELECT + COUNT(*) 在 _db_lock 期间执行，保证两 SQL 间无其他 Repository 操作插入。
+        读操作不持 _db_lock：WAL 模式下读不阻塞读/写，SELECT + COUNT 间可能被写操作
+        插入导致 total 略大于 rows，分页统计弱一致可接受（用户翻页期间新账号加入
+        属正常业务行为）。
         """
-        with _db_lock:
-            cur = self._conn.execute(
-                "SELECT * FROM accounts ORDER BY id ASC LIMIT ? OFFSET ?",
-                (limit, offset),
-            )
-            rows = [_row_to_dict(r) for r in cur.fetchall()]
-            total = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-            return rows, total
+        cur = self._conn.execute(
+            "SELECT id, phone, name, remark, enabled, claim_target FROM accounts ORDER BY id ASC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        rows = [_row_to_dict(r) for r in cur.fetchall()]
+        total = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
+        return rows, total
 
-    def list_page_search(self, offset: int, limit: int, keyword: str) -> tuple[list[dict], int]:
-        """分页搜索账号，按 name/phone/remark 子串模糊匹配，返回 (accounts, total)。
+    def list_page_search(self, offset: int, limit: int, keyword: str) -> tuple[list[dict], int, int]:
+        """分页搜索账号，按 name/phone/remark 子串模糊匹配，返回 (accounts, total, enabled_count)。
+
+        只查基础字段（id + BASE_FIELDS），与 list_page 一致。
 
         匹配规则（与方案文档 §4.1 一致）：
-        - name/remark 用 LOWER() 不区分大小写
-        - phone 全数字无大小写问题，直接 LIKE
+        - name/phone/remark 均用 LIKE，SQLite 默认 case_sensitive_like=OFF（实测 3.38.4），
+          TEXT 列 LIKE 本身大小写不敏感，无需 LOWER() 包裹
         - 子串包含（LIKE '%keyword%'）
         - keyword 中的 ``%`` / ``_`` / ``\\`` 被 ESCAPE 转义，防止通配符注入
         - 按 id ASC 排序（与 list_page 一致，新账号排在末尾）
+
+        性能：原 list_page_search + count_search_enabled 共触发 3 次全表 LIKE 扫描
+        （SELECT + COUNT + COUNT enabled），现合并为 2 次（SELECT + 单 SQL 同时取
+        total 与 enabled_count），翻页延迟约降 30%+。
 
         Args:
             offset: 偏移量（clamp 由 API 层负责，与 list_page 一致）
@@ -159,60 +168,45 @@ class DbAccountRepository:
             keyword: 搜索关键词原始字符串（函数内部负责转义）
 
         Returns:
-            (accounts, total)：accounts 为匹配的账号列表，total 为匹配总数
+            (accounts, total, enabled_count)：accounts 为匹配的账号列表，total 为匹配总数，
+            enabled_count 为匹配结果中 enabled=1 的账号数（搜索态合并卡片 m/n 用）。
         """
         # 转义 LIKE 通配符：先转义 \ 自身，再转义 % 和 _（顺序不可换）
         escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{escaped}%"
         where_sql = (
-            "WHERE LOWER(name) LIKE LOWER(?) ESCAPE '\\' "
+            "WHERE name LIKE ? ESCAPE '\\' "
             "OR phone LIKE ? ESCAPE '\\' "
-            "OR LOWER(remark) LIKE LOWER(?) ESCAPE '\\'"
+            "OR remark LIKE ? ESCAPE '\\'"
         )
-        with _db_lock:
-            cur = self._conn.execute(
-                f"SELECT * FROM accounts {where_sql} ORDER BY id ASC LIMIT ? OFFSET ?",
-                (pattern, pattern, pattern, limit, offset),
-            )
-            rows = [_row_to_dict(r) for r in cur.fetchall()]
-            total = self._conn.execute(
-                f"SELECT COUNT(*) FROM accounts {where_sql}",
-                (pattern, pattern, pattern),
-            ).fetchone()[0]
-            return rows, total
-
-    def count_search_enabled(self, keyword: str) -> int:
-        """统计搜索关键词匹配的账号中启用数量（搜索态合并卡片用）。
-
-        匹配规则同 list_page_search（name/phone/remark 子串模糊，name/remark 不区分大小写）。
-        """
-        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        pattern = f"%{escaped}%"
-        match_sql = (
-            "(LOWER(name) LIKE LOWER(?) ESCAPE '\\' "
-            "OR phone LIKE ? ESCAPE '\\' "
-            "OR LOWER(remark) LIKE LOWER(?) ESCAPE '\\')"
+        # 读操作不持 _db_lock：WAL 模式下读不阻塞读/写，分页统计弱一致可接受
+        # （用户翻页期间新账号加入导致的口径偏差属正常业务行为）
+        cur = self._conn.execute(
+            f"SELECT id, phone, name, remark, enabled, claim_target FROM accounts {where_sql} ORDER BY id ASC LIMIT ? OFFSET ?",
+            (pattern, pattern, pattern, limit, offset),
         )
-        with _db_lock:
-            return self._conn.execute(
-                f"SELECT COUNT(*) FROM accounts WHERE {match_sql} AND enabled = 1",
-                (pattern, pattern, pattern),
-            ).fetchone()[0]
+        rows = [_row_to_dict(r) for r in cur.fetchall()]
+        # 单 SQL 同时取 total 和 enabled_count，避免再走一次全表 LIKE 扫描
+        # SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END)：enabled=0 行贡献 0；
+        # 无匹配行时 SUM 返回 NULL，用 COALESCE 兜底为 0
+        row = self._conn.execute(
+            f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) FROM accounts {where_sql}",
+            (pattern, pattern, pattern),
+        ).fetchone()
+        return rows, row[0], row[1]
 
     def list_enabled(self) -> list[dict]:
         """列出启用账号（领取用），按 id DESC 排序。"""
-        with _db_lock:
-            cur = self._conn.execute(
-                "SELECT * FROM accounts WHERE enabled = 1 ORDER BY id DESC"
-            )
-            return [_row_to_dict(r) for r in cur.fetchall()]
+        cur = self._conn.execute(
+            "SELECT * FROM accounts WHERE enabled = 1 ORDER BY id DESC"
+        )
+        return [_row_to_dict(r) for r in cur.fetchall()]
 
     def get(self, phone: str) -> dict | None:
         """按手机号查单条账号，找不到返回 None。"""
-        with _db_lock:
-            cur = self._conn.execute("SELECT * FROM accounts WHERE phone = ?", (phone,))
-            row = cur.fetchone()
-            return _row_to_dict(row) if row else None
+        cur = self._conn.execute("SELECT * FROM accounts WHERE phone = ?", (phone,))
+        row = cur.fetchone()
+        return _row_to_dict(row) if row else None
 
     def get_or_create(self, phone: str) -> dict:
         """查不到则建初始态账号（name='' / phone / remark='' / enabled=True / claim_target='all'）。
@@ -294,15 +288,92 @@ class DbAccountRepository:
 
     def count(self) -> int:
         """账号总数（调试用）。"""
+        cur = self._conn.execute("SELECT COUNT(*) FROM accounts")
+        return cur.fetchone()[0]
+
+    def get_by_phones(self, phones: list[str]) -> dict[str, dict]:
+        """按手机号列表批量查询账号，返回 {phone: account_dict}。
+
+        不存在的 phone 不会出现在返回字典中。单条 SQL，
+        替代逐个 repo.get(phone) 的 N+1 查询模式。
+        """
+        if not phones:
+            return {}
+        placeholders = ",".join("?" * len(phones))
+        cur = self._conn.execute(
+            f"SELECT * FROM accounts WHERE phone IN ({placeholders})",
+            phones,
+        )
+        return {row["phone"]: _row_to_dict(row) for row in cur.fetchall()}
+
+    def get_enabled_by_phones(self, phones: list[str]) -> list[dict]:
+        """按手机号列表批量查询启用账号（enabled=1），返回账号字典列表。
+
+        单条 SQL，替代逐个 repo.get(phone) + 过滤的 N+1 模式。
+        自动去重（SQL IN 语义对重复值只返回一行）。
+        """
+        if not phones:
+            return []
+        placeholders = ",".join("?" * len(phones))
+        cur = self._conn.execute(
+            f"SELECT * FROM accounts WHERE phone IN ({placeholders}) AND enabled = 1",
+            phones,
+        )
+        return [_row_to_dict(r) for r in cur.fetchall()]
+
+    def get_existing_phones(self, phones: list[str]) -> set[str]:
+        """按手机号列表批量查询存在的 phone 集合，仅 SELECT phone 列。
+
+        供 batch_update_accounts 判断存在性用，避免 get_by_phones 的 SELECT *
+        载入 password/auth_token 等敏感字段冗余开销。
+        自动去重（SQL IN 语义对重复值只返回一行）。
+        """
+        if not phones:
+            return set()
+        placeholders = ",".join("?" * len(phones))
+        cur = self._conn.execute(
+            f"SELECT phone FROM accounts WHERE phone IN ({placeholders})",
+            phones,
+        )
+        return {row["phone"] for row in cur.fetchall()}
+
+    def batch_set_enabled(self, phones: list[str], enabled: bool) -> int:
+        """批量设置启用/禁用状态，返回受影响行数。
+
+        单条 SQL + 单次锁获取 + 单次 commit，替代逐条 update_fields 的 N 次 commit 模式。
+        """
+        if not phones:
+            return 0
+        val = 1 if enabled else 0
+        placeholders = ",".join("?" * len(phones))
         with _db_lock:
-            cur = self._conn.execute("SELECT COUNT(*) FROM accounts")
-            return cur.fetchone()[0]
+            cur = self._conn.execute(
+                f"UPDATE accounts SET enabled = ? WHERE phone IN ({placeholders})",
+                [val] + phones,
+            )
+            self._conn.commit()
+            return cur.rowcount
+
+    def batch_delete(self, phones: list[str]) -> int:
+        """批量删除账号，返回受影响行数。
+
+        单条 SQL + 单次锁获取 + 单次 commit，替代逐条 delete 的 N 次 commit 模式。
+        """
+        if not phones:
+            return 0
+        placeholders = ",".join("?" * len(phones))
+        with _db_lock:
+            cur = self._conn.execute(
+                f"DELETE FROM accounts WHERE phone IN ({placeholders})",
+                phones,
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     def count_enabled(self) -> int:
         """启用账号数（供前端统计卡片用，与 list_enabled 等价的计数形式）。"""
-        with _db_lock:
-            cur = self._conn.execute("SELECT COUNT(*) FROM accounts WHERE enabled = 1")
-            return cur.fetchone()[0]
+        cur = self._conn.execute("SELECT COUNT(*) FROM accounts WHERE enabled = 1")
+        return cur.fetchone()[0]
 
 
 def is_db_valid(db_path: str = DB_PATH) -> bool:

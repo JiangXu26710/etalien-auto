@@ -13,6 +13,7 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Thread
 from typing import Any, Callable
 
 import requests
@@ -234,23 +235,45 @@ def get_account_status(account: dict, enable_relogin: bool = False) -> dict:
         info["logged_in"] = True
         try:
             # 2 个接口并发：PC duration + PC ad_config
-            # token 过期时，第一个 result() 即抛 NeedLoginError，跳到 except
-            # 其余 futures 会快速失败：_handle_auth_error_and_retry 立即抛 NeedLoginError（无重试），
-            # 无需共享取消标志；ThreadPoolExecutor.__exit__ 的 shutdown(wait=True) 等待全部完成
-            # 手机端接口（mobile activity / profile）由 get_account_mobile_status 按需查询，
-            # 翻面时前端调 /api/accounts/<phone>/mobile_status 触发，避免全量刷新拉取冗余数据
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                dur_future = ex.submit(client.fetch_pc_duration)
-                tasks_future = ex.submit(client.fetch_pc_ad_config)
-                # token 过期时 result() 抛 NeedLoginError，其余 futures 仍在飞行中；
-                # 在 except 块显式 cancel（仅能取消未开始的提交，已发出的 HTTP 请求
-                # 无法中断——requests 库限制，属可接受权衡，避免新增请求被调度）
-                futures = [dur_future, tasks_future]
-                dur = dur_future.result()
-                tasks_result = tasks_future.result()
+            # 用 Thread 替代 ThreadPoolExecutor(max_workers=2)，避免频繁创建/销毁线程池
+            # token 过期时，第一个 join 后检查结果即可感知 NeedLoginError
+            dur_result: list = [None]
+            dur_exc: list = [None]
+            tasks_result_ref: list = [None]
+            tasks_exc: list = [None]
+
+            def _fetch_duration():
+                try:
+                    dur_result[0] = client.fetch_pc_duration()
+                except Exception as e:
+                    dur_exc[0] = e
+
+            def _fetch_tasks():
+                try:
+                    tasks_result_ref[0] = client.fetch_pc_ad_config()
+                except Exception as e:
+                    tasks_exc[0] = e
+
+            t_dur = Thread(target=_fetch_duration)
+            t_tasks = Thread(target=_fetch_tasks)
+            t_dur.start()
+            t_tasks.start()
+            t_dur.join()
+            t_tasks.join()
+
+            # 优先抛 NeedLoginError（让调用方感知 token 过期）
+            if isinstance(dur_exc[0], NeedLoginError):
+                raise dur_exc[0]
+            if isinstance(tasks_exc[0], NeedLoginError):
+                raise tasks_exc[0]
+            if dur_exc[0]:
+                raise dur_exc[0]
+            if tasks_exc[0]:
+                raise tasks_exc[0]
+
+            dur = dur_result[0]
+            tasks_result = tasks_result_ref[0]
         except NeedLoginError:
-            for f in futures:
-                f.cancel()
             info["token_expired"] = True
             client.close()
             return info
@@ -303,11 +326,43 @@ def get_account_mobile_status(account: dict) -> dict:
         return info
     info["logged_in"] = True
     try:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            act_future = ex.submit(client.fetch_mobile_ad_activity)
-            prof_future = ex.submit(client.fetch_mobile_profile)
-            activity = act_future.result()
-            profile = prof_future.result()
+        # 2 个接口并发：mobile activity + mobile profile
+        # 用 Thread 替代 ThreadPoolExecutor(max_workers=2)，避免频繁创建/销毁线程池
+        act_result: list = [None]
+        act_exc: list = [None]
+        prof_result: list = [None]
+        prof_exc: list = [None]
+
+        def _fetch_activity():
+            try:
+                act_result[0] = client.fetch_mobile_ad_activity()
+            except Exception as e:
+                act_exc[0] = e
+
+        def _fetch_profile():
+            try:
+                prof_result[0] = client.fetch_mobile_profile()
+            except Exception as e:
+                prof_exc[0] = e
+
+        t_act = Thread(target=_fetch_activity)
+        t_prof = Thread(target=_fetch_profile)
+        t_act.start()
+        t_prof.start()
+        t_act.join()
+        t_prof.join()
+
+        if isinstance(act_exc[0], NeedLoginError):
+            raise act_exc[0]
+        if isinstance(prof_exc[0], NeedLoginError):
+            raise prof_exc[0]
+        if act_exc[0]:
+            raise act_exc[0]
+        if prof_exc[0]:
+            raise prof_exc[0]
+
+        activity = act_result[0]
+        profile = prof_result[0]
     except NeedLoginError:
         info["token_expired"] = True
         client.close()
@@ -394,9 +449,10 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
     if not phones:
         return results
 
-    phone_to_account: dict[str, dict | None] = {p: repo.get(p) for p in phones}
-    pending_phones = [p for p, a in phone_to_account.items() if a is not None]
-    not_found_phones = [p for p, a in phone_to_account.items() if a is None]
+    # 批量查询：单条 SQL + 单次锁获取，替代逐个 repo.get(p) 的 N+1 模式
+    phone_to_account = repo.get_by_phones(phones)
+    pending_phones = list(phone_to_account.keys())
+    not_found_phones = [p for p in phones if p not in phone_to_account]
 
     # 占位项：phone 不存在
     for p in not_found_phones:
@@ -455,9 +511,16 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
 def batch_update_accounts(phones: list[str], action: str) -> dict:
     """批量启用/禁用/删除账号。
 
-    逐条操作，非原子：单条失败不影响其他，失败 phone 记录到 failed 列表。
-    SQLite 单连接 + _db_lock 已串行化写操作，但批量操作不引入事务（避免长时间持锁
-    阻塞其他读操作），按方案文档 §4.4 决策。
+    enable/disable 用单条 UPDATE ... WHERE phone IN (...) + 单次 commit；
+    delete 用单条 DELETE ... WHERE phone IN (...) + 单次 commit。
+    替代逐条 update_fields/delete 的 N 次 commit 模式，大幅减少 fsync 次数。
+
+    非原子语义保留：affected 返回实际受影响行数（不含不存在的 phone），
+    failed 返回不存在的 phone（affected + len(failed) 可能 < len(phones)
+    因重复 phone 被 SQL IN 自动去重）。
+
+    性能：用 get_existing_phones（仅 SELECT phone）替代 get_by_phones（SELECT *），
+    避免载入 password/auth_token 等敏感字段冗余开销。
 
     Args:
         phones: 手机号列表（API 层已校验上限 1000 并去重，此处不重复校验）
@@ -466,32 +529,34 @@ def batch_update_accounts(phones: list[str], action: str) -> dict:
     Returns:
         ``{"ok": True, "affected": int, "failed": list[str]}``：
         - affected：实际成功处理的账号数
-        - failed：处理失败的 phone 列表（如 phone 不存在或写盘异常）
+        - failed：处理失败的 phone 列表
     """
-    affected = 0
-    failed: list[str] = []
-    for phone in phones:
-        try:
-            if action == "enable":
-                ok = repo.update_fields(phone, enabled=True)
-            elif action == "disable":
-                ok = repo.update_fields(phone, enabled=False)
-            else:  # action == "delete"
-                ok = repo.delete(phone)
-            if ok:
-                affected += 1
-            else:
-                failed.append(phone)
-        except Exception as e:
-            logger.warning("batch_update_accounts %s for %s failed: %s", action, phone, e)
-            failed.append(phone)
-    return {"ok": True, "affected": affected, "failed": failed}
+    if not phones:
+        return {"ok": True, "affected": 0, "failed": []}
+
+    try:
+        # 仅 SELECT phone 列判断存在性，避免 SELECT * 载入敏感字段
+        existing_phones = repo.get_existing_phones(phones)
+        unique_phones = set(phones)
+        not_found = list(unique_phones - existing_phones)
+
+        existing_list = list(existing_phones)
+        if action == "enable":
+            affected = repo.batch_set_enabled(existing_list, True)
+        elif action == "disable":
+            affected = repo.batch_set_enabled(existing_list, False)
+        else:  # action == "delete"
+            affected = repo.batch_delete(existing_list)
+    except Exception as e:
+        logger.error("batch_update_accounts %s failed: %s", action, e)
+        return {"ok": True, "affected": 0, "failed": list(phones)}
+    return {"ok": True, "affected": affected, "failed": not_found}
 
 
 def get_enabled_accounts_by_phones(phones: list[str]) -> list[dict]:
     """按 phones 列表取 enabled 账号（供 /api/claim 搜索态用）。
 
-    遍历 phones 调 repo.get(phone)，过滤 enabled=True 的账号。
+    批量 SQL 查询 phones 中 enabled=True 的账号。
     用于搜索态下"开始领取"只领搜索结果中启用账号的场景。
 
     Args:
@@ -499,22 +564,15 @@ def get_enabled_accounts_by_phones(phones: list[str]) -> list[dict]:
 
     Returns:
         list[dict]：仅 enabled=True 的账号完整字典列表（含 auth_token / device_id
-        等字段，供 run_concurrent_claim 用）。重复 phone 自动去重。
+        等字段，供 run_concurrent_claim 用）。重复 phone 自动去重（SQL IN 语义）。
     """
-    result: list[dict] = []
-    seen: set[str] = set()
-    for phone in phones:
-        if phone in seen:
-            continue
-        seen.add(phone)
-        try:
-            account = repo.get(phone)
-        except Exception as e:
-            logger.warning("get_enabled_accounts_by_phones repo.get failed for %s: %s", phone, e)
-            continue
-        if account and account.get("enabled", True):
-            result.append(account)
-    return result
+    if not phones:
+        return []
+    try:
+        return repo.get_enabled_by_phones(phones)
+    except Exception as e:
+        logger.warning("get_enabled_accounts_by_phones failed: %s", e)
+        return []
 
 
 def _get_cli_exe_path() -> str:
@@ -965,7 +1023,54 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                 progress_entry["current"] = 0
                 progress_entry["total"] = 0
 
-            ad_result = client.fetch_pc_ad_config()
+            # PC 阶段初始状态：并发查询 ad_config + duration（两者无依赖）
+            ad_result_ref: list = [None]
+            ad_exc: list = [None]
+            dur_before_ref: list = [None]
+            dur_exc: list = [None]
+
+            def _fetch_pc_ad():
+                try:
+                    ad_result_ref[0] = client.fetch_pc_ad_config()
+                except Exception as e:
+                    ad_exc[0] = e
+
+            def _fetch_pc_dur():
+                try:
+                    dur_before_ref[0] = client.fetch_pc_duration()
+                except Exception as e:
+                    dur_exc[0] = e
+
+            t_ad = Thread(target=_fetch_pc_ad)
+            t_dur = Thread(target=_fetch_pc_dur)
+            t_ad.start()
+            t_dur.start()
+            t_ad.join()
+            t_dur.join()
+
+            # 检查 NeedLoginError / RequestException 优先上抛（保持原有异常语义）
+            if isinstance(ad_exc[0], NeedLoginError):
+                raise ad_exc[0]
+            if isinstance(dur_exc[0], NeedLoginError):
+                raise dur_exc[0]
+            if isinstance(ad_exc[0], requests.RequestException):
+                raise ad_exc[0]
+            if isinstance(dur_exc[0], requests.RequestException):
+                raise dur_exc[0]
+
+            ad_result = ad_result_ref[0]
+            dur_before = dur_before_ref[0]
+
+            if ad_exc[0]:
+                ad_result = {"_error": True, "msg": str(ad_exc[0])}
+            if dur_exc[0]:
+                dur_before = {"_error": True, "msg": str(dur_exc[0])}
+
+            if ad_result is None:
+                ad_result = {"_error": True}
+            if dur_before is None:
+                dur_before = {"_error": True}
+
             if ad_result.get("_error"):
                 logger.warning("  [%s] 获取PC任务失败: %s", phone, ad_result.get('msg'))
                 phase_results.append("error")
@@ -979,7 +1084,6 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                     progress_entry["pc_initial"] = total_items - total_unwatched
                     progress_entry["pc_total"] = total_items
 
-                dur_before = client.fetch_pc_duration()
                 vip_before = dur_before.get("vip_duration_second", 0) if not dur_before.get("_error") else 0
 
                 if total_unwatched == 0:
@@ -1026,7 +1130,54 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                 progress_entry["current"] = 0
                 progress_entry["total"] = 0
 
-            activity = client.fetch_mobile_ad_activity()
+            # Mobile 阶段初始状态：并发查询 activity + profile（两者无依赖）
+            act_result_ref: list = [None]
+            act_exc: list = [None]
+            prof_result_ref: list = [None]
+            prof_exc: list = [None]
+
+            def _fetch_mobile_act():
+                try:
+                    act_result_ref[0] = client.fetch_mobile_ad_activity()
+                except Exception as e:
+                    act_exc[0] = e
+
+            def _fetch_mobile_prof():
+                try:
+                    prof_result_ref[0] = client.fetch_mobile_profile()
+                except Exception as e:
+                    prof_exc[0] = e
+
+            t_act = Thread(target=_fetch_mobile_act)
+            t_prof = Thread(target=_fetch_mobile_prof)
+            t_act.start()
+            t_prof.start()
+            t_act.join()
+            t_prof.join()
+
+            # 检查 NeedLoginError / RequestException 优先上抛（保持原有异常语义）
+            if isinstance(act_exc[0], NeedLoginError):
+                raise act_exc[0]
+            if isinstance(prof_exc[0], NeedLoginError):
+                raise prof_exc[0]
+            if isinstance(act_exc[0], requests.RequestException):
+                raise act_exc[0]
+            if isinstance(prof_exc[0], requests.RequestException):
+                raise prof_exc[0]
+
+            activity = act_result_ref[0]
+            profile_before = prof_result_ref[0]
+
+            if act_exc[0]:
+                activity = {"_error": True, "msg": str(act_exc[0])}
+            if prof_exc[0]:
+                profile_before = {"_error": True, "msg": str(prof_exc[0])}
+
+            if activity is None:
+                activity = {"_error": True}
+            if profile_before is None:
+                profile_before = {"_error": True}
+
             if activity.get("_error"):
                 logger.warning("  [%s] 获取手机端任务失败: %s", phone, activity.get('msg'))
                 phase_results.append("error")
@@ -1043,7 +1194,6 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                     progress_entry["mobile_initial"] = _clamp_watch_cnt(watched_before, video_cnt)
                     progress_entry["mobile_total"] = video_cnt
 
-                profile_before = client.fetch_mobile_profile()
                 mobile_before = profile_before.get("remaining_seconds", 0) if not profile_before.get("_error") else 0
 
                 if video_cnt == 0 or watched_before >= video_cnt:

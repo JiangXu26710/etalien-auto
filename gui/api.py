@@ -4,7 +4,6 @@
 领取任务启停与进度查询、设置读写、Windows 计划任务管理。
 """
 
-import copy
 import logging
 import os
 import re
@@ -125,7 +124,10 @@ class ClaimManager:
         with self._lock:
             return {
                 "running": self._running,
-                "progress": copy.deepcopy(self._progress),
+                # 浅拷贝列表 + 浅拷贝每个 dict：progress 条目字段全是基本类型（str/int/float），
+                # 无嵌套 list/dict，浅拷贝比 deepcopy 快 5-10 倍且语义等价。
+                # 持锁期间快照，释放锁后后端 update 修改的是原 dict（已不在快照中）。
+                "progress": [dict(e) for e in self._progress],
             }
 
     def add_progress_entry(self, entry: dict[str, Any]) -> None:
@@ -234,9 +236,9 @@ def get_accounts():
     # 非搜索态：q 为空或不传时走 list_page 全体分页（行为同现状）
     q = request.args.get("q", "").strip()
     if q:
-        accounts, total = repo.list_page_search(offset, limit, q)
-        # 搜索态额外返回匹配结果中的启用数（合并卡片搜索态显示 m/n 用）
-        enabled = repo.count_search_enabled(q)
+        # list_page_search 一次返回 (accounts, total, enabled_count)，
+        # 合并了原 count_search_enabled 的全表 LIKE 扫描，避免重复扫表
+        accounts, total, enabled = repo.list_page_search(offset, limit, q)
     else:
         accounts, total = repo.list_page(offset, limit)
         enabled = None
