@@ -74,6 +74,10 @@ else:
     STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 app = Flask(__name__, static_folder=STATIC_DIR)
+# 关闭 jsonify 的键字母排序，保留 Python dict 插入顺序。
+# 前端高级区按 schema 字段定义顺序渲染（如先 PC 轮数后手机轮数），
+# sort_keys=True 会破坏 SETTINGS_SCHEMA 的业务分组顺序。
+app.json.sort_keys = False
 
 
 class ClaimManager:
@@ -119,7 +123,7 @@ class ClaimManager:
             dict: 包含 running（布尔）、progress（各账号条目列表的深拷贝）。
             注：``pc_initial`` / ``pc_total`` / ``mobile_initial`` / ``mobile_total``
             等字段仍保留在 progress 条目中（由 claim_for_account 写入，死字段但无害），
-            不再聚合为顶层汇总字段（前端已砍掉总进度卡片，按方案文档 §4.3 清理）。
+            不再聚合为顶层汇总字段（前端已砍掉总进度卡片）。
         """
         with self._lock:
             return {
@@ -593,11 +597,37 @@ def cli_trigger_claim():
     return jsonify({"ok": True, "msg": "已触发领取"}), 202
 
 
+def _serialize_schema(schema):
+    """将 SETTINGS_SCHEMA 序列化为可 JSON 化的字典，type 从 Python 类型对象转为字符串标识。
+
+    int -> "int" / float -> "float" / bool -> "bool" / str -> "str"。
+    enum 类型当前生产 schema 未使用，前端渲染器已保留支持；实际新增 enum 字段时需在此补充
+    "enum" 类型标识与 options 字段输出。
+    min/max 仅在原 schema 中存在时输出；advanced/label/description 缺省时给安全默认值。
+    """
+    result = {}
+    for key, meta in schema.items():
+        item = {"type": meta["type"].__name__}
+        if "min" in meta:
+            item["min"] = meta["min"]
+        if "max" in meta:
+            item["max"] = meta["max"]
+        item["advanced"] = meta.get("advanced", False)
+        item["label"] = meta.get("label", "")
+        item["description"] = meta.get("description", "")
+        result[key] = item
+    return result
+
+
 @app.route("/api/settings", methods=["GET"])
 def get_settings():
-    """获取设置，刷新缓存以反映外部手动编辑。"""
+    """获取设置，刷新缓存以反映外部手动编辑。
+
+    返回值在配置项值基础上增加 schema 字段，一次请求同时拿到值和元数据，
+    供前端 schema 驱动渲染。
+    """
     # 打开设置页时刷新缓存，应对外部手动编辑 settings.json 后的缓存过期
-    return jsonify(reload_settings())
+    return jsonify({**reload_settings(), "schema": _serialize_schema(SETTINGS_SCHEMA)})
 
 
 @app.route("/api/settings", methods=["PUT"])
@@ -636,7 +666,7 @@ def update_settings():
             schan_value = str(value)
             if len(schan_value) > 100:
                 return error_response("schan_key 长度超过 100 字符", 400)
-            # Server酱 Turbo 版 SendKey 文档标注 SCT 开头（docs/07-protocol.md L304），
+            # Server酱 Turbo 版 SendKey 以 SCT 开头，
             # notify.py 直接拼接到 URL 不做格式校验。此处保留长度校验，
             # 不强制正则以兼容历史数据与现有测试用例
             settings[key] = schan_value

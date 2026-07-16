@@ -50,15 +50,15 @@ DEFAULT_SETTINGS = {
 }
 
 SETTINGS_SCHEMA = {
-    "max_concurrent": {"type": int, "min": 1, "max": 999},
-    "request_interval": {"type": float, "min": 0.01, "max": 30.0},
-    "max_rounds": {"type": int, "min": 1, "max": 200},
-    "mobile_max_rounds": {"type": int, "min": 1, "max": 200},
-    "schedule_time": {"type": str},
-    "schan_enabled": {"type": bool},
-    "schan_key": {"type": str},
-    "max_retries": {"type": int, "min": 0, "max": 10},       # 0=不重试，10=极端场景
-    "retry_delay": {"type": float, "min": 0.01, "max": 30.0},  # 与 request_interval 范围一致
+    "max_concurrent":    {"type": int,   "min": 1,    "max": 999,  "advanced": False, "label": "最大账号并发数", "description": "同时领取权益的账号数上限"},
+    "request_interval":  {"type": float, "min": 0.01, "max": 30.0, "advanced": False, "label": "单账号请求间隔", "description": "同一账号两次请求之间的间隔"},
+    "max_rounds":        {"type": int,   "min": 1,    "max": 200,  "advanced": True,  "label": "电脑权益领取最大轮数", "description": ""},
+    "mobile_max_rounds": {"type": int,   "min": 1,    "max": 200,  "advanced": True,  "label": "手机权益领取最大轮数", "description": ""},
+    "schedule_time":     {"type": str,                            "advanced": False, "label": "定时自动领取", "description": "定时自动领取的触发时间"},
+    "schan_enabled":     {"type": bool,                            "advanced": False, "label": "领取情况通知", "description": "是否开启 Server 酱通知"},
+    "schan_key":         {"type": str,                            "advanced": False, "label": "Server 酱 SendKey", "description": "Server 酱 SendKey"},
+    "max_retries":       {"type": int,   "min": 0,    "max": 10,   "advanced": True,  "label": "本地原因导致请求失败后的重试次数", "description": ""},
+    "retry_delay":       {"type": float, "min": 0.01, "max": 30.0, "advanced": True,  "label": "本地原因导致请求失败后的每轮重试间隔", "description": ""},
 }
 
 
@@ -156,11 +156,19 @@ def _atomic_write(filepath: str, data: str) -> None:
 
 
 def _read_settings_from_disk() -> dict:
-    """从磁盘读取 settings.json（load_settings 的底层实现）。"""
+    """从磁盘读取 settings.json（load_settings 的底层实现）。
+
+    读取后用 DEFAULT_SETTINGS 补全缺失字段（不覆盖已有值），确保旧版配置文件
+    升级到新版后内存中的 settings 含全部字段，避免前端高级区初始化读到 undefined。
+    """
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+            # 合并默认值：缺失字段补全，已有值保留（data 覆盖 DEFAULT_SETTINGS）
+            merged = dict(DEFAULT_SETTINGS)
+            merged.update(data)
+            return merged
         except (json.JSONDecodeError, OSError) as e:
             logger.error("Failed to load settings: %s", e)
             return dict(DEFAULT_SETTINGS)
@@ -219,3 +227,29 @@ def save_settings(settings: dict) -> None:
         raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
     with _settings_lock:
         _settings_cache = copy.deepcopy(settings)  # 缓存写入的深拷贝副本
+
+
+def migrate_settings() -> None:
+    """启动时检测 settings.json 缺失字段并写回磁盘（一次性迁移）。
+
+    读取磁盘配置，用 DEFAULT_SETTINGS 补全缺失字段，如果有补全则写回磁盘。
+    幂等：已含全部字段的配置文件不会被重写。
+
+    读取失败时跳过迁移，不崩溃（安全第一）。复用 save_settings 的原子写入逻辑。
+    """
+    if not os.path.exists(SETTINGS_FILE):
+        return
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning("migrate_settings: 读取失败，跳过迁移: %s", e)
+        return
+    changed = False
+    for key, default in DEFAULT_SETTINGS.items():
+        if key not in data:
+            data[key] = default
+            changed = True
+    if changed:
+        save_settings(data)
+        logger.info("settings.json 已迁移：补全缺失字段")

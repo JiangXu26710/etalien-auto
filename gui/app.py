@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 
 import webview
 import gui.api as gui_api
-from core.config import reload_settings, CONFIG_DIR, ACCOUNTS_FILE
+from core.config import reload_settings, migrate_settings, CONFIG_DIR, ACCOUNTS_FILE
 from core.db import DB_PATH, is_db_valid, migrate_from_json
 from werkzeug.serving import make_server
 
@@ -524,9 +524,12 @@ def main():
     from main import _create_mutex
     mutex_handle, already_exists = _create_mutex()
     if mutex_handle == 0 or already_exists:
-        # 已有实例在运行（GUI 或 CLI），直接退出（方案要求不弹窗、不区分实例类型）
+        # 已有实例在运行（GUI 或 CLI），直接退出（不弹窗、不区分实例类型）
         logger.info("已有实例在运行，GUI 退出")
         sys.exit(0)
+
+    # 迁移旧版 settings.json（补全缺失字段，幂等；在初始化缓存前执行，确保缓存含完整字段）
+    migrate_settings()
 
     # 初始化 settings 缓存（整个进程生命周期内首次读取）
     reload_settings()

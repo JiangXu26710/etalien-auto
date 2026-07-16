@@ -198,7 +198,7 @@ def get_account_status(account: dict, enable_relogin: bool = False) -> dict:
         enable_relogin: 是否注入 token 过期自动重登能力（含密码与持久化回调）。
             领取流程传 True；状态查询传 False（默认），token 过期时由公共流程抛
             NeedLoginError，状态查询函数捕获后标记 token_expired。
-            批量懒加载查询传 True（密码重登兜底，副作用已知见方案文档 3.2）。
+            批量懒加载查询传 True（密码重登兜底，副作用已知）。
 
     Returns:
         dict 包含以下字段:
@@ -463,7 +463,7 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
 
     deadline = time.monotonic() + total_timeout
     # 不用 with 语句：退出时 shutdown(wait=True) 会阻塞等待已启动的 future 完成，
-    # 违反"超时未完成的 future 放弃等待"的设计（方案 3.2）。手动管理 executor，
+    # 违反"超时未完成的 future 放弃等待"的设计。手动管理 executor，
     # 超时后用 shutdown(wait=False, cancel_futures=True) 立即返回（已启动的 future
     # 在后台继续执行至完成，结果被丢弃；未启动的 future 被取消）。
     executor = ThreadPoolExecutor(max_workers=max_workers)

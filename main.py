@@ -8,12 +8,12 @@ from logging.handlers import RotatingFileHandler
 
 import requests
 
-from core.config import reload_settings, CONFIG_DIR, load_settings
+from core.config import reload_settings, migrate_settings, CONFIG_DIR, load_settings
 from core.db import DbAccountRepository, DB_PATH
 from core.notify import send_claim_notification, send_schan
 from core.service import run_concurrent_claim, format_duration
 
-# CLI 退出码（与 docs/06-cli-and-schedule.md 退出码表一致）
+# CLI 退出码定义
 EXIT_OK = 0              # 全部成功
 EXIT_PARTIAL = 1         # 部分成功
 EXIT_ERROR = 2           # 全部失败
@@ -59,6 +59,8 @@ def main(auto_close: bool = False):
     """
     logger = logging.getLogger(__name__)
 
+    # 迁移旧版 settings.json（补全缺失字段，幂等；在初始化缓存前执行，确保缓存含完整字段）
+    migrate_settings()
     settings = reload_settings()
     repo = DbAccountRepository()
     enabled = repo.list_enabled()

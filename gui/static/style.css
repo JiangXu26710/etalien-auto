@@ -1063,6 +1063,9 @@ body {
     max-width: 480px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 60px rgba(201, 168, 76, 0.05);
     animation: modalIn 0.25s ease-out;
+    /* 给 .adv-panel 的 position: absolute; inset: 0 提供参照系。
+       position: relative 不改变 static 元素自身的文档流位置，对其他 modal 无副作用。 */
+    position: relative;
 }
 
 .modal.closing {
@@ -1420,14 +1423,8 @@ body {
     letter-spacing: 0.5px;
 }
 
-.footer-version code {
-    font-size: 11px;
-    color: var(--gold);
-    background: var(--gold-dim);
-    padding: 1px 6px;
-    border-radius: 4px;
-    font-family: 'Cascadia Code', 'Fira Code', monospace;
-}
+/* 版本号 chip 样式已迁移至 .version-flip-face（见文件末尾翻转卡片区块），
+ * 外层 <code> 仅作为 perspective 容器，避免双层金色圆角嵌套。 */
 
 /* ===== Footer Separator & Icon Link (项目主页) ===== */
 .footer-separator {
@@ -1663,99 +1660,11 @@ body {
     max-width: 540px;
 }
 
-/* ===== Settings Flip Card (最大轮数 PC/手机) ===== */
-.settings-flip-card {
-    perspective: 1000px;
-}
-
-.settings-flip-inner {
-    position: relative;
-    transition: transform 0.55s cubic-bezier(0.25, 0.8, 0.25, 1);
-    transform-style: preserve-3d;
-}
-
-.settings-flip-card.flipped .settings-flip-inner {
-    transform: rotateX(180deg);
-}
-
-.settings-flip-face {
-    backface-visibility: hidden;
-    -webkit-backface-visibility: hidden;
-}
-
-.settings-flip-back {
-    position: absolute;
-    top: 0;
-    left: 0;
-    width: 100%;
-    transform: rotateX(180deg);
-}
-
-.settings-flip-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 8px;
-}
-
-.settings-flip-header label {
-    display: block;
-    font-size: 11px;
-    color: var(--text-muted);
-    letter-spacing: 1px;
-    text-transform: uppercase;
-    margin-bottom: 0;
-    flex: 1;
-}
-
-.flip-btn {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-card);
-    color: var(--text-muted);
-    cursor: pointer;
-    font-size: 14px;
-    line-height: 1;
-    transition: border-color var(--transition), color var(--transition);
-    position: relative;
-    flex-shrink: 0;
-}
-
-.flip-btn:hover {
-    border-color: var(--border-gold-dim);
-    color: var(--gold);
-}
-
-.flip-btn::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    bottom: calc(100% + 8px);
-    right: 0;
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-gold-dim);
-    border-radius: var(--radius);
-    padding: 6px 10px;
-    font-size: 12px;
-    font-weight: 400;
-    color: var(--text-primary);
-    white-space: nowrap;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.2s ease;
-    transition-delay: 0s;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    z-index: 10;
-}
-
-.flip-btn:hover::after {
-    opacity: 1;
-    transition-delay: 1s;
-}
+/* [ARCHIVE] 旧版翻转卡片（最大轮数 PC/手机）样式已移除，由高级设置覆盖层 .adv-panel 取代。
+   归档清单提交给主 agent，由 archive-file skill 统一归档到 .trash/。
+   移除内容：.settings-flip-card / .settings-flip-inner / .settings-flip-card.flipped .settings-flip-inner /
+   .settings-flip-face / .settings-flip-back / .settings-flip-header / .settings-flip-header label /
+   .flip-btn / .flip-btn:hover / .flip-btn::after / .flip-btn:hover::after */
 
 /* ===== Card Flip System (3D X-Axis Tilt) ===== */
 .account-card .card-inner {
@@ -1968,28 +1877,11 @@ body {
     pointer-events: none;
 }
 
-.info-icon::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    bottom: calc(100% + 8px);
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--bg-elevated);
-    border: 1px solid var(--border-gold-dim);
-    border-radius: var(--radius);
-    padding: 6px 10px;
-    font-size: 12px;
-    font-weight: 400;
-    font-style: normal;
-    font-family: 'Segoe UI', 'SF Pro Display', -apple-system, sans-serif;
-    color: var(--text-primary);
-    white-space: nowrap;
-    pointer-events: none;
-    opacity: 0;
-    transition: opacity 0.2s ease;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-    z-index: 10;
-}
+/* [ARCHIVE] 旧版纯 CSS tooltip（.info-icon:hover::after 内容tooltip）已移除，
+   改用全局 DOM 元素 .info-tooltip + JS 动态定位（见文件末尾新增样式）。
+   保留 .info-icon 本身和 ::before 圆形边框样式。
+   下方 .info-icon::after { display: none; } 是保险规则，防止旧 ::after tooltip 规则残留导致双重 tooltip。
+   归档清单提交给主 agent，由 archive-file skill 统一归档到 .trash/。 */
 
 .info-icon:hover {
     color: var(--gold);
@@ -2000,8 +1892,9 @@ body {
     box-shadow: 0 0 8px rgba(201, 168, 76, 0.15);
 }
 
-.info-icon:hover::after {
-    opacity: 1;
+/* 保险：禁用旧 ::after tooltip，防止旧规则残留导致双重 tooltip */
+.info-icon::after {
+    display: none;
 }
 
 /* ===== 合并卡片（启用 / 总数） ===== */
@@ -2438,23 +2331,433 @@ body {
     color: var(--text-muted);
 }
 
-.modal-input-confirm input.shake {
-    animation: shakeX 0.4s ease;
-    border-color: var(--error);
-}
-
-@keyframes shakeX {
-    0%, 100% { transform: translateX(0); }
-    15% { transform: translateX(-8px); }
-    30% { transform: translateX(8px); }
-    45% { transform: translateX(-6px); }
-    60% { transform: translateX(6px); }
-    75% { transform: translateX(-3px); }
-}
+/* [ARCHIVE] 旧版 .modal-input-confirm input.shake + @keyframes shakeX 已移除。
+   统一用全局 input.shake + @keyframes advShake（见文件末尾新增样式），与高级区 shake 一致体验。
+   批量删除弹窗的 input.shake 由全局规则接管，仍会展示摇晃效果 + 边框变红（border-color 通过 .modal-input-confirm input:focus 继承生效）。
+   归档清单提交给主 agent，由 archive-file skill 统一归档到 .trash/。 */
 
 /* 禁用态：降低不透明度 + 禁止光标（保留点击触发抖动） */
 .btn-modal:disabled {
     opacity: 0.35;
     cursor: not-allowed;
     pointer-events: auto;
+}
+
+/* ====================================================================
+ * ===== 高级配置覆盖层 + 通用控件（从 demo 迁移，剥离 demo 专属） =====
+ * ==================================================================== */
+
+/* ===== 版本号翻转卡片：3D 双面（v1.0.1 ↔ 高级配置） =====
+ * 入口交互：单击版本号打开高级设置覆盖层
+ * 翻转状态机由 JS 实现（initVersionFlip），悬停 0.5s 翻面，点击立即重置并打开
+ */
+.footer-version code {
+    /* perspective 容器：承载 3D 翻转 */
+    display: inline-block;
+    position: relative;
+    cursor: pointer;
+    user-select: none;
+    perspective: 1000px;
+    transition: transform var(--transition);
+}
+.footer-version code::before {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    /* 不可见的扩大点击热区 */
+}
+.version-flip-inner {
+    position: relative;
+    display: inline-block;
+    transition: transform 0.55s cubic-bezier(0.25, 0.8, 0.25, 1);
+    transform-style: preserve-3d;
+    will-change: transform;
+}
+.footer-version code.flipped .version-flip-inner {
+    transform: rotateX(180deg);
+}
+.version-flip-face {
+    backface-visibility: hidden;
+    -webkit-backface-visibility: hidden;
+    /* chip 样式 */
+    display: inline-block;
+    font-size: 11px;
+    color: var(--gold);
+    background: var(--gold-dim);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    border: 1px solid transparent;
+    transition: background var(--transition), border-color var(--transition), box-shadow var(--transition), color var(--transition);
+    min-width: 60px;
+    text-align: center;
+    white-space: nowrap;
+    box-sizing: border-box;
+}
+.version-flip-back {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    transform: rotateX(180deg) translateZ(0.01px);
+}
+.footer-version code.flipped .version-flip-back {
+    background: rgba(201, 168, 76, 0.25);
+    border-color: var(--border-gold-dim);
+    box-shadow: 0 0 12px rgba(201, 168, 76, 0.25);
+    color: var(--gold-light);
+}
+.footer-version code:active {
+    transform: scale(0.96);
+}
+
+/* ===== 高级配置覆盖层（覆盖在主弹窗上，水波扩散过渡） =====
+ * 复用主弹窗的 modal-overlay，用 clip-path: circle() 从版本号位置水波扩散铺满主弹窗
+ * 视觉感知：同一卡片"内容变换"，而非叠加新弹窗
+ */
+@property --ripple-radius {
+    syntax: '<length>';
+    inherits: true;  /* 让 ::before 继承 .adv-panel 的值 */
+    initial-value: 0px;
+}
+.adv-panel {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-primary);
+    border-radius: var(--radius-lg);
+    padding: 28px 28px 6px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    clip-path: circle(var(--ripple-radius, 0px) at var(--cx, 50%) var(--cy, 100%));
+    -webkit-clip-path: circle(var(--ripple-radius, 0px) at var(--cx, 50%) var(--cy, 100%));
+    pointer-events: none;
+    opacity: 0;
+    --ripple-radius: 0px;
+    /* 只过渡 --ripple-radius：clip-path 和 ::before 金色环都跟随它的当前值变化，三者完全同步。
+       opacity 延迟到 0.5s（收缩结束）才隐藏，让关闭时金色环全程可见 */
+    transition: --ripple-radius 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0s linear 0.5s,
+                pointer-events 0s linear 0.5s;
+}
+/* 金色辉光层：金色环跟随水波边缘移动，扩散完成后淡出 */
+.adv-panel::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: var(--radius-lg);
+    background: radial-gradient(circle at var(--cx, 50%) var(--cy, 100%),
+        transparent max(0px, var(--ripple-radius, 0px) - 40px),
+        rgba(201, 168, 76, 0.02) max(0px, var(--ripple-radius, 0px) - 30px),
+        rgba(201, 168, 76, 0.04) max(0px, var(--ripple-radius, 0px) - 20px),
+        rgba(201, 168, 76, 0.08) max(0px, var(--ripple-radius, 0px) - 10px),
+        rgba(201, 168, 76, 0.12) max(0px, var(--ripple-radius, 0px) - 3px),
+        rgba(201, 168, 76, 0.15) var(--ripple-radius, 0px),
+        transparent calc(var(--ripple-radius, 0px) + 6px));
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity 0.15s ease 0s;
+    z-index: 2;
+}
+.adv-panel.active {
+    --ripple-radius: var(--max-radius, 600px);
+    pointer-events: auto;
+    opacity: 1;
+    transition: --ripple-radius 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+                opacity 0s linear 0.05s,
+                pointer-events 0s;
+}
+.adv-panel.active::before {
+    opacity: 0;
+    transition: opacity 0.35s ease 0.3s;
+}
+/* 让内容在金色辉光层之上 */
+.adv-panel-header,
+.adv-fields,
+.adv-panel-actions {
+    position: relative;
+    z-index: 1;
+}
+.adv-panel-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-bottom: 4px;
+}
+.adv-panel-header h3 {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--gold-light);
+    letter-spacing: 0.5px;
+    margin: 0;
+}
+.adv-panel-header .schema-count {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    letter-spacing: 0.5px;
+}
+.adv-panel-header .schema-count .dot {
+    color: var(--gold);
+    margin: 0 4px;
+}
+.adv-panel-actions {
+    display: flex;
+    justify-content: center;
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+/* 圆角矩形 X 关闭按钮（居中于分割线下方，不超出分割线宽度） */
+.btn-close {
+    width: 32px;
+    height: 20px;
+    border-radius: 5px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: var(--transition);
+    padding: 0;
+}
+.btn-close:hover {
+    border-color: var(--border-gold-dim);
+    color: var(--gold-light);
+    background: var(--gold-dim);
+}
+.adv-fields {
+    flex: 1;
+    overflow-y: auto;
+    margin: 0 -8px 14px;
+    padding: 0 8px;
+}
+.adv-fields::-webkit-scrollbar {
+    width: 6px;
+}
+.adv-fields::-webkit-scrollbar-track {
+    background: transparent;
+}
+.adv-fields::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+.adv-fields::-webkit-scrollbar-thumb:hover {
+    background: var(--border-gold-dim);
+}
+.adv-field-row {
+    margin-bottom: 14px;
+}
+
+/* 高级项 label（带 info icon） */
+.adv-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* ===== 数字输入框 + 范围后缀「n - m」 ===== */
+.adv-input-wrap {
+    display: flex;
+    align-items: stretch;
+    gap: 10px;
+}
+.adv-input-wrap input {
+    flex: 1;
+    min-width: 0;
+}
+.adv-range-suffix {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    padding-left: 10px;
+    min-width: 100px;
+    text-align: right;
+    font-family: 'Cascadia Code', 'Fira Code', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    flex-shrink: 0;
+    transition: var(--transition);
+}
+.adv-field-row:focus-within .adv-range-suffix {
+    color: var(--gold);
+}
+
+/* ===== Enum 自定义下拉框（参考 claim-select，去掉图标） ===== */
+.enum-select-wrap {
+    position: relative;
+}
+.enum-select-trigger {
+    width: 100%;
+    padding: 10px 36px 10px 14px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: inherit;
+    cursor: pointer;
+    transition: var(--transition);
+    display: flex;
+    align-items: center;
+    user-select: none;
+    position: relative;
+}
+.enum-select-trigger:hover {
+    border-color: var(--border-gold-dim);
+}
+.enum-select-trigger:focus {
+    border-color: var(--border-gold);
+    box-shadow: 0 0 0 2px var(--gold-dim);
+    outline: none;
+}
+.enum-select-trigger-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.enum-select-arrow {
+    position: absolute;
+    right: 14px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid var(--text-muted);
+    transition: transform 0.2s ease, border-top-color 0.2s ease;
+}
+.enum-select-trigger.open .enum-select-arrow {
+    transform: translateY(-50%) rotate(180deg);
+    border-top-color: var(--gold);
+}
+.enum-select-dropdown {
+    position: fixed;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-gold-dim);
+    border-radius: var(--radius);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 0 20px rgba(201, 168, 76, 0.05);
+    z-index: 1000;
+    opacity: 0;
+    visibility: hidden;
+    transform: translateY(-4px) scale(0.98);
+    transition: opacity 0.15s ease, transform 0.15s ease, visibility 0.15s;
+    overflow: hidden;
+    max-height: 240px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+.enum-select-dropdown.open {
+    opacity: 1;
+    visibility: visible;
+    transform: translateY(0) scale(1);
+}
+.enum-select-dropdown.drop-up {
+    transform: translateY(4px) scale(0.98);
+}
+.enum-select-dropdown.drop-up.open {
+    transform: translateY(0) scale(1);
+}
+.enum-select-dropdown::-webkit-scrollbar {
+    width: 6px;
+}
+.enum-select-dropdown::-webkit-scrollbar-track {
+    background: transparent;
+}
+.enum-select-dropdown::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+.enum-select-dropdown::-webkit-scrollbar-thumb:hover {
+    background: var(--border-gold-dim);
+}
+.enum-select-option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    cursor: pointer;
+    transition: var(--transition);
+    border: none;
+    background: none;
+    color: var(--text-secondary);
+    font-size: 13px;
+    font-family: inherit;
+    width: 100%;
+    text-align: left;
+}
+.enum-select-option:hover {
+    background: var(--gold-dim);
+    color: var(--gold-light);
+}
+.enum-select-option + .enum-select-option {
+    border-top: 1px solid var(--border);
+}
+.enum-select-option.selected {
+    color: var(--gold);
+}
+.enum-select-option-text {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.enum-select-check {
+    width: 14px;
+    text-align: center;
+    flex-shrink: 0;
+    opacity: 0;
+    color: var(--gold);
+    font-size: 12px;
+}
+.enum-select-option.selected .enum-select-check {
+    opacity: 1;
+}
+
+/* ===== 全局 info-tooltip（JS 动态定位：水平居中于 i、垂直方向动态选上/下） ===== */
+.info-tooltip {
+    position: fixed;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-gold-dim);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 400;
+    font-family: 'Segoe UI', 'SF Pro Display', -apple-system, sans-serif;
+    color: var(--text-primary);
+    line-height: 1.5;
+    pointer-events: none;
+    z-index: 9999;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    width: max-content;
+    max-width: min(280px, calc(100vw - 16px));
+    white-space: normal;
+    word-break: break-word;
+    opacity: 0;
+    transition: opacity 0.15s ease;
+    left: -9999px;
+    top: -9999px;
+}
+.info-tooltip.show {
+    opacity: 1;
+}
+
+/* ===== 输入框越界 shake 动画（全局通用，含批量删除弹窗 + 高级区输入框） ===== */
+@keyframes advShake {
+    0%, 100% { transform: translateX(0); }
+    15% { transform: translateX(-6px); }
+    30% { transform: translateX(6px); }
+    45% { transform: translateX(-5px); }
+    60% { transform: translateX(5px); }
+    75% { transform: translateX(-3px); }
+    90% { transform: translateX(3px); }
+}
+input.shake {
+    animation: advShake 0.45s cubic-bezier(0.36, 0.07, 0.19, 0.97);
 }

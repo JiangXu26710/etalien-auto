@@ -15,7 +15,7 @@ let hasRenderedOnce = false;
 let logMouseDownTarget = null;
 let menuCounter = 0;
 
-// ===== 搜索 + 批量操作卡片状态（方案 3.3）=====
+// ===== 搜索 + 批量操作卡片状态 =====
 // searchState 三态：'idle'（未搜索，折叠）/ 'expanded'（展开输入中）/ 'searched'（已搜索，折叠金盘）
 let searchState = 'idle';
 // 当前搜索关键词（非空字符串表示处于已搜索态）
@@ -46,7 +46,7 @@ const flippedPhones = new Set();
 const mobileCountdownPhones = new Set();
 let mobileCountdownTimer = null;
 
-// ===== 虚拟滚动 + 分页 + 懒加载（方案 4.x）=====
+// ===== 虚拟滚动 + 分页 + 懒加载 =====
 // 分页缓存：按 offset 缓存已加载的页（基础字段）
 const pageCache = new Map();
 // 状态缓存：按 phone 缓存状态（懒加载写入）
@@ -504,11 +504,27 @@ function openModal(html, wide) {
 function closeModal(e) {
     if (e && e.target !== document.getElementById('modalOverlay')) return;
     if (e && modalMouseDownTarget !== document.getElementById('modalOverlay')) return;
+    // 设置弹窗上下文：高级区打开时点遮罩不关闭任何东西（避免误触丢失高级区修改）
+    const advPanel = document.getElementById('advPanel');
+    if (advPanel && advPanel.classList.contains('active')) {
+        modalMouseDownTarget = null;
+        return;
+    }
+    // 设置弹窗上下文：有未保存修改时阻止关闭 + toast 提示
+    if (isDirty()) {
+        showToast('有未保存的修改，请点取消或保存', 'error');
+        modalMouseDownTarget = null;
+        return;
+    }
     _animateCloseModal();
     modalMouseDownTarget = null;
 }
 
 function closeModalForce() {
+    // 强制关闭弹窗：清除设置弹窗脏标记，避免残留 commonDirty/advDirty 阻止其他弹窗的遮罩关闭
+    // （其他弹窗调用时本就是 false，重置无副作用；取消/遮罩关闭后需重置脏标记）
+    commonDirty = false;
+    advDirty = false;
     _animateCloseModal();
 }
 
@@ -549,8 +565,8 @@ function _animateCloseLogModal() {
     });
 }
 
-// 全量刷新流程（方案 4.3）：清除懒加载相关缓存与翻转态，由懒加载机制重新加载可见账号状态。
-// 含 500ms 防抖（方案 6.11）；领取中（isClaiming=true）禁止点击。
+// 全量刷新流程：清除懒加载相关缓存与翻转态，由懒加载机制重新加载可见账号状态。
+// 含 500ms 防抖；领取中（isClaiming=true）禁止点击。
 function refreshAll() {
     if (isClaiming) return;
     if (refreshAllTimer) {
@@ -570,7 +586,7 @@ function refreshAll() {
         inFlightPhones.clear();
         // 1. 清除所有账号的"已查询"标记，触发懒加载重新查询可见 phone
         queriedPhones.clear();
-        // 2. 搜索态：清空搜索结果缓存，重新拉搜索结果首页刷新 searchTotalCount（保持搜索状态，方案 3.3）
+        // 2. 搜索态：清空搜索结果缓存，重新拉搜索结果首页刷新 searchTotalCount（保持搜索状态）
         //    非搜索态：保留 pageCache 与 statusCache 不清空（兜底渲染，避免占位闪烁）
         if (isSearching()) {
             pageCache.clear();
@@ -639,7 +655,7 @@ function mergeAccountWithStatus(acc, status) {
     };
 }
 
-// 拉取分页数据并写入 pageCache（方案 3.1 接口 + 方案 3.3 搜索态复合 key）
+// 拉取分页数据并写入 pageCache（接口 + 搜索态复合 key）
 // keyword 非空时为搜索态：调 GET /api/accounts?offset=&limit=&q=，写 pageCache 用复合 key
 //   (offset + ':' + keyword)，更新 searchTotalCount + 累加 searchResultPhones。
 async function fetchAccountsPage(offset, limit, keyword) {
@@ -697,7 +713,7 @@ function updatePageCacheEntry(phone, patch) {
     return true;
 }
 
-// ===== 搜索态与虚拟滚动的联动辅助（方案 3.3）=====
+// ===== 搜索态与虚拟滚动的联动辅助 =====
 // 是否处于已搜索态（searchKeyword 非空表示已执行过搜索）
 function isSearching() {
     return searchKeyword !== '';
@@ -782,7 +798,7 @@ function clampScrollTop(scrollTop, viewportH) {
 // 计算渲染区间 [start, end)，含上下各 1 屏缓冲（按行计算，区间边界对齐到整行）
 // 多列布局下：visibleRows = floor(viewportH / rowHeight)，capacity = visibleRows * columns
 // 同时返回纯视口区间 viewport（无缓冲），懒加载只查 viewport 范围
-// 搜索态下用 searchTotalCount 替代 totalCount（方案 6.7）
+// 搜索态下用 searchTotalCount 替代 totalCount
 function computeVisibleRange(scrollTop, viewportH) {
     const effectiveTotal = getEffectiveTotalCount();
     if (effectiveTotal === 0) return { visible: { start: 0, end: 0 }, viewport: { start: 0, end: 0 } };
@@ -883,7 +899,7 @@ function handleWheel(e) {
     // 每次事件跳一行（鼠标滚轮一格 = 一次事件 = 一行，不受 Windows 滚动速度设置影响）
     wheelTargetRow += Math.sign(e.deltaY);
 
-    // clamp 到 [0, totalRows-1]；搜索态用 getEffectiveTotalCount()（方案 6.8）
+    // clamp 到 [0, totalRows-1]；搜索态用 getEffectiveTotalCount()
     const totalRows = Math.ceil(getEffectiveTotalCount() / getColumns());
     wheelTargetRow = Math.max(0, Math.min(wheelTargetRow, Math.max(0, totalRows - 1)));
 
@@ -903,7 +919,7 @@ function handleScroll() {
     startLazyLoadPolling();
 }
 
-// resize 防抖 200ms（方案 6.10）
+// resize 防抖 200ms
 function handleResize() {
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
@@ -1138,7 +1154,7 @@ function buildPlaceholderCardHTML(absoluteIdx) {
     </div>`;
 }
 
-// 构建单张账号卡片 HTML（含占位渲染优先级判定，方案 4.4）
+// 构建单张账号卡片 HTML（含占位渲染优先级判定）
 function buildCardHTML(s, idx) {
     const initial = escapeHtml((s.name || s.phone).charAt(0).toUpperCase());
     const displayName = escapeHtml(s.name || maskPhone(s.phone));
@@ -1328,7 +1344,7 @@ async function refreshAccountsLight() {
     }
 }
 
-// ===== 懒加载轮询（方案 4.2）=====
+// ===== 懒加载轮询 =====
 const LAZY_LOAD_INTERVAL = 200;
 const LAZY_LOAD_BATCH_MAX = 50;
 const LAZY_LOAD_FETCH_TIMEOUT = 100000; // 100s（≥后端 90s + 10s 网络余量）
@@ -1355,7 +1371,7 @@ function scheduleLazyLoadTick(immediate) {
 
 // 单次轮询：收集纯视口范围内（viewportRange，不含缓冲）未标记"已查询"且未飞行中的 phone，拆分多批串行查询
 // 不扫描 DOM，改为按索引遍历 pageCache，确保只查视口可见卡片（缓冲区卡片预取数据但不触发外网状态查询）
-// 搜索态下用复合 key 读取 pageCache（方案 6.6）
+// 搜索态下用复合 key 读取 pageCache
 function lazyLoadTick() {
     if (isClaiming) return; // 领取中暂停
     if (getEffectiveTotalCount() === 0) return;
@@ -1760,7 +1776,7 @@ async function toggleAccount(phone, enabled) {
             method: 'PUT',
             body: { enabled },
         });
-        // 局部更新 pageCache 中该 phone 的 enabled 字段，不重新请求分页（方案 4.4）
+        // 局部更新 pageCache 中该 phone 的 enabled 字段，不重新请求分页
         updatePageCacheEntry(phone, { enabled });
         rerenderCardByPhone(phone);
         // 启用/禁用直接影响"已启用"卡片数字，从后端确认
@@ -2060,7 +2076,7 @@ async function doEditAccount(originalPhone) {
         });
         showToast('账号已更新', 'success');
         closeModalForce();
-        // 局部更新 pageCache 中该 phone 所在页的对应字段，不重新请求分页（方案 4.4）
+        // 局部更新 pageCache 中该 phone 所在页的对应字段，不重新请求分页
         updatePageCacheEntry(originalPhone, { name, remark, enabled, claim_target: claimTarget });
         rerenderCardByPhone(originalPhone);
         // 编辑表单可切换 enabled，需从后端确认"已启用"卡片数字
@@ -2137,7 +2153,7 @@ async function doDeleteAccount(phone) {
         statusCache.delete(phone);
         queriedPhones.delete(phone);
         inFlightPhones.delete(phone);
-        // 搜索态：从搜索结果集合移除 + 递减搜索结果总数（方案 3.3）
+        // 搜索态：从搜索结果集合移除 + 递减搜索结果总数
         if (isSearching()) {
             searchResultPhones.delete(phone);
             searchTotalCount = Math.max(0, searchTotalCount - 1);
@@ -2266,7 +2282,7 @@ async function doVerifyPwd(phone) {
 // 启动异步领取流程：调用后端 /api/claim，将按钮切换为"查看日志"，开始轮询进度。
 async function startClaim() {
     const btn = document.getElementById('btnClaim');
-    // 搜索态：搜索结果为空时拒绝领取（方案 3.5）
+    // 搜索态：搜索结果为空时拒绝领取
     if (isSearching() && searchResultPhones.size === 0) {
         showToast('搜索结果为空，无可领取账号', 'error');
         return;
@@ -2275,7 +2291,7 @@ async function startClaim() {
     btn.textContent = '领取中...';
     isClaiming = true;
     document.getElementById('btnRefresh').disabled = true;
-    // 领取中禁用批量操作卡片（方案 6.2 并发领取与批量操作互斥）
+    // 领取中禁用批量操作卡片（并发领取与批量操作互斥）
     const batchCard = document.getElementById('batchAction');
     if (batchCard) batchCard.classList.add('is-locked');
 
@@ -2492,13 +2508,568 @@ async function detectCliTrigger() {
     startCliTriggerDetect();
 }
 
-// 翻转设置弹窗中的"最大轮数"卡片，在 PC 端和手机端配置之间切换。
-function flipSettingsCard(btn) {
-    const card = btn.closest('.settings-flip-card');
-    if (card) card.classList.toggle('flipped');
+// [ARCHIVE] 旧版 flipSettingsCard 函数已移除（最大轮数翻转卡片整体被高级设置覆盖层取代）。
+// 归档清单提交给主 agent，由 archive-file skill 统一归档到 .trash/。
+// 原 flipSettingsCard 函数体（约 L2496-2499）：toggle 翻转卡片 .flipped 类，调用方为翻转卡片上的 ⇄ 按钮。
+
+/* ====================================================================
+ * ===== 高级配置覆盖层（从 demo 迁移，剥离 demo 专属） =====
+ * ==================================================================== */
+
+// 全局变量
+let advancedStaging = {};   // 高级区暂存对象（advanced=true 字段的当前值）
+let commonDirty = false;    // 常规区脏标记
+let advDirty = false;       // 高级区脏标记
+let infoTooltipEl = null;   // 全局 info-tooltip 元素（懒加载）
+
+/* 通用渲染器：按 schema 生成对应控件 HTML。用 schema.label 作为显示名（前端不维护 FIELD_LABELS） */
+function renderSettingsField(key, schema, value) {
+    const label = schema.label || key;
+    const desc = schema.description || '';
+    let controlHTML = '';
+
+    if (schema.type === 'int' || schema.type === 'float') {
+        const step = schema.type === 'float' ? '0.01' : '1';
+        controlHTML = `
+            <div class="adv-input-wrap">
+                <input type="number" data-key="${escapeHtml(key)}" value="${value}" min="${schema.min}" max="${schema.max}" step="${step}">
+                <span class="adv-range-suffix">「${schema.min} - ${schema.max}」</span>
+            </div>`;
+    } else if (schema.type === 'bool') {
+        controlHTML = `
+            <label class="toggle-rect">
+                <input type="checkbox" data-key="${escapeHtml(key)}" ${value ? 'checked' : ''}>
+                <span class="toggle-rect-slider"></span>
+            </label>`;
+    } else if (schema.type === 'enum') {
+        const opts = Object.entries(schema.options || {});
+        const selOpt = opts.find(([v]) => v === value) || opts[0] || ['', ''];
+        const id = `enum-${key}`;
+        // onclick 传参用 jsStr()：输出含双引号的合法 JS 字符串字面量，避免引号注入
+        controlHTML = `
+            <div class="enum-select-wrap" id="${id}" data-key="${escapeHtml(key)}" data-value="${escapeHtml(String(selOpt[0]))}">
+                <div class="enum-select-trigger" tabindex="0" onclick="toggleEnumSelect(${jsStr(id)})">
+                    <span class="enum-select-trigger-text">${escapeHtml(String(selOpt[1]))}</span>
+                    <span class="enum-select-arrow"></span>
+                </div>
+                <div class="enum-select-dropdown">
+                    ${opts.map(([v, lbl]) => `
+                        <button type="button" class="enum-select-option${v === selOpt[0] ? ' selected' : ''}" onclick="pickEnumSelect(${jsStr(id)}, ${jsStr(v)}, ${jsStr(String(lbl))}, this)">
+                            <span class="enum-select-option-text">${escapeHtml(String(lbl))}</span>
+                            <span class="enum-select-check">${v === selOpt[0] ? '\u2713' : ''}</span>
+                        </button>
+                    `).join('')}
+                </div>
+            </div>`;
+    } else {
+        // str
+        controlHTML = `<input type="text" data-key="${escapeHtml(key)}" value="${escapeHtml(String(value))}">`;
+    }
+
+    const infoIconHTML = desc
+        ? `<span class="info-icon" data-tooltip="${escapeHtml(desc)}">i</span>`
+        : '';
+
+    return `
+        <div class="form-group adv-field-row" data-row="${escapeHtml(key)}">
+            <label>
+                <span class="adv-label">
+                    ${escapeHtml(label)}
+                </span>
+                ${infoIconHTML}
+            </label>
+            ${controlHTML}
+        </div>`;
 }
 
-// 打开设置弹窗：并发加载设置、计划任务、版本信息，渲染含最大并发数、间隔、轮数、定时任务、Server酱等配置项。
+/* 从 window.__settingsSchema 筛选 advanced=true 字段 */
+function getAdvancedSchemaEntries() {
+    const schema = window.__settingsSchema || {};
+    return Object.entries(schema).filter(([_, s]) => s && s.advanced === true);
+}
+
+/* 打开高级区：以版本号位置为 clip-path 圆心，水波扩散铺满主弹窗 */
+function openAdvanced() {
+    const fieldsContainer = document.getElementById('advFields');
+    if (!fieldsContainer) return;
+    const entries = getAdvancedSchemaEntries();
+    const countEl = document.getElementById('advFieldCount');
+    if (countEl) countEl.textContent = entries.length;
+
+    fieldsContainer.innerHTML = entries.map(([key, schema]) => {
+        const value = advancedStaging[key];
+        return renderSettingsField(key, schema, value);
+    }).join('');
+
+    // 为新生成的高级区输入框初始化 lastValid
+    initLastValid();
+
+    const panel = document.getElementById('advPanel');
+    const modal = document.getElementById('modalContent');
+    const versionEl = document.getElementById('versionCode');
+    if (!panel || !modal || !versionEl) return;
+
+    // 计算版本号中心点相对主弹窗左上角的位置 → 设为 clip-path 圆心
+    const modalRect = modal.getBoundingClientRect();
+    const versionRect = versionEl.getBoundingClientRect();
+    const cx = versionRect.left + versionRect.width / 2 - modalRect.left;
+    const cy = versionRect.top + versionRect.height / 2 - modalRect.top;
+    panel.style.setProperty('--cx', cx + 'px');
+    panel.style.setProperty('--cy', cy + 'px');
+
+    // 计算到主弹窗最远角的距离，作为金色环的最大半径
+    const maxR = Math.hypot(
+        Math.max(cx, modalRect.width - cx),
+        Math.max(cy, modalRect.height - cy)
+    );
+    panel.style.setProperty('--max-radius', maxR + 'px');
+
+    // 下一帧触发过渡，确保 clip-path 圆心和 max-radius 已生效
+    requestAnimationFrame(() => {
+        panel.classList.add('active');
+    });
+}
+
+/* 关闭高级区：扫描 .adv-field-row 按 schema.type 取值写回 advancedStaging，
+   比较前后 advancedStaging 设 advDirty，水波收缩到关闭按钮 */
+function onAdvClose() {
+    const rows = document.querySelectorAll('#advFields .adv-field-row');
+    const schema = window.__settingsSchema || {};
+    const before = JSON.stringify(advancedStaging);
+    rows.forEach(row => {
+        const key = row.dataset.row;
+        const fieldSchema = schema[key];
+        if (!fieldSchema) return;
+        let val;
+        if (fieldSchema.type === 'enum') {
+            const wrap = row.querySelector('.enum-select-wrap');
+            val = wrap ? wrap.dataset.value : '';
+        } else if (fieldSchema.type === 'bool') {
+            const input = row.querySelector('input[data-key]');
+            val = input ? input.checked : false;
+        } else {
+            const input = row.querySelector('input[data-key]');
+            if (!input) return;
+            if (fieldSchema.type === 'int') val = parseInt(input.value, 10);
+            else if (fieldSchema.type === 'float') val = parseFloat(input.value);
+            else val = input.value;
+        }
+        advancedStaging[key] = val;
+    });
+
+    // 比较前后暂存对象，有差异则标记为脏
+    const after = JSON.stringify(advancedStaging);
+    if (before !== after) advDirty = true;
+
+    const panel = document.getElementById('advPanel');
+    const modal = document.getElementById('modalContent');
+    const closeBtn = panel ? panel.querySelector('.btn-close') : null;
+
+    // 关闭时：以关闭按钮为中心收缩（与打开时从版本号扩散对称）
+    if (panel && modal && closeBtn) {
+        const modalRect = modal.getBoundingClientRect();
+        const btnRect = closeBtn.getBoundingClientRect();
+        const cx = btnRect.left + btnRect.width / 2 - modalRect.left;
+        const cy = btnRect.top + btnRect.height / 2 - modalRect.top;
+        const maxR = Math.hypot(
+            Math.max(cx, modalRect.width - cx),
+            Math.max(cy, modalRect.height - cy)
+        );
+        // 禁用过渡：让圆心立即跳到关闭按钮（无动画），避免扩散动画
+        panel.style.transition = 'none';
+        panel.style.setProperty('--cx', cx + 'px');
+        panel.style.setProperty('--cy', cy + 'px');
+        panel.style.setProperty('--max-radius', maxR + 'px');
+        // 强制 reflow，让变量更新生效
+        void panel.offsetHeight;
+        // 恢复过渡（清除 inline style，回到 CSS 规则）
+        panel.style.transition = '';
+    }
+
+    // 移除 active，--ripple-radius 从 max 收缩到 0（圆心为关闭按钮）
+    if (panel) panel.classList.remove('active');
+}
+
+/* 切换 enum 下拉框展开/收起，关闭其他已展开的 */
+function toggleEnumSelect(id) {
+    const wrap = document.getElementById(id);
+    if (!wrap) return;
+    const trigger = wrap.querySelector('.enum-select-trigger');
+    const dropdown = wrap.querySelector('.enum-select-dropdown');
+    if (!trigger || !dropdown) return;
+    const isOpen = trigger.classList.contains('open');
+
+    // 关闭其他已打开的下拉框（同时只允许一个展开）
+    document.querySelectorAll('.enum-select-trigger.open').forEach(t => {
+        if (t !== trigger) {
+            t.classList.remove('open');
+            const d = t.nextElementSibling;
+            if (d) {
+                d.classList.remove('open');
+                d.classList.remove('drop-up');
+            }
+        }
+    });
+
+    if (isOpen) {
+        trigger.classList.remove('open');
+        dropdown.classList.remove('open');
+        dropdown.classList.remove('drop-up');
+        return;
+    }
+
+    // 展开前先计算位置：fixed 定位，脱离 .adv-fields 的 scrollHeight
+    const triggerRect = trigger.getBoundingClientRect();
+    const fields = document.getElementById('advFields');
+    const fieldsRect = fields ? fields.getBoundingClientRect() : { top: 0, bottom: 0 };
+    const dropdownHeight = dropdown.offsetHeight || 150;
+    const margin = 4;
+    const spaceBelow = fieldsRect.bottom - triggerRect.bottom;
+    const spaceAbove = triggerRect.top - fieldsRect.top;
+    const dropUp = spaceBelow < dropdownHeight + margin && spaceAbove > spaceBelow;
+
+    dropdown.classList.toggle('drop-up', dropUp);
+    dropdown.style.width = triggerRect.width + 'px';
+
+    // fixed 定位的 containing block 可能是 .modal-overlay（backdrop-filter 会改变 containing block）
+    // 用动态测量法：临时设 left:0 top:0 读取 rect，得到 containing block 偏移
+    dropdown.style.left = '0px';
+    dropdown.style.top = '0px';
+    const cbRect = dropdown.getBoundingClientRect();
+    dropdown.style.left = (triggerRect.left - cbRect.left) + 'px';
+    if (dropUp) {
+        dropdown.style.top = (triggerRect.top - margin - dropdownHeight - cbRect.top) + 'px';
+    } else {
+        dropdown.style.top = (triggerRect.bottom + margin - cbRect.top) + 'px';
+    }
+
+    trigger.classList.add('open');
+    dropdown.classList.add('open');
+}
+
+/* enum 选项点击：更新 trigger 文字 + ✓ 标记 + 关闭 dropdown */
+function pickEnumSelect(id, value, label, btn) {
+    const wrap = document.getElementById(id);
+    if (!wrap) return;
+    wrap.dataset.value = value;
+    wrap.querySelectorAll('.enum-select-option').forEach(o => {
+        o.classList.remove('selected');
+        const check = o.querySelector('.enum-select-check');
+        if (check) check.textContent = '';
+    });
+    if (btn) {
+        btn.classList.add('selected');
+        const check = btn.querySelector('.enum-select-check');
+        if (check) check.textContent = '\u2713';
+    }
+    const triggerText = wrap.querySelector('.enum-select-trigger-text');
+    if (triggerText) triggerText.textContent = label;
+    const trigger = wrap.querySelector('.enum-select-trigger');
+    const dropdown = wrap.querySelector('.enum-select-dropdown');
+    if (trigger) trigger.classList.remove('open');
+    if (dropdown) {
+        dropdown.classList.remove('open');
+        dropdown.classList.remove('drop-up');
+    }
+}
+
+/* 关闭所有 enum dropdown */
+function closeAllEnumDropdowns(e) {
+    if (e && e.target && e.target.classList && e.target.classList.contains('enum-select-dropdown')) {
+        return;  // dropdown 自身滚动，不关闭
+    }
+    document.querySelectorAll('.enum-select-trigger.open').forEach(t => {
+        t.classList.remove('open');
+        const d = t.nextElementSibling;
+        if (d) {
+            d.classList.remove('open');
+            d.classList.remove('drop-up');
+        }
+    });
+}
+
+/* 收集常规区可见控件的值（不含 schedule_enabled，因 schedule_enabled 仅用于 /api/schedule 控制） */
+function collectCommonValues() {
+    return {
+        max_concurrent: parseInt(document.getElementById('setMaxConcurrent').value, 10),
+        request_interval: parseFloat(document.getElementById('setInterval').value),
+        schedule_time: document.getElementById('setScheduleTime').value,
+        schan_enabled: document.getElementById('setSchanEnabled').checked,
+        schan_key: document.getElementById('setSchanKey').value,
+    };
+}
+
+/* 复检所有 int/float 字段范围（常用区 + 高级区），范围由 schema 驱动 */
+function validateAll(common) {
+    const settingsSchema = window.__settingsSchema || {};
+    const mcSchema = settingsSchema.max_concurrent || {};
+    const mcMin = mcSchema.min ?? 1;
+    const mcMax = mcSchema.max ?? 999;
+    if (Number.isNaN(common.max_concurrent) || common.max_concurrent < mcMin || common.max_concurrent > mcMax) {
+        return { ok: false, field: 'max_concurrent', msg: `${mcSchema.label || '最大账号并发数'} 超出范围（${mcMin}-${mcMax}）` };
+    }
+    const riSchema = settingsSchema.request_interval || {};
+    const riMin = riSchema.min ?? 0.01;
+    const riMax = riSchema.max ?? 30;
+    if (Number.isNaN(common.request_interval) || common.request_interval < riMin || common.request_interval > riMax) {
+        return { ok: false, field: 'request_interval', msg: `${riSchema.label || '单账号请求间隔'} 超出范围（${riMin}-${riMax}）` };
+    }
+    const advEntries = getAdvancedSchemaEntries();
+    for (const [key, schema] of advEntries) {
+        const v = advancedStaging[key];
+        if (schema.type === 'int' || schema.type === 'float') {
+            if (Number.isNaN(v) || v < schema.min || v > schema.max) {
+                return { ok: false, field: key, msg: `${schema.label || key} 超出范围（${schema.min}-${schema.max}）` };
+            }
+        }
+    }
+    return { ok: true };
+}
+
+/* 脏标记判断：只在设置弹窗上下文生效（其他弹窗走原逻辑） */
+function isDirty() {
+    return typeof advancedStaging !== 'undefined' && (commonDirty || advDirty);
+}
+
+/* 懒加载创建全局 .info-tooltip 元素 */
+function ensureInfoTooltip() {
+    if (!infoTooltipEl) {
+        infoTooltipEl = document.createElement('div');
+        infoTooltipEl.className = 'info-tooltip';
+        document.body.appendChild(infoTooltipEl);
+    }
+    return infoTooltipEl;
+}
+
+/* 显示 tooltip：水平居中于 icon + clamp 到视口，垂直动态选择上/下 */
+function showInfoTooltip(icon) {
+    const tip = ensureInfoTooltip();
+    tip.textContent = icon.dataset.tooltip || '';
+    tip.classList.add('show');
+
+    // 先让 tooltip 在屏幕外渲染，才能测真实尺寸
+    tip.style.left = '-9999px';
+    tip.style.top = '-9999px';
+    // 强制 reflow，确保 getBoundingClientRect 返回真实尺寸
+    void tip.offsetHeight;
+
+    const iconRect = icon.getBoundingClientRect();
+    const tipRect = tip.getBoundingClientRect();
+    const gap = 8;
+    const margin = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    // 水平：始终居中于 icon，再 clamp 到视口内
+    let left = iconRect.left + iconRect.width / 2 - tipRect.width / 2;
+    if (left < margin) left = margin;
+    if (left + tipRect.width > vw - margin) left = vw - margin - tipRect.width;
+
+    // 垂直：动态选择上方或下方
+    const aboveSpace = iconRect.top;
+    const belowSpace = vh - iconRect.bottom;
+    let top;
+    if (aboveSpace >= tipRect.height + gap) {
+        top = iconRect.top - tipRect.height - gap;
+    } else if (belowSpace >= tipRect.height + gap) {
+        top = iconRect.bottom + gap;
+    } else {
+        // 上下都不够：选空间较大的一边贴边显示
+        if (aboveSpace >= belowSpace) top = margin;
+        else top = vh - tipRect.height - margin;
+    }
+
+    tip.style.left = `${left}px`;
+    tip.style.top = `${top}px`;
+}
+
+/* 隐藏 tooltip */
+function hideInfoTooltip() {
+    if (infoTooltipEl) {
+        infoTooltipEl.classList.remove('show');
+        infoTooltipEl.style.left = '-9999px';
+        infoTooltipEl.style.top = '-9999px';
+    }
+}
+
+/* 全局版 shake（与 showDeleteConfirmDialog 内的局部函数同名但不冲突） */
+function triggerShake(input) {
+    input.classList.remove('shake');
+    void input.offsetWidth;  // 强制 reflow，让动画能重新播放
+    input.classList.add('shake');
+    input.addEventListener('animationend', () => input.classList.remove('shake'), { once: true });
+}
+
+/* 给所有 input[data-key] 设 dataset.lastValid（用于失焦时恢复） */
+function initLastValid() {
+    const schema = window.__settingsSchema || {};
+    document.querySelectorAll('input[data-key]').forEach(input => {
+        const key = input.dataset.key;
+        const fieldSchema = schema[key];
+        if (!fieldSchema) return;
+        // 高级区从暂存对象取，常规区直接取当前 DOM 值
+        const v = (fieldSchema.advanced && advancedStaging[key] !== undefined)
+            ? advancedStaging[key]
+            : input.value;
+        input.dataset.lastValid = v;
+    });
+}
+
+/* 版本号翻转状态机（替代 demo 的 IIFE，在 showSettings 的 openModal() 之后调用，防重复绑定）
+ * 4 状态：IDLE_FRONT / FLIPPING_TO_BACK / IDLE_BACK / FLIPPING_TO_FRONT
+ * 静止状态悬停/离开：延迟 0.5s 后翻转；动画过程中悬停/离开：立即反转，不延迟
+ * click 行为：清 hoverTimer + flipTimer → setFlipped(false) → 状态置 IDLE_FRONT（在 openAdvanced 之前执行）
+ */
+function initVersionFlip() {
+    const versionCode = document.getElementById('versionCode');
+    if (!versionCode) return;
+    // 无需防重复绑定：每次 showSettings 重新创建 #versionCode 元素，监听器随旧元素一起被 GC
+
+    const FLIP_DURATION = 550;  // 与 CSS transition: transform 0.55s 一致
+
+    let state = 'IDLE_FRONT';
+    let hoverTimer = null;
+    let flipTimer = null;
+
+    function clearHoverTimer() {
+        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+    }
+    function clearFlipTimer() {
+        if (flipTimer) { clearTimeout(flipTimer); flipTimer = null; }
+    }
+    function setFlipped(on) {
+        versionCode.classList.toggle('flipped', on);
+    }
+    function startFlip(toBack) {
+        clearFlipTimer();
+        state = toBack ? 'FLIPPING_TO_BACK' : 'FLIPPING_TO_FRONT';
+        setFlipped(toBack);
+        flipTimer = setTimeout(() => {
+            flipTimer = null;
+            state = toBack ? 'IDLE_BACK' : 'IDLE_FRONT';
+        }, FLIP_DURATION);
+    }
+
+    versionCode.addEventListener('mouseenter', () => {
+        clearHoverTimer();
+        if (state === 'IDLE_FRONT') {
+            hoverTimer = setTimeout(() => {
+                hoverTimer = null;
+                startFlip(true);
+            }, 500);
+        } else if (state === 'FLIPPING_TO_FRONT') {
+            startFlip(true);  // 动画进行中：立即反转，不延迟
+        }
+    });
+
+    versionCode.addEventListener('mouseleave', () => {
+        clearHoverTimer();
+        if (state === 'IDLE_BACK') {
+            hoverTimer = setTimeout(() => {
+                hoverTimer = null;
+                startFlip(false);
+            }, 500);
+        } else if (state === 'FLIPPING_TO_BACK') {
+            startFlip(false);  // 动画进行中：立即反转，不延迟
+        }
+    });
+
+    // click 事件捕获阶段先执行（在 openAdvanced 之前）：重置翻转到正面
+    versionCode.addEventListener('click', () => {
+        clearHoverTimer();
+        clearFlipTimer();
+        setFlipped(false);
+        state = 'IDLE_FRONT';
+    }, true);
+}
+
+/* ====================================================================
+ * 顶层事件监听（注册一次，不放在 showSettings 内部）
+ * ==================================================================== */
+
+// 点击 enum 外部关闭所有 dropdown
+document.addEventListener('click', e => {
+    if (!e.target.closest('.enum-select-wrap')) {
+        closeAllEnumDropdowns();
+    }
+});
+
+// 失焦校验：空值/非数字/越界 clamp + shake（所有 input[data-key] 共用）
+document.addEventListener('focusout', e => {
+    const target = e.target;
+    if (!(target instanceof Element)) return;
+    if (!target.matches('input[data-key]')) return;
+
+    const key = target.dataset.key;
+    const schema = (window.__settingsSchema || {})[key];
+    if (!schema || (schema.type !== 'int' && schema.type !== 'float')) return;
+
+    const raw = (target.value || '').trim();
+    const lastValid = target.dataset.lastValid !== undefined ? target.dataset.lastValid : '';
+    if (raw === '') {
+        if (lastValid !== '') target.value = lastValid;
+        triggerShake(target);
+        return;
+    }
+    const v = schema.type === 'int' ? parseInt(raw, 10) : parseFloat(raw);
+    if (Number.isNaN(v)) {
+        if (lastValid !== '') target.value = lastValid;
+        triggerShake(target);
+        return;
+    }
+    // 越界：clamp 到范围内并 shake
+    if (v < schema.min) {
+        target.value = schema.min;
+        triggerShake(target);
+        target.dataset.lastValid = schema.min;
+    } else if (v > schema.max) {
+        target.value = schema.max;
+        triggerShake(target);
+        target.dataset.lastValid = schema.max;
+    } else {
+        // 合法值：标准化显示（如 1.0 → 1，01 → 1），并记录为 lastValid
+        target.value = v;
+        target.dataset.lastValid = v;
+    }
+});
+
+// ESC 关闭：高级区打开时关闭高级区（不关闭主弹窗）
+document.addEventListener('keydown', e => {
+    if (e.key !== 'Escape') return;
+    const advPanel = document.getElementById('advPanel');
+    if (advPanel && advPanel.classList.contains('active')) {
+        onAdvClose();
+    }
+});
+
+// scroll capture：隐藏 info-tooltip + 关闭 enum dropdown
+window.addEventListener('scroll', () => {
+    hideInfoTooltip();
+    closeAllEnumDropdowns();
+}, true);
+
+// resize：隐藏 info-tooltip + 关闭 enum dropdown
+window.addEventListener('resize', () => {
+    hideInfoTooltip();
+    closeAllEnumDropdowns();
+});
+
+// info-icon mouseenter/mouseleave（capture，不冒泡）
+document.addEventListener('mouseenter', e => {
+    const target = e.target;
+    if (target instanceof Element && target.classList && target.classList.contains('info-icon')) {
+        showInfoTooltip(target);
+    }
+}, true);
+document.addEventListener('mouseleave', e => {
+    const target = e.target;
+    if (target instanceof Element && target.classList && target.classList.contains('info-icon')) {
+        hideInfoTooltip();
+    }
+}, true);
+
+// 打开设置弹窗：并发加载设置、计划任务、版本信息，渲染含最大并发数、间隔、定时任务、Server酱等配置项。
+// 高级配置项（advanced=true）按 schema 渲染到 .adv-panel 覆盖层，单击版本号入口打开。
 function showSettings() {
     Promise.all([
         api('/api/settings'),
@@ -2512,33 +3083,28 @@ function showSettings() {
         const schanEnabled = settings.schan_enabled || false;
         const schanKey = settings.schan_key || '';
 
+        // 从 GET /api/settings 返回值读取后端 schema（生产 schema 由后端驱动，前端不硬编码）
+        window.__settingsSchema = settings.schema || {};
+        // 初始化高级区暂存对象：从 settings 取所有 advanced=true 字段的当前值
+        advancedStaging = {};
+        Object.entries(window.__settingsSchema).forEach(([key, schema]) => {
+            if (schema && schema.advanced === true && settings[key] !== undefined) {
+                advancedStaging[key] = settings[key];
+            }
+        });
+        // 重置脏标记（打开弹窗视为初始状态）
+        commonDirty = false;
+        advDirty = false;
+
         openModal(`
             <h3>设置</h3>
             <div class="form-group">
                 <label>最大账号并发数</label>
-                <input type="number" id="setMaxConcurrent" value="${settings.max_concurrent}" min="1" max="999">
+                <input type="number" id="setMaxConcurrent" data-key="max_concurrent" value="${settings.max_concurrent}" min="1" max="999">
             </div>
             <div class="form-group">
                 <label>单账号请求间隔（秒）</label>
-                <input type="number" id="setInterval" value="${settings.request_interval}" min="0.01" max="30" step="0.01">
-            </div>
-            <div class="settings-flip-card">
-                <div class="settings-flip-inner">
-                    <div class="settings-flip-face settings-flip-front form-group">
-                        <div class="settings-flip-header">
-                            <label>电脑权益领取 最大轮数</label>
-                            <button type="button" class="flip-btn" data-tooltip="点击以翻转卡面" onclick="flipSettingsCard(this)">⇄</button>
-                        </div>
-                        <input type="number" id="setMaxRounds" value="${settings.max_rounds}" min="1" max="200">
-                    </div>
-                    <div class="settings-flip-face settings-flip-back form-group">
-                        <div class="settings-flip-header">
-                            <label>手机权益领取 最大轮数</label>
-                            <button type="button" class="flip-btn" data-tooltip="点击以翻转卡面" onclick="flipSettingsCard(this)">⇄</button>
-                        </div>
-                        <input type="number" id="setMobileMaxRounds" value="${settings.mobile_max_rounds ?? 7}" min="1" max="200">
-                    </div>
-                </div>
+                <input type="number" id="setInterval" data-key="request_interval" value="${settings.request_interval}" min="0.01" max="30" step="0.01">
             </div>
             <div class="settings-divider"></div>
             <div class="form-group">
@@ -2567,49 +3133,74 @@ function showSettings() {
                 <button type="button" class="btn-modal btn-modal-primary" onclick="doSaveSettings()">保存</button>
             </div>
             <div class="modal-footer-info">
-                <span class="footer-version">etalien-auto <code>v${escapeHtml(ver)}</code></span>
+                <span class="footer-version">etalien-auto <code id="versionCode"><span class="version-flip-inner"><span class="version-flip-face version-flip-front">v${escapeHtml(ver)}</span><span class="version-flip-face version-flip-back">高级配置</span></span></code></span>
                 <span class="footer-separator"></span>
                 <a href="https://github.com/JiangXu26710/etalien-auto" target="_blank" class="footer-icon-link">
                     <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
                     GitHub
                 </a>
             </div>
+            <div class="adv-panel" id="advPanel">
+                <div class="adv-panel-header">
+                    <h3>高级设置</h3>
+                    <span class="schema-count">schema<span class="dot">·</span><span id="advFieldCount">0</span> fields</span>
+                </div>
+                <div class="adv-fields" id="advFields"></div>
+                <div class="adv-panel-actions">
+                    <button type="button" class="btn-close" onclick="onAdvClose()" aria-label="关闭">
+                        <svg viewBox="0 0 16 16" width="12" height="12">
+                            <path d="M4 4 L12 12 M12 4 L4 12" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
         `);
         document.getElementById('modalContent').classList.add('modal-compact');
+        // 初始化所有 input[data-key] 的 lastValid（用于失焦时恢复）
+        initLastValid();
+        // 初始化版本号翻转状态机（替代 demo 的 IIFE，防重复绑定）
+        initVersionFlip();
+        // 绑定版本号 click 监听（打开高级设置）
+        const versionCodeEl = document.getElementById('versionCode');
+        if (versionCodeEl) {
+            versionCodeEl.addEventListener('click', openAdvanced);
+        }
+        // 更新高级区 schema 字段数标记
+        const advFieldCount = document.getElementById('advFieldCount');
+        if (advFieldCount) {
+            advFieldCount.textContent = getAdvancedSchemaEntries().length;
+        }
     }).catch(e => showToast(e.message || '获取设置失败', 'error'));
 }
 
-// 保存设置：含风控预警（理论请求频率 > 50次/秒时弹二次确认），同步更新计划任务。
+// 保存设置：合并常用区 + 高级区，前端 validateAll 复检，风控预警（> 50 次/秒时弹二次确认），同步更新计划任务。
 async function doSaveSettings() {
     const btn = document.querySelector('.btn-modal-primary');
     if (btn) btn.disabled = true;
-    const maxConcurrent = parseInt(document.getElementById('setMaxConcurrent').value);
-    const requestInterval = parseFloat(document.getElementById('setInterval').value);
-    const maxRounds = parseInt(document.getElementById('setMaxRounds').value);
-    const mobileMaxRounds = parseInt(document.getElementById('setMobileMaxRounds').value);
+
+    const common = collectCommonValues();
     const scheduleEnabled = document.getElementById('setScheduleEnabled').checked;
-    const scheduleTime = document.getElementById('setScheduleTime').value;
-    const schanEnabled = document.getElementById('setSchanEnabled').checked;
-    const schanKey = document.getElementById('setSchanKey').value;
+    const merged = { ...common, ...advancedStaging };
 
-    if ([maxConcurrent, requestInterval, maxRounds, mobileMaxRounds].some(Number.isNaN)) {
-        showToast('请填写有效的数值', 'error');
+    const check = validateAll(common);
+    if (!check.ok) {
+        showToast(check.msg, 'error');
         if (btn) btn.disabled = false;
-        return;
-    }
-    if (maxConcurrent < 1 || maxConcurrent > 999 || requestInterval < 0.01 || requestInterval > 30 ||
-        maxRounds < 1 || maxRounds > 200 || mobileMaxRounds < 1 || mobileMaxRounds > 200) {
-        showToast('数值超出允许范围', 'error');
-        if (btn) btn.disabled = false;
+        // 若是高级区字段错误，提示用户从版本号入口进入修改
+        const fieldSchema = (window.__settingsSchema || {})[check.field];
+        if (fieldSchema && fieldSchema.advanced) {
+            setTimeout(() => showToast(`请单击版本号进入"高级设置"修改 ${fieldSchema.label || check.field}`, 'error'), 1200);
+        }
         return;
     }
 
-    if (requestInterval > 0) {
-        const totalRps = maxConcurrent / requestInterval;
+    // 风控预警（与原项目一致：> 50 次/秒时弹二次确认）
+    if (common.request_interval > 0) {
+        const totalRps = common.max_concurrent / common.request_interval;
         if (totalRps > 50) {
             const confirmed = await showConfirmDialog(
                 '并发过大可能导致账号或IP风控',
-                `当前设置理论最大请求频率为 ${totalRps.toFixed(1)} 次/秒（${maxConcurrent} 并发 ÷ ${requestInterval}s 间隔）`,
+                `当前设置理论最大请求频率为 ${totalRps.toFixed(1)} 次/秒（${common.max_concurrent} 并发 ÷ ${common.request_interval}s 间隔）`,
                 '确认保存',
                 '我再想想'
             );
@@ -2623,22 +3214,14 @@ async function doSaveSettings() {
     try {
         await api('/api/settings', {
             method: 'PUT',
-            body: {
-                max_concurrent: maxConcurrent,
-                request_interval: requestInterval,
-                max_rounds: maxRounds,
-                mobile_max_rounds: mobileMaxRounds,
-                schedule_time: scheduleTime,
-                schan_enabled: schanEnabled,
-                schan_key: schanKey,
-            },
+            body: merged,
         });
 
         if (scheduleEnabled) {
             try {
                 const result = await api('/api/schedule', {
                     method: 'POST',
-                    body: { time: scheduleTime },
+                    body: { time: common.schedule_time },
                 });
                 showToast(result.msg || '计划任务已创建', 'success');
             } catch (e) { showToast('请确保程序以管理员权限运行，且杀毒软件已经关闭', 'error'); }
@@ -2649,6 +3232,9 @@ async function doSaveSettings() {
         }
 
         showToast('设置已保存', 'success');
+        // 重置脏标记（保存成功后视为初始状态）
+        commonDirty = false;
+        advDirty = false;
         closeModalForce();
     } catch (e) { showToast(e.message || '保存失败', 'error'); }
     finally { if (btn) btn.disabled = false; }
@@ -2681,7 +3267,7 @@ function showConfirmDialog(title, message, confirmText, cancelText) {
     });
 }
 
-// ===== 搜索卡片交互（方案 3.3 搜索相关）=====
+// ===== 搜索卡片交互（搜索相关）=====
 // 三态：idle（未搜索折叠）/ expanded（展开输入中）/ searched（已搜索折叠金盘）
 // searchKeyword 非空 = 已搜索态；searchKeyword 空 + .expanded = 展开输入态
 
@@ -2783,7 +3369,7 @@ function bindSearchEvents() {
         }
     });
 
-    // 输入框键盘事件：Enter 执行搜索，Escape 仅折叠（保留已搜索态，方案 5.2）
+    // 输入框键盘事件：Enter 执行搜索，Escape 仅折叠（保留已搜索态）
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
         if (e.key === 'Escape') { e.preventDefault(); collapseSearch(); }
@@ -2814,7 +3400,7 @@ function bindSearchEvents() {
     }
 }
 
-// ===== 批量操作卡片交互（方案 3.3 批量操作相关）=====
+// ===== 批量操作卡片交互（批量操作相关）=====
 // 三态：idle（默认）→ select（启用·禁用·删除）→ confirm（确认文字 + ✓/✗）
 // 大量删除（>DELETE_RECONFIRM_THRESHOLD）触发输入"确认删除"二次确认弹窗
 const DELETE_RECONFIRM_THRESHOLD = 50;
@@ -2874,7 +3460,7 @@ function onBatchActionCancel() {
 }
 
 // 执行批量操作：收集 phones（搜索态调 fetchAllSearchResultPhones 拉全部匹配，非搜索态调 fetchAllPhones 拉全体）
-// 调 POST /api/accounts/batch {action, phones}（后端契约见方案 4.1；上限 1000，超限前端预检拦截）
+// 调 POST /api/accounts/batch {action, phones}（上限 1000，超限前端预检拦截）
 async function executeBatchAction() {
     const action = pendingBatchAction;
     if (!action) return;
@@ -2886,7 +3472,7 @@ async function executeBatchAction() {
         backToIdle();
         return;
     }
-    // phones 必须显式传列表（方案 5.5 决策：不接受 null）
+    // phones 必须显式传列表（不接受 null）
     // 搜索态：拉全部匹配的 phones（fetchAllSearchResultPhones）；非搜索态：拉全体 phones（fetchAllPhones）
     let phones = null;
     if (isSearching()) {
