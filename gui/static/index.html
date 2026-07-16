@@ -33,18 +33,52 @@
 
   <main class="main-content">
     <section class="stats-bar" id="statsBar">
-      <div class="stat-card">
-        <div class="stat-value" id="totalAccounts">0</div>
-        <div class="stat-label">账号数</div>
+      <!-- 第一张：启用 / 总数 合并卡片 -->
+      <div class="stat-card" id="statCount">
+        <div class="stat-count">
+          <span id="enabledCount">0</span><span class="sep">/</span><span class="total" id="totalCount">0</span>
+        </div>
+        <div class="stat-label">启用 / 总数</div>
       </div>
-      <div class="stat-card">
-        <div class="stat-value" id="activeAccounts">0</div>
-        <div class="stat-label">已启用</div>
+
+      <!-- 第二张：批量操作卡片（三态变形 idle→select→confirm） -->
+      <div class="stat-card is-action" id="batchAction">
+        <div class="action-morph">
+          <!-- 态0 idle：默认 -->
+          <div class="action-state as-idle active">
+            <svg class="idle-icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg>
+            <span class="idle-text">批量操作</span>
+          </div>
+          <!-- 态1 select：启用·禁用·删除 -->
+          <div class="action-state as-select">
+            <span class="action-text" data-action="enable">启用</span>
+            <span class="action-sep">·</span>
+            <span class="action-text" data-action="disable">禁用</span>
+            <span class="action-sep">·</span>
+            <span class="action-text is-danger" data-action="delete">删除</span>
+          </div>
+          <!-- 态2 confirm：确认文字 + ✓/✗ -->
+          <div class="action-state as-confirm">
+            <span class="confirm-text" id="confirmText">确认？</span>
+            <button type="button" class="confirm-btn ok" data-act="ok"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></button>
+            <button type="button" class="confirm-btn cancel" data-act="cancel"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
+          </div>
+        </div>
       </div>
-      <div class="stat-card">
-        <div class="stat-value" id="totalProgress">0/0</div>
-        <div class="stat-label">总进度</div>
+
+      <!-- 第三张：搜索卡片（折叠态占 1 格，展开态覆盖整行） -->
+      <div class="search-card" id="searchCard">
+        <div class="search-field">
+          <input type="text" class="search-input" id="searchInput" placeholder="搜索用户名 / 手机号 / 备注..." autocomplete="off" />
+          <div class="search-underline"></div>
+        </div>
       </div>
+
+      <!-- 搜索图标按钮（绝对定位于 .stats-bar，与卡片宽度动画解耦） -->
+      <button type="button" class="search-icon-btn" id="searchIconBtn" aria-label="搜索" data-tooltip="右键清除搜索结果">
+        <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"></circle><line x1="16.5" y1="16.5" x2="21" y2="21"></line></svg>
+        <span class="icon-text">搜索账号</span>
+      </button>
     </section>
 
     <section class="action-bar">

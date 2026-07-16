@@ -19,7 +19,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from core.config import load_settings, save_settings, reload_settings, validate_settings, VERSION, SETTINGS_SCHEMA
 from core.db import DbAccountRepository
-from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, batch_get_account_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule
+from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, batch_get_account_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule, batch_update_accounts, get_enabled_accounts_by_phones
 
 logger = logging.getLogger(__name__)
 
@@ -117,35 +117,15 @@ class ClaimManager:
         """返回当前进度快照。
 
         Returns:
-            dict: 包含 running（布尔）、progress（各账号条目列表的深拷贝）、
-            total_progress（聚合的 watched/total 计数）。
+            dict: 包含 running（布尔）、progress（各账号条目列表的深拷贝）。
+            注：``pc_initial`` / ``pc_total`` / ``mobile_initial`` / ``mobile_total``
+            等字段仍保留在 progress 条目中（由 claim_for_account 写入，死字段但无害），
+            不再聚合为顶层汇总字段（前端已砍掉总进度卡片，按方案文档 §4.3 清理）。
         """
         with self._lock:
-            # 后端统计总进度（PC + 手机端）
-            total_watched = 0
-            total_items = 0
-            for e in self._progress:
-                # PC 端：初始已观看 + 本次领取
-                pc_initial = e.get("pc_initial", 0)
-                if e.get("phase") == "mobile":
-                    pc_claimed = e.get("pc_claimed", 0)
-                else:
-                    pc_claimed = e.get("current", 0)
-                total_watched += pc_initial + pc_claimed
-                total_items += e.get("pc_total", 0)
-
-                # 手机端：初始已观看 + 本次领取（仅 phase=mobile 时有增量）
-                if e.get("phase") == "mobile":
-                    mobile_claimed = e.get("current", 0)
-                else:
-                    mobile_claimed = 0
-                total_watched += e.get("mobile_initial", 0) + mobile_claimed
-                total_items += e.get("mobile_total", 0)
-
             return {
                 "running": self._running,
                 "progress": copy.deepcopy(self._progress),
-                "total_progress": {"watched": total_watched, "total": total_items},
             }
 
     def add_progress_entry(self, entry: dict[str, Any]) -> None:
@@ -250,14 +230,26 @@ def get_accounts():
     if offset < 0:
         offset = 0
 
-    accounts, total = repo.list_page(offset, limit)
+    # 搜索态：q 非空时调 list_page_search 走 name/phone/remark 子串模糊匹配
+    # 非搜索态：q 为空或不传时走 list_page 全体分页（行为同现状）
+    q = request.args.get("q", "").strip()
+    if q:
+        accounts, total = repo.list_page_search(offset, limit, q)
+        # 搜索态额外返回匹配结果中的启用数（合并卡片搜索态显示 m/n 用）
+        enabled = repo.count_search_enabled(q)
+    else:
+        accounts, total = repo.list_page(offset, limit)
+        enabled = None
     filtered_accounts = [{k: v for k, v in acc.items() if k in BASE_FIELDS} for acc in accounts]
-    return jsonify({
+    resp = {
         "accounts": filtered_accounts,
         "total": total,
         "offset": offset,
         "limit": limit,
-    })
+    }
+    if enabled is not None:
+        resp["enabled"] = enabled
+    return jsonify(resp)
 
 
 @app.route("/api/accounts/stats", methods=["GET"])
@@ -368,6 +360,37 @@ def delete_account(phone):
         logger.error("删除账号失败: %s", e)
         return error_response("保存账号失败，请检查磁盘空间或文件权限", 500)
     return jsonify({"ok": True})
+
+
+@app.route("/api/accounts/batch", methods=["POST"])
+def batch_accounts():
+    """批量启用/禁用/删除账号。
+
+    请求体：{"action": "enable"|"disable"|"delete", "phones": ["138...", ...]}
+    - action 必传，phones 必传且为数组，上限 1000（防止误操作）
+    - 单条失败不影响其他，返回 failed 列表告知前端
+
+    响应成功：{"ok": true, "affected": int, "failed": ["139...", ...]}
+    """
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    phones = data.get("phones")
+
+    if not action or phones is None:
+        return error_response("缺少 action/phones 参数", 400)
+    if action not in ("enable", "disable", "delete"):
+        return error_response("action 必须是 enable/disable/delete", 400)
+    if not isinstance(phones, list):
+        return error_response("phones 必须是数组", 400)
+    if len(phones) > 1000:
+        return error_response("phones 数量超过上限 1000", 400)
+
+    try:
+        result = batch_update_accounts(phones, action)
+    except Exception as e:
+        logger.error("批量操作失败: %s", e)
+        return error_response("批量操作失败，请检查磁盘空间或文件权限", 500)
+    return jsonify(result)
 
 
 @app.route("/api/accounts/<phone>/mobile_status", methods=["GET"])
@@ -498,13 +521,34 @@ def _start_claim_thread(enabled, settings, tag=""):
 
 @app.route("/api/claim", methods=["POST"])
 def start_claim():
-    """启动领取任务，后台线程执行。"""
+    """启动领取任务，后台线程执行。
+
+    支持可选 phones 参数（搜索态下"开始领取"只领搜索结果中启用的账号）：
+    - 请求体含 phones（非空数组）：只领这些 phone 中 enabled=True 的账号
+    - 请求体无 phones 或为空：走 repo.list_enabled() 全体（非搜索态）
+    CLI 触发的 /api/cli-trigger-claim 不走此路径，始终领全体。
+    """
     if not claim_mgr.start():
         return error_response("领取正在进行中")
 
     # 领取前显式刷新 settings 缓存，确保使用最新配置（用户可能在领取前刚改过设置）
     settings = reload_settings()
-    enabled = repo.list_enabled()
+    data = request.get_json(silent=True) or {}
+    phones = data.get("phones")
+    if phones is not None:
+        # 显式传了 phones：只领这些 phone 中 enabled 的账号（搜索态）
+        if not isinstance(phones, list) or not phones:
+            claim_mgr.finish()  # 回滚 running 状态
+            return error_response("phones 必须是非空数组", 400)
+        # 上限 10000（高于 /api/accounts/batch 的 1000）：claim 为只读查询操作，无写锁风险，
+        # 仅用于筛选 enabled 账号；batch 是写操作（启用/禁用/删除），长时间持锁风险高故上限 1000
+        if len(phones) > 10000:
+            claim_mgr.finish()
+            return error_response("phones 数量超过上限", 400)
+        enabled = get_enabled_accounts_by_phones(phones)
+    else:
+        # 未传 phones：走全体（非搜索态）
+        enabled = repo.list_enabled()
 
     if not _start_claim_thread(enabled, settings):
         return error_response("启动领取失败，请重试", 500)

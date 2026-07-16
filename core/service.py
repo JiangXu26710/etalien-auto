@@ -452,6 +452,71 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
     return results
 
 
+def batch_update_accounts(phones: list[str], action: str) -> dict:
+    """批量启用/禁用/删除账号。
+
+    逐条操作，非原子：单条失败不影响其他，失败 phone 记录到 failed 列表。
+    SQLite 单连接 + _db_lock 已串行化写操作，但批量操作不引入事务（避免长时间持锁
+    阻塞其他读操作），按方案文档 §4.4 决策。
+
+    Args:
+        phones: 手机号列表（API 层已校验上限 1000 并去重，此处不重复校验）
+        action: ``"enable"`` / ``"disable"`` / ``"delete"``
+
+    Returns:
+        ``{"ok": True, "affected": int, "failed": list[str]}``：
+        - affected：实际成功处理的账号数
+        - failed：处理失败的 phone 列表（如 phone 不存在或写盘异常）
+    """
+    affected = 0
+    failed: list[str] = []
+    for phone in phones:
+        try:
+            if action == "enable":
+                ok = repo.update_fields(phone, enabled=True)
+            elif action == "disable":
+                ok = repo.update_fields(phone, enabled=False)
+            else:  # action == "delete"
+                ok = repo.delete(phone)
+            if ok:
+                affected += 1
+            else:
+                failed.append(phone)
+        except Exception as e:
+            logger.warning("batch_update_accounts %s for %s failed: %s", action, phone, e)
+            failed.append(phone)
+    return {"ok": True, "affected": affected, "failed": failed}
+
+
+def get_enabled_accounts_by_phones(phones: list[str]) -> list[dict]:
+    """按 phones 列表取 enabled 账号（供 /api/claim 搜索态用）。
+
+    遍历 phones 调 repo.get(phone)，过滤 enabled=True 的账号。
+    用于搜索态下"开始领取"只领搜索结果中启用账号的场景。
+
+    Args:
+        phones: 手机号列表（可能含不存在或重复的 phone）
+
+    Returns:
+        list[dict]：仅 enabled=True 的账号完整字典列表（含 auth_token / device_id
+        等字段，供 run_concurrent_claim 用）。重复 phone 自动去重。
+    """
+    result: list[dict] = []
+    seen: set[str] = set()
+    for phone in phones:
+        if phone in seen:
+            continue
+        seen.add(phone)
+        try:
+            account = repo.get(phone)
+        except Exception as e:
+            logger.warning("get_enabled_accounts_by_phones repo.get failed for %s: %s", phone, e)
+            continue
+        if account and account.get("enabled", True):
+            result.append(account)
+    return result
+
+
 def _get_cli_exe_path() -> str:
     """生成计划任务中 CLI 模式的执行命令路径。
 

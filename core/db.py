@@ -143,6 +143,62 @@ class DbAccountRepository:
             total = self._conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
             return rows, total
 
+    def list_page_search(self, offset: int, limit: int, keyword: str) -> tuple[list[dict], int]:
+        """分页搜索账号，按 name/phone/remark 子串模糊匹配，返回 (accounts, total)。
+
+        匹配规则（与方案文档 §4.1 一致）：
+        - name/remark 用 LOWER() 不区分大小写
+        - phone 全数字无大小写问题，直接 LIKE
+        - 子串包含（LIKE '%keyword%'）
+        - keyword 中的 ``%`` / ``_`` / ``\\`` 被 ESCAPE 转义，防止通配符注入
+        - 按 id ASC 排序（与 list_page 一致，新账号排在末尾）
+
+        Args:
+            offset: 偏移量（clamp 由 API 层负责，与 list_page 一致）
+            limit: 每页数量
+            keyword: 搜索关键词原始字符串（函数内部负责转义）
+
+        Returns:
+            (accounts, total)：accounts 为匹配的账号列表，total 为匹配总数
+        """
+        # 转义 LIKE 通配符：先转义 \ 自身，再转义 % 和 _（顺序不可换）
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        where_sql = (
+            "WHERE LOWER(name) LIKE LOWER(?) ESCAPE '\\' "
+            "OR phone LIKE ? ESCAPE '\\' "
+            "OR LOWER(remark) LIKE LOWER(?) ESCAPE '\\'"
+        )
+        with _db_lock:
+            cur = self._conn.execute(
+                f"SELECT * FROM accounts {where_sql} ORDER BY id ASC LIMIT ? OFFSET ?",
+                (pattern, pattern, pattern, limit, offset),
+            )
+            rows = [_row_to_dict(r) for r in cur.fetchall()]
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM accounts {where_sql}",
+                (pattern, pattern, pattern),
+            ).fetchone()[0]
+            return rows, total
+
+    def count_search_enabled(self, keyword: str) -> int:
+        """统计搜索关键词匹配的账号中启用数量（搜索态合并卡片用）。
+
+        匹配规则同 list_page_search（name/phone/remark 子串模糊，name/remark 不区分大小写）。
+        """
+        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        match_sql = (
+            "(LOWER(name) LIKE LOWER(?) ESCAPE '\\' "
+            "OR phone LIKE ? ESCAPE '\\' "
+            "OR LOWER(remark) LIKE LOWER(?) ESCAPE '\\')"
+        )
+        with _db_lock:
+            return self._conn.execute(
+                f"SELECT COUNT(*) FROM accounts WHERE {match_sql} AND enabled = 1",
+                (pattern, pattern, pattern),
+            ).fetchone()[0]
+
     def list_enabled(self) -> list[dict]:
         """列出启用账号（领取用），按 id DESC 排序。"""
         with _db_lock:

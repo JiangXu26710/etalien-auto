@@ -16,7 +16,11 @@
     --gold-dim: rgba(201, 168, 76, 0.15);
     --gold-glow: rgba(201, 168, 76, 0.08);
     --success: #4caf7d;
+    --success-dim: rgba(76, 175, 125, 0.12);
+    --success-border: rgba(76, 175, 125, 0.4);
     --error: #cf5c5c;
+    --error-dim: rgba(207, 92, 92, 0.12);
+    --error-border: rgba(207, 92, 92, 0.4);
     --warning: #d4a03c;
     --radius: 8px;
     --radius-lg: 12px;
@@ -236,6 +240,7 @@ body {
 }
 
 .stats-bar {
+    position: relative;
     display: grid;
     grid-template-columns: repeat(3, 1fr);
     gap: 12px;
@@ -252,6 +257,10 @@ body {
     transition: var(--transition);
     position: relative;
     overflow: hidden;
+    min-height: 70px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
 }
 
 .stat-card::before {
@@ -891,12 +900,12 @@ body {
     font-size: 13px;
 }
 
-/* 虚拟滚动下空状态：覆盖 grid-column 规则，作为唯一子节点居中 */
+/* 虚拟滚动下空状态：覆盖 grid-column 规则，作为唯一子节点居中（相对视口上移 130px） */
 .accounts-list .empty-state {
     position: absolute;
     top: 50%;
     left: 50%;
-    transform: translate(-50%, -50%);
+    transform: translate(-50%, calc(-50% - 130px));
     grid-column: auto;
 }
 
@@ -1993,4 +2002,459 @@ body {
 
 .info-icon:hover::after {
     opacity: 1;
+}
+
+/* ===== 合并卡片（启用 / 总数） ===== */
+.stat-count {
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--gold-light);
+    font-variant-numeric: tabular-nums;
+    margin-bottom: 4px;
+    letter-spacing: 1px;
+    line-height: 22px;
+}
+
+.stat-count .sep {
+    color: var(--text-muted);
+    margin: 0 2px;
+    font-weight: 500;
+}
+
+.stat-count .total {
+    color: var(--text-secondary);
+    font-size: 16px;
+}
+
+/* ===== 第二张：批量操作卡片（三态变形） ===== */
+.stat-card.is-action {
+    cursor: pointer;
+    user-select: none;
+}
+
+.stat-card.is-action.is-locked {
+    opacity: 0.4;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.action-morph {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.action-state {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 18px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.22s ease;
+}
+
+.action-state.active {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+/* 态0 idle：图标 + 文字，垂直布局 */
+.as-idle {
+    inset: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+
+.as-idle .idle-icon {
+    width: 22px;
+    height: 22px;
+    display: block;
+    fill: none;
+    stroke: var(--text-secondary);
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: stroke var(--transition);
+}
+
+.as-idle .idle-text {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    transition: color var(--transition);
+}
+
+.as-idle.icon-hover .idle-icon {
+    stroke: var(--gold-light);
+}
+
+.as-idle.icon-hover .idle-text {
+    color: var(--gold-light);
+}
+
+/* 态1 select：三个纯文字操作 */
+.as-select .action-text {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    cursor: pointer;
+    border-bottom: 1px solid transparent;
+    padding-bottom: 1px;
+    transition: color 0.15s ease, border-color 0.15s ease;
+    color: var(--text-secondary);
+}
+
+.as-select .action-text:hover {
+    border-bottom-color: currentColor;
+}
+
+.as-select .action-text[data-action="enable"]:hover {
+    color: var(--success);
+}
+
+.as-select .action-text[data-action="disable"]:hover {
+    color: var(--warning);
+}
+
+.as-select .action-text[data-action="delete"]:hover {
+    color: var(--error);
+}
+
+.as-select .action-sep {
+    color: var(--text-muted);
+    font-size: 15px;
+    font-weight: 700;
+}
+
+/* 态2 confirm：文字 + ✓/✗ */
+.as-confirm .confirm-text {
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: 0.5px;
+}
+
+.as-confirm .confirm-btn {
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: transparent;
+    cursor: pointer;
+    transition: var(--transition);
+    color: var(--text-secondary);
+    padding: 0;
+}
+
+.as-confirm .confirm-btn svg {
+    width: 12px;
+    height: 12px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.as-confirm .confirm-btn.ok:hover {
+    background: var(--success-dim);
+    border-color: var(--success-border);
+    color: var(--success);
+}
+
+.as-confirm .confirm-btn.cancel:hover {
+    background: var(--error-dim);
+    border-color: var(--error-border);
+    color: var(--error);
+}
+
+/* ===== 第三张：搜索卡片 + 搜索图标按钮 ===== */
+.search-card {
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    height: 100%;
+    width: calc((100% - 24px) / 3);
+    z-index: 20;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+                box-shadow 0.3s ease,
+                border-color 0.3s ease,
+                background 0.3s ease;
+}
+
+.search-card::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border-gold-dim), transparent);
+}
+
+.search-card:hover {
+    border-color: var(--border-gold-dim);
+    background: var(--bg-card-hover);
+}
+
+.search-card.expanded {
+    width: 100%;
+    z-index: 40;
+    cursor: default;
+    border-color: var(--border-gold);
+    background: var(--bg-card);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5), 0 0 30px rgba(201, 168, 76, 0.06);
+}
+
+.search-card.searched:not(.expanded) {
+    border-color: var(--border-gold-dim);
+}
+
+.search-field {
+    position: relative;
+    width: 100%;
+    height: 22px;
+    padding-right: 44px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease 0.1s;
+}
+
+.search-card.expanded .search-field {
+    opacity: 1;
+    pointer-events: auto;
+}
+
+.search-input {
+    width: 100%;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-size: 15px;
+    font-family: inherit;
+    line-height: 1.5;
+    padding: 0 0 8px;
+    transform: translateY(-4px);
+}
+
+.search-input::placeholder {
+    color: var(--text-muted);
+}
+
+.search-underline {
+    position: absolute;
+    left: 0;
+    right: 44px;
+    bottom: -1px;
+    height: 2px;
+    background: linear-gradient(90deg, var(--border-gold-dim), var(--gold-light));
+    transform: scaleX(0);
+    transform-origin: right center;
+    transition: transform 0.45s cubic-bezier(0.4, 0, 0.2, 1) 0.15s;
+    border-radius: 2px;
+}
+
+.search-card.expanded .search-underline {
+    transform: scaleX(1);
+}
+
+/* 搜索图标按钮：绝对定位于 .stats-bar，与卡片宽度动画解耦 */
+.search-icon-btn {
+    position: absolute;
+    top: 50%;
+    transform: translateY(-50%);
+    right: calc((100% - 24px) / 6 - 30px);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    padding: 4px 8px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    color: var(--text-secondary);
+    border-radius: var(--radius);
+    z-index: 50;
+    transition: right 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+                color var(--transition),
+                background var(--transition);
+}
+
+.search-icon-btn svg {
+    width: 22px;
+    height: 22px;
+    display: block;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    position: relative;
+    z-index: 1;
+    transition: stroke var(--transition);
+}
+
+.search-icon-btn::before {
+    content: '';
+    position: absolute;
+    top: 1px;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--gold), #8b6914);
+    opacity: 0;
+    transition: opacity 0.35s ease;
+}
+
+.search-icon-btn .icon-text {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-muted);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    opacity: 1;
+    transition: opacity 0.2s ease, color var(--transition);
+}
+
+.search-icon-btn:hover {
+    color: var(--gold-light);
+}
+
+.search-icon-btn:hover .icon-text {
+    color: var(--gold-light);
+}
+
+.search-card.expanded ~ .search-icon-btn .icon-text {
+    opacity: 0;
+}
+
+.search-card.expanded ~ .search-icon-btn {
+    right: 20px;
+    color: var(--gold-light);
+}
+
+.search-card.searched ~ .search-icon-btn {
+    color: var(--bg-deep);
+    box-shadow: none;
+}
+
+.search-card.searched ~ .search-icon-btn::before {
+    opacity: 1;
+}
+
+.search-card.searched ~ .search-icon-btn:hover {
+    color: var(--gold-light);
+}
+
+.search-card.searched.expanded ~ .search-icon-btn {
+    color: var(--gold-light);
+    box-shadow: none;
+}
+
+.search-card.searched.expanded ~ .search-icon-btn::before {
+    opacity: 0;
+}
+
+.search-card.searched.expanded ~ .search-icon-btn:hover {
+    background: var(--gold-dim);
+}
+
+/* 已搜索状态：图标 hover 提示（与 .flip-btn::after 风格一致，1s 延迟显示） */
+.search-card.searched ~ .search-icon-btn::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-gold-dim);
+    border-radius: var(--radius);
+    padding: 6px 10px;
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--text-primary);
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+    transition-delay: 0s;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    z-index: 100;
+}
+
+.search-card.searched ~ .search-icon-btn:hover::after {
+    opacity: 1;
+    transition-delay: 1s;
+}
+
+/* ===== 批量删除二次确认弹窗（输入"确认删除"文本） ===== */
+.modal-input-confirm {
+    margin-top: 12px;
+}
+
+.modal-input-confirm input {
+    width: 100%;
+    padding: 10px 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-primary);
+    font-size: 14px;
+    font-family: inherit;
+    outline: none;
+    transition: var(--transition);
+}
+
+.modal-input-confirm input:focus {
+    border-color: var(--error);
+    box-shadow: 0 0 0 2px var(--error-dim);
+}
+
+.modal-input-confirm input::placeholder {
+    color: var(--text-muted);
+}
+
+.modal-input-confirm input.shake {
+    animation: shakeX 0.4s ease;
+    border-color: var(--error);
+}
+
+@keyframes shakeX {
+    0%, 100% { transform: translateX(0); }
+    15% { transform: translateX(-8px); }
+    30% { transform: translateX(8px); }
+    45% { transform: translateX(-6px); }
+    60% { transform: translateX(6px); }
+    75% { transform: translateX(-3px); }
+}
+
+/* 禁用态：降低不透明度 + 禁止光标（保留点击触发抖动） */
+.btn-modal:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+    pointer-events: auto;
 }

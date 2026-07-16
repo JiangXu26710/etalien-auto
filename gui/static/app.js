@@ -8,15 +8,33 @@ let dragInitiating = false;
 let refreshPromise = null;
 let modalMouseDownTarget = null;
 let vipFloatShown = new Set();
-let prevStats = { total: 0, active: 0, watched: 0, items: 0 };
+let prevStats = { total: 0, active: 0 };
 // 顶部"已启用"卡片数字来自后端 /api/accounts/stats（前端分页缓存无法统计全部账号）
 let statsFromBackend = { enabled: 0 };
 let hasRenderedOnce = false;
 let logMouseDownTarget = null;
 let menuCounter = 0;
 
+// ===== 搜索 + 批量操作卡片状态（方案 3.3）=====
+// searchState 三态：'idle'（未搜索，折叠）/ 'expanded'（展开输入中）/ 'searched'（已搜索，折叠金盘）
+let searchState = 'idle';
+// 当前搜索关键词（非空字符串表示处于已搜索态）
+let searchKeyword = '';
+// 搜索结果 phone 集合（已搜索态时批量操作 + 开始领取用）
+const searchResultPhones = new Set();
+// 搜索结果总数（替代搜索态下的 totalCount 用于虚拟滚动撑高）
+let searchTotalCount = 0;
+// 搜索结果中的启用数（搜索态合并卡片显示 m/n 用）
+let searchEnabled = 0;
+// 批量操作三态：'idle' / 'select' / 'confirm'
+let batchActionState = 'idle';
+// 待执行的批量操作类型：'enable' / 'disable' / 'delete'
+let pendingBatchAction = null;
+// 添加账号暂存信息：step1 提交后 form 被 modal 替换，onAccountAdded 在搜索态需读取做匹配预判（决策#3）
+let pendingAddedAccountInfo = null;
+
 // vipFloatShown: 已显示过飘字动画的账号集合（PC/手机端），防止轮询重复触发
-// prevStats: 上一轮统计值（total/active/watched/items），供 animateValue/animateProgress 做滚动计数
+// prevStats: 上一轮统计值（total/active），供 animateValue 做滚动计数
 // hasRenderedOnce: 首批卡片渲染标志，控制卡片入场交错动画是否播放（虚拟滚动下滚动替换不重置）
 // logMouseDownTarget: 日志弹窗 mousedown 目标，用于遮罩层点击关闭检测
 // menuCounter: 自增计数器，为 action-menu-wrap 生成唯一 ID
@@ -365,20 +383,6 @@ function animateValue(el, start, end, duration) {
     requestAnimationFrame(update);
 }
 
-function animateProgress(el, startW, endW, startT, endT, duration) {
-    const startTime = performance.now();
-    function update(now) {
-        const elapsed = now - startTime;
-        const progress = Math.min(elapsed / duration, 1);
-        const eased = 1 - Math.pow(1 - progress, 3);
-        const w = Math.round(startW + (endW - startW) * eased);
-        const t = Math.round(startT + (endT - startT) * eased);
-        el.textContent = w + '/' + t;
-        if (progress < 1) requestAnimationFrame(update);
-    }
-    requestAnimationFrame(update);
-}
-
 /**
  * 更新账号卡片的进度条与进度文本。
  * phase='mobile' 时更新手机端面（card-back），否则更新 PC 面（card-front）。
@@ -423,7 +427,7 @@ function updateCardProgress(phone, current, total, phase) {
         fill.classList.remove('complete');
     }
     label.textContent = `${newWatched}/${totalItems}`;
-    // 总进度由 pollClaimProgress 从后端 total_progress 字段统一更新，此处不再前端聚合
+    // 总进度卡片已移除，此处仅更新单卡进度条（不再聚合总进度）
 }
 
 async function api(path, options = {}) {
@@ -566,7 +570,17 @@ function refreshAll() {
         inFlightPhones.clear();
         // 1. 清除所有账号的"已查询"标记，触发懒加载重新查询可见 phone
         queriedPhones.clear();
-        // 2. 保留 pageCache 与 statusCache 不清空（兜底渲染，避免占位闪烁）
+        // 2. 搜索态：清空搜索结果缓存，重新拉搜索结果首页刷新 searchTotalCount（保持搜索状态，方案 3.3）
+        //    非搜索态：保留 pageCache 与 statusCache 不清空（兜底渲染，避免占位闪烁）
+        if (isSearching()) {
+            pageCache.clear();
+            searchResultPhones.clear();
+            pageCacheVersion++;
+            fetchAccountsPage(0, viewportCapacity || 24, searchKeyword).then(() => {
+                renderViewport();
+                startLazyLoadPolling();
+            }).catch(e => console.error('refreshAll search fetchAccountsPage error:', e));
+        }
         // 3. 清除 mobileStatusCache 并重置 flippedPhones（所有卡片回到正面）
         Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
         flippedPhones.clear();
@@ -625,34 +639,52 @@ function mergeAccountWithStatus(acc, status) {
     };
 }
 
-// 拉取分页数据并写入 pageCache（方案 3.1 接口）
-async function fetchAccountsPage(offset, limit) {
-    const data = await api(`/api/accounts?offset=${offset}&limit=${limit}`);
+// 拉取分页数据并写入 pageCache（方案 3.1 接口 + 方案 3.3 搜索态复合 key）
+// keyword 非空时为搜索态：调 GET /api/accounts?offset=&limit=&q=，写 pageCache 用复合 key
+//   (offset + ':' + keyword)，更新 searchTotalCount + 累加 searchResultPhones。
+async function fetchAccountsPage(offset, limit, keyword) {
+    const q = keyword || '';
+    const url = `/api/accounts?offset=${offset}&limit=${limit}` + (q ? `&q=${encodeURIComponent(q)}` : '');
+    const data = await api(url);
     const accounts = data.accounts || [];
-    pageCache.set(offset, accounts);
+    pageCache.set(getEffectivePageCacheKey(offset), accounts);
     pageCacheVersion++;
-    if (typeof data.total === 'number') totalCount = data.total;
+    if (typeof data.total === 'number') {
+        if (q) {
+            searchTotalCount = data.total;
+            searchEnabled = typeof data.enabled === 'number' ? data.enabled : 0;
+            for (const a of accounts) {
+                if (a && a.phone) searchResultPhones.add(a.phone);
+            }
+        } else {
+            totalCount = data.total;
+        }
+    }
     return accounts;
 }
 
-// 拉取后端账号统计（总数 + 启用数），刷新顶部"已启用"卡片。
-// total/totalProgress 用 prevStats 占位，仅更新 enabled，避免与 renderViewport 的聚合值打架。
+// 拉取后端账号统计（总数 + 启用数），刷新顶部合并卡片（搜索态显示搜索结果 m/n，非搜索态显示全体）。
 async function fetchStats() {
     try {
         const data = await api('/api/accounts/stats');
         if (typeof data.total === 'number') totalCount = data.total;
         if (typeof data.enabled === 'number') {
             statsFromBackend.enabled = data.enabled;
-            updateStats(totalCount, data.enabled, prevStats.watched, prevStats.items);
+            refreshStatsCard();
         }
     } catch (e) { /* 统计失败静默，不影响主流程 */ }
 }
 
 // 在 pageCache 中查找 phone 所在页 + 页内索引（未找到返回 null）
+// 兼容搜索态复合 key（'offset:keyword'）：返回的 offset 始终是数字，cacheKey 为完整 key 字符串
 function findInPageCache(phone) {
-    for (const [offset, page] of pageCache) {
+    for (const [cacheKey, page] of pageCache) {
         const idx = page.findIndex(a => a.phone === phone);
-        if (idx >= 0) return { offset, idxInPage: idx, page };
+        if (idx >= 0) {
+            // cacheKey 格式：'offset' 或 'offset:keyword'，取冒号前数字部分作为 numeric offset
+            const numericOffset = parseInt(cacheKey, 10) || 0;
+            return { offset: numericOffset, cacheKey, idxInPage: idx, page };
+        }
     }
     return null;
 }
@@ -663,6 +695,24 @@ function updatePageCacheEntry(phone, patch) {
     if (!found) return false;
     Object.assign(found.page[found.idxInPage], patch);
     return true;
+}
+
+// ===== 搜索态与虚拟滚动的联动辅助（方案 3.3）=====
+// 是否处于已搜索态（searchKeyword 非空表示已执行过搜索）
+function isSearching() {
+    return searchKeyword !== '';
+}
+
+// 虚拟滚动应使用的总数：搜索态返回 searchTotalCount，非搜索态返回 totalCount
+// 用于撑高层、computeVisibleRange、clampScrollTop、lazyLoadTick 等
+function getEffectiveTotalCount() {
+    return isSearching() ? searchTotalCount : totalCount;
+}
+
+// pageCache 的 key：搜索态用复合 key 'offset:keyword' 防止与全体缓存冲突
+// 非搜索态直接用 offset 数字字符串（保持与历史调用兼容）
+function getEffectivePageCacheKey(offset) {
+    return isSearching() ? `${offset}:${searchKeyword}` : String(offset);
 }
 
 // 从 CSS 变量 --card-base-height 读取单卡基准高度
@@ -718,11 +768,12 @@ function ensureVirtualStructure(listEl) {
 }
 
 // clamp scrollTop 到 [0, max(0, 总高度 - viewportH)]
-// 总高度按"总行数 × 行高"计算，考虑多列并排布局
+// 总高度按"总行数 × 行高"计算，考虑多列并排布局；搜索态用 getEffectiveTotalCount()
 function clampScrollTop(scrollTop, viewportH) {
     const columns = getColumns();
     const rowHeight = getRowHeight();
-    const totalRows = Math.ceil(totalCount / columns);
+    const effectiveTotal = getEffectiveTotalCount();
+    const totalRows = Math.ceil(effectiveTotal / columns);
     const totalH = Math.max(0, totalRows * rowHeight - CARD_GAP);
     const maxScroll = Math.max(0, totalH - viewportH);
     return Math.max(0, Math.min(scrollTop, maxScroll));
@@ -731,8 +782,10 @@ function clampScrollTop(scrollTop, viewportH) {
 // 计算渲染区间 [start, end)，含上下各 1 屏缓冲（按行计算，区间边界对齐到整行）
 // 多列布局下：visibleRows = floor(viewportH / rowHeight)，capacity = visibleRows * columns
 // 同时返回纯视口区间 viewport（无缓冲），懒加载只查 viewport 范围
+// 搜索态下用 searchTotalCount 替代 totalCount（方案 6.7）
 function computeVisibleRange(scrollTop, viewportH) {
-    if (totalCount === 0) return { visible: { start: 0, end: 0 }, viewport: { start: 0, end: 0 } };
+    const effectiveTotal = getEffectiveTotalCount();
+    if (effectiveTotal === 0) return { visible: { start: 0, end: 0 }, viewport: { start: 0, end: 0 } };
     const columns = getColumns();
     const rowHeight = getRowHeight();
     const visibleRows = Math.max(1, Math.floor(viewportH / rowHeight));
@@ -741,20 +794,20 @@ function computeVisibleRange(scrollTop, viewportH) {
     const bufferRows = visibleRows; // 上下各 1 屏缓冲（按行）
     const firstVisibleRow = Math.floor(scrollTop / rowHeight);
     const startRow = Math.max(0, firstVisibleRow - bufferRows);
-    const endRow = Math.min(Math.ceil(totalCount / columns), firstVisibleRow + visibleRows + bufferRows);
+    const endRow = Math.min(Math.ceil(effectiveTotal / columns), firstVisibleRow + visibleRows + bufferRows);
     // 纯视口区间（无缓冲）：基于 scrollTop + viewportH 计算最后像素可见行，
-    // 避免 totalCount 不满整数屏时 maxScroll 不足以让 firstVisibleRow 跨行，
+    // 避免 effectiveTotal 不满整数屏时 maxScroll 不足以让 firstVisibleRow 跨行，
     // 导致最后一行卡片永远进不了 viewportRange（懒加载漏查）
     const lastVisibleRow = Math.floor((scrollTop + viewportH - 1) / rowHeight);
-    const vpEndRow = Math.min(Math.ceil(totalCount / columns), lastVisibleRow + 1);
+    const vpEndRow = Math.min(Math.ceil(effectiveTotal / columns), lastVisibleRow + 1);
     return {
         visible: {
             start: startRow * columns,
-            end: Math.min(totalCount, endRow * columns)
+            end: Math.min(effectiveTotal, endRow * columns)
         },
         viewport: {
             start: firstVisibleRow * columns,
-            end: Math.min(totalCount, vpEndRow * columns)
+            end: Math.min(effectiveTotal, vpEndRow * columns)
         }
     };
 }
@@ -830,8 +883,8 @@ function handleWheel(e) {
     // 每次事件跳一行（鼠标滚轮一格 = 一次事件 = 一行，不受 Windows 滚动速度设置影响）
     wheelTargetRow += Math.sign(e.deltaY);
 
-    // clamp 到 [0, totalRows-1]
-    const totalRows = Math.ceil(totalCount / getColumns());
+    // clamp 到 [0, totalRows-1]；搜索态用 getEffectiveTotalCount()（方案 6.8）
+    const totalRows = Math.ceil(getEffectiveTotalCount() / getColumns());
     wheelTargetRow = Math.max(0, Math.min(wheelTargetRow, Math.max(0, totalRows - 1)));
 
     // 启动或更新动画
@@ -897,19 +950,28 @@ function initVirtualScrollOnce() {
 }
 
 // 基于 visibleRange 渲染当前视口（含分页缺失时按需请求）
+// 搜索态下用 getEffectiveTotalCount() 撑高 + 复合 key 读取 pageCache + 传 searchKeyword 拉分页
+// 合并卡片始终显示全体 totalCount / statsFromBackend.enabled（不随搜索变化）
 function renderViewport() {
     const listEl = document.getElementById('accountsList');
     if (!listEl) return;
     const { spacer, render } = ensureVirtualStructure(listEl);
 
-    // 空列表
-    if (totalCount === 0) {
+    // 空列表（含搜索无结果）：合并卡片始终显示全体，不归零
+    const effectiveTotal = getEffectiveTotalCount();
+    if (effectiveTotal === 0) {
         // 无卡片时清理 body 中残留的 menu 孤儿
         document.body.querySelectorAll(':scope > .action-menu').forEach(m => m.remove());
         spacer.style.height = '0px';
         render.style.transform = 'translateY(0px)';
-        render.innerHTML = '<div class="empty-state">暂无账号，点击"添加账号"开始</div>';
-        updateStats(0, 0, 0, 0);
+        // 撑满视口高度，使 .empty-state 的 top:50% 相对可视区居中
+        // 否则 .virtual-render 内容高度为 0，top:50%=0 导致提示文字被上边框切割
+        render.style.height = listEl.clientHeight + 'px';
+        const emptyText = isSearching()
+            ? `未找到匹配 "${escapeHtml(searchKeyword)}" 的账号`
+            : '暂无账号，点击"添加账号"开始';
+        render.innerHTML = `<div class="empty-state">${emptyText}</div>`;
+        refreshStatsCard();
         hasRenderedOnce = true;
         // 失效渲染快照，确保下次非空列表时不被早退跳过
         lastRender = { start: -1, end: -1, total: -1, pageVer: -1, gen: -1 };
@@ -917,13 +979,15 @@ function renderViewport() {
     }
 
     const viewportH = listEl.clientHeight;
+    // 重置空状态残留的显式高度，让 grid 内容自然撑开 .virtual-render
+    render.style.height = '';
     const ranges = computeVisibleRange(listEl.scrollTop, viewportH);
     const range = ranges.visible;
     viewportRange = ranges.viewport;
-    // 早退：range/totalCount/pageCache/refreshGen 均未变化时跳过 innerHTML 重建
+    // 早退：range/effectiveTotal/pageCache/refreshGen 均未变化时跳过 innerHTML 重建
     // wheel 动画期间每帧可能调用 renderViewport 但 range 未跨行变化，避免无谓 DOM 重建
     if (range.start === lastRender.start && range.end === lastRender.end
-        && totalCount === lastRender.total
+        && effectiveTotal === lastRender.total
         && pageCacheVersion === lastRender.pageVer
         && refreshGeneration === lastRender.gen) {
         return;
@@ -933,12 +997,12 @@ function renderViewport() {
     const prevStart = visibleRange.start;
     const prevEnd = visibleRange.end;
     visibleRange = range;
-    lastRender = { start: range.start, end: range.end, total: totalCount, pageVer: pageCacheVersion, gen: refreshGeneration };
+    lastRender = { start: range.start, end: range.end, total: effectiveTotal, pageVer: pageCacheVersion, gen: refreshGeneration };
 
     // 撑高层 + 渲染层偏移（按行计算，考虑多列并排）
     const columns = getColumns();
     const rowHeight = getRowHeight();
-    const totalRows = Math.ceil(totalCount / columns);
+    const totalRows = Math.ceil(effectiveTotal / columns);
     spacer.style.height = Math.max(0, totalRows * rowHeight - CARD_GAP) + 'px';
     const startRow = Math.floor(range.start / columns);
     render.style.transform = `translateY(${startRow * rowHeight}px)`;
@@ -948,14 +1012,15 @@ function renderViewport() {
         cleanupFlippedOutsideRange();
     }
 
-    // 收集区间内的账号（按页对齐拉取，缺失页异步请求）
+    // 收集区间内的账号（按页对齐拉取，缺失页异步请求；搜索态用复合 key + 传 keyword）
     const capacity = viewportCapacity;
     const pendingPages = new Set();
     const slots = [];
     for (let i = range.start; i < range.end; i++) {
         const pageOffset = Math.floor(i / capacity) * capacity;
-        if (pageCache.has(pageOffset)) {
-            const page = pageCache.get(pageOffset);
+        const cacheKey = getEffectivePageCacheKey(pageOffset);
+        if (pageCache.has(cacheKey)) {
+            const page = pageCache.get(cacheKey);
             const idxInPage = i - pageOffset;
             slots.push({ acc: page[idxInPage] || null, absoluteIdx: i });
         } else {
@@ -965,7 +1030,7 @@ function renderViewport() {
             if (!pendingPages.has(pageOffset) && !pendingPageRequests.has(pageOffset)) {
                 pendingPages.add(pageOffset);
                 pendingPageRequests.add(pageOffset);
-                fetchAccountsPage(pageOffset, capacity).then(() => {
+                fetchAccountsPage(pageOffset, capacity, searchKeyword).then(() => {
                     pendingPageRequests.delete(pageOffset);
                     renderViewport();
                     // 新卡片已渲染到 DOM，确保懒加载 timer 运行（空闲态 timer 可能已被停止）
@@ -991,8 +1056,7 @@ function renderViewport() {
         }
     }
 
-    // 渲染卡片 + 聚合统计（已启用数由后端 /api/accounts/stats 提供，前端不再聚合）
-    let totalWatched = 0, totalItems = 0;
+    // 渲染卡片（已启用数由后端 /api/accounts/stats 提供，前端不再聚合总进度）
     render.innerHTML = slots.map(({ acc, absoluteIdx }) => {
         if (!acc) {
             // 该位置分页加载中，渲染加载占位
@@ -1000,24 +1064,6 @@ function renderViewport() {
         }
         const status = statusCache.get(acc.phone) || buildDefaultPlaceholder(acc.phone);
         const s = mergeAccountWithStatus(acc, status);
-        // 聚合统计（口径与原 renderAccounts 一致）
-        if (s.token_valid && s.enabled) {
-            const ct = s.claim_target || 'all';
-            if (ct !== 'mobile') {
-                const [w, t] = (s.progress || '0/0').split('/').map(Number);
-                if (!isNaN(w) && !isNaN(t)) {
-                    totalWatched += w;
-                    totalItems += t;
-                }
-            }
-            if (ct !== 'pc' && s.mobile_progress) {
-                const [mw, mt] = s.mobile_progress.split('/').map(Number);
-                if (!isNaN(mw) && !isNaN(mt)) {
-                    totalWatched += mw;
-                    totalItems += mt;
-                }
-            }
-        }
         return buildCardHTML(s, absoluteIdx);
     }).join('');
 
@@ -1049,7 +1095,8 @@ function renderViewport() {
         }
     });
 
-    updateStats(totalCount, statsFromBackend.enabled, totalWatched, totalItems);
+    // 合并卡片：搜索态显示搜索结果 m/n，非搜索态显示全体 m/n
+    refreshStatsCard();
     // 仅当当前视口内所有分页都已加载（无 acc=null 占位）时才标记 hasRenderedOnce。
     // 否则异步分页加载完成的二次 renderViewport 会因 hasRenderedOnce=true 给所有卡片加 no-anim，
     // 经 render.innerHTML 重建 DOM 后覆盖掉首批卡片的进场动画。
@@ -1059,43 +1106,21 @@ function renderViewport() {
     }
 }
 
-// 更新顶部统计数字
-function updateStats(total, active, watched, items) {
+// 更新顶部合并卡片数字（启用数 / 总数）。签名 2 参数（删除总进度后无 watched/items）
+function updateStats(total, active) {
     const dur = 300;
-    animateValue(document.getElementById('totalAccounts'), prevStats.total, total, dur);
-    animateValue(document.getElementById('activeAccounts'), prevStats.active, active, dur);
-    animateProgress(document.getElementById('totalProgress'), prevStats.watched, watched, prevStats.items, items, dur);
-    prevStats = { total, active, watched, items };
+    animateValue(document.getElementById('totalCount'), prevStats.total, total, dur);
+    animateValue(document.getElementById('enabledCount'), prevStats.active, active, dur);
+    prevStats = { total, active };
 }
 
-// 重新聚合统计数字（局部更新后用，遍历已加载的 pageCache）
-// 注：仅聚合总进度（watched/items），已启用数由 fetchStats() 从后端获取
-function reaggregateStats() {
-    let totalWatched = 0, totalItems = 0;
-    for (const [, page] of pageCache) {
-        for (const acc of page) {
-            const status = statusCache.get(acc.phone) || buildDefaultPlaceholder(acc.phone);
-            const s = mergeAccountWithStatus(acc, status);
-            if (s.token_valid && s.enabled) {
-                const ct = s.claim_target || 'all';
-                if (ct !== 'mobile') {
-                    const [w, t] = (s.progress || '0/0').split('/').map(Number);
-                    if (!isNaN(w) && !isNaN(t)) {
-                        totalWatched += w;
-                        totalItems += t;
-                    }
-                }
-                if (ct !== 'pc' && s.mobile_progress) {
-                    const [mw, mt] = s.mobile_progress.split('/').map(Number);
-                    if (!isNaN(mw) && !isNaN(mt)) {
-                        totalWatched += mw;
-                        totalItems += mt;
-                    }
-                }
-            }
-        }
+// 刷新合并卡片：搜索态显示搜索结果 m/n，非搜索态显示全体 m/n
+function refreshStatsCard() {
+    if (isSearching()) {
+        updateStats(searchTotalCount, searchEnabled);
+    } else {
+        updateStats(totalCount, statsFromBackend.enabled);
     }
-    updateStats(totalCount, statsFromBackend.enabled, totalWatched, totalItems);
 }
 
 // 构建分页加载中的占位卡片（pageCache 未加载时用，区别于状态占位）
@@ -1293,7 +1318,7 @@ async function refreshAccountsLight() {
     try {
         const capacity = viewportCapacity || 24;
         const pageOffset = Math.floor(visibleRange.start / capacity) * capacity;
-        await fetchAccountsPage(pageOffset, capacity);
+        await fetchAccountsPage(pageOffset, capacity, searchKeyword);
         renderViewport();
         // 删除账号后视口可能补位进新卡片，确保懒加载轮询在运行（空闲态 timer 已停止时需要重启）
         startLazyLoadPolling();
@@ -1330,16 +1355,17 @@ function scheduleLazyLoadTick(immediate) {
 
 // 单次轮询：收集纯视口范围内（viewportRange，不含缓冲）未标记"已查询"且未飞行中的 phone，拆分多批串行查询
 // 不扫描 DOM，改为按索引遍历 pageCache，确保只查视口可见卡片（缓冲区卡片预取数据但不触发外网状态查询）
+// 搜索态下用复合 key 读取 pageCache（方案 6.6）
 function lazyLoadTick() {
     if (isClaiming) return; // 领取中暂停
-    if (totalCount === 0) return;
+    if (getEffectiveTotalCount() === 0) return;
     if (isBatchInFlight) return; // 上一批仍在飞行，跳过避免跨 tick 并发
     const capacity = viewportCapacity;
     if (capacity <= 0) return;
     const pendingPhones = [];
     for (let i = viewportRange.start; i < viewportRange.end; i++) {
         const pageOffset = Math.floor(i / capacity) * capacity;
-        const page = pageCache.get(pageOffset);
+        const page = pageCache.get(getEffectivePageCacheKey(pageOffset));
         if (!page) continue; // 视口内分页未加载，等下次 tick（fetchAccountsPage 完成后会重新 renderViewport）
         const acc = page[i - pageOffset];
         if (!acc) continue;
@@ -1410,7 +1436,6 @@ async function queryPhonesBatched(phones) {
                 inFlightPhones.delete(p);
                 rerenderCardByPhone(p);
             });
-            reaggregateStats();
         } catch (e) {
             if (e.name === 'AbortError' && gen !== refreshGeneration) {
                 // refreshAll 主动中止（gen 已变）：静默退出，不标记 query_timeout
@@ -1439,7 +1464,7 @@ async function initAccountsView() {
         const visibleRows = Math.max(1, Math.floor(viewportH / rowHeight));
         const capacity = visibleRows * columns;
         viewportCapacity = capacity;
-        await Promise.all([fetchAccountsPage(0, capacity), fetchStats()]);
+        await Promise.all([fetchAccountsPage(0, capacity, ''), fetchStats()]);
         renderViewport();
         startLazyLoadPolling();
     } catch (e) {
@@ -1450,16 +1475,48 @@ async function initAccountsView() {
 
 // 添加账号成功后：递增 totalCount 撑高虚拟滚动总高度；末尾在当前视口内主动请求末页分页
 // 否则等用户滚动到末尾触发新页分页请求时新账号自然进入 pageCache，再由懒加载补状态
+// 搜索态下：决策#3 ——前端用 step1 暂存的 name/remark/phone 预判是否匹配 searchKeyword：
+//   匹配：重新拉搜索首页让新账号进列表；不匹配：toast 提示，不进列表
 function onAccountAdded() {
-    totalCount++;
+    // 取出 step1 暂存信息并立即清空（避免后续误用）
+    const addedInfo = pendingAddedAccountInfo;
+    pendingAddedAccountInfo = null;
+    totalCount++;  // 全体总数始终 +1（合并卡片下次 fetchStats 更新）
     const capacity = viewportCapacity || 24;
+    if (isSearching()) {
+        // 搜索态：前端匹配预判（与后端 list_page_search 规则一致：name/remark 大小写不敏感子串、phone 子串）
+        if (addedInfo) {
+            const kw = searchKeyword;
+            const kwLower = kw.toLowerCase();
+            const phoneMatch = addedInfo.phone ? addedInfo.phone.includes(kw) : false;
+            const nameMatch = addedInfo.name ? addedInfo.name.toLowerCase().includes(kwLower) : false;
+            const remarkMatch = addedInfo.remark ? addedInfo.remark.toLowerCase().includes(kwLower) : false;
+            if (!(phoneMatch || nameMatch || remarkMatch)) {
+                // 不匹配：toast 提示，不进列表（fetchStats 仍调用以同步 totalCount）
+                showToast('已添加账号，但当前搜索关键词不匹配，清除搜索后可见', 'info');
+                fetchStats();
+                return;
+            }
+        }
+        // 匹配（或无 addedInfo 兜底）：清空搜索结果缓存，重新拉首页让后端决定 searchTotalCount
+        searchResultPhones.clear();
+        pageCache.clear();
+        pageCacheVersion++;
+        fetchAccountsPage(0, capacity, searchKeyword).then(() => {
+            renderViewport();
+            startLazyLoadPolling();
+        }).catch(e => console.error('onAccountAdded search fetchAccountsPage error:', e));
+        fetchStats();
+        return;
+    }
+    // 非搜索态：原逻辑
     // 新账号在末尾，所在页 offset = (totalCount-1) 减去对 capacity 取模
     const lastIdx = totalCount - 1;
     const lastPageOffset = Math.floor(lastIdx / capacity) * capacity;
     // 末尾在当前视口内：检查旧 totalCount（totalCount 已递增，故用 totalCount - 1 等价旧值）
     // visibleRange.end 由 computeVisibleRange 钳位到旧 totalCount，递增后需用 totalCount - 1 比较
     if (visibleRange.end >= totalCount - 1) {
-        fetchAccountsPage(lastPageOffset, capacity).then(() => {
+        fetchAccountsPage(lastPageOffset, capacity, '').then(() => {
             renderViewport();
             // 懒加载下一 tick 自动补状态
             // 确保 timer 运行（新卡片已渲染到 DOM 需查询状态；timer 可能因空闲态被停止）
@@ -1469,7 +1526,7 @@ function onAccountAdded() {
         }).catch(e => console.error('onAccountAdded fetchAccountsPage error:', e));
     } else {
         // 末尾不在视口内：清空末页缓存确保下次滚动到末尾时重新拉取（避免拿到旧空页缓存）
-        pageCache.delete(lastPageOffset);
+        pageCache.delete(getEffectivePageCacheKey(lastPageOffset));
         pageCacheVersion++;
         // 仅撑高总高度（renderViewport 会基于 scrollTop 重算 visibleRange，若用户没滚动 visibleRange 不变）
         const listEl = document.getElementById('accountsList');
@@ -1479,7 +1536,7 @@ function onAccountAdded() {
                 // 按总行数撑高（多列并排）
                 const columns = getColumns();
                 const rowHeight = getRowHeight();
-                const totalRows = Math.ceil(totalCount / columns);
+                const totalRows = Math.ceil(getEffectiveTotalCount() / columns);
                 spacer.style.height = Math.max(0, totalRows * rowHeight - CARD_GAP) + 'px';
             }
         }
@@ -1566,6 +1623,8 @@ async function doAddAccountStep1() {
 
     try {
         const claimTarget = document.getElementById('addClaimSelect')?.dataset.value || 'all';
+        // 暂存 name/remark 供 onAccountAdded 在搜索态做匹配预判（form 即将被验证码 modal 替换，原输入框丢失）
+        pendingAddedAccountInfo = { phone, name, remark };
         await api('/api/accounts', {
             method: 'POST',
             body: { phone, name, remark, claim_target: claimTarget },
@@ -1632,6 +1691,7 @@ async function cancelAddAccount(phone) {
     try {
         await api(`/api/accounts/${encodeURIComponent(phone)}`, { method: 'DELETE' });
     } catch (e) { showToast(e.message || '操作失败', 'error'); }
+    pendingAddedAccountInfo = null;
     closeModalForce();
 }
 
@@ -1682,7 +1742,6 @@ async function toggleAccount(phone, enabled) {
         // 局部更新 pageCache 中该 phone 的 enabled 字段，不重新请求分页（方案 4.4）
         updatePageCacheEntry(phone, { enabled });
         rerenderCardByPhone(phone);
-        reaggregateStats();
         // 启用/禁用直接影响"已启用"卡片数字，从后端确认
         fetchStats();
     } catch (e) { showToast(e.message || '切换失败', 'error'); }
@@ -1983,7 +2042,6 @@ async function doEditAccount(originalPhone) {
         // 局部更新 pageCache 中该 phone 所在页的对应字段，不重新请求分页（方案 4.4）
         updatePageCacheEntry(originalPhone, { name, remark, enabled, claim_target: claimTarget });
         rerenderCardByPhone(originalPhone);
-        reaggregateStats();
         // 编辑表单可切换 enabled，需从后端确认"已启用"卡片数字
         fetchStats();
     } catch (e) { showToast(e.message || '更新失败', 'error'); }
@@ -2058,6 +2116,11 @@ async function doDeleteAccount(phone) {
         statusCache.delete(phone);
         queriedPhones.delete(phone);
         inFlightPhones.delete(phone);
+        // 搜索态：从搜索结果集合移除 + 递减搜索结果总数（方案 3.3）
+        if (isSearching()) {
+            searchResultPhones.delete(phone);
+            searchTotalCount = Math.max(0, searchTotalCount - 1);
+        }
 
         // 等 cardRemove(350)+FLIP(350)+card.remove()(400) 完成，避免打断补位动画
         setTimeout(() => {
@@ -2182,14 +2245,31 @@ async function doVerifyPwd(phone) {
 // 启动异步领取流程：调用后端 /api/claim，将按钮切换为"查看日志"，开始轮询进度。
 async function startClaim() {
     const btn = document.getElementById('btnClaim');
+    // 搜索态：搜索结果为空时拒绝领取（方案 3.5）
+    if (isSearching() && searchResultPhones.size === 0) {
+        showToast('搜索结果为空，无可领取账号', 'error');
+        return;
+    }
     btn.disabled = true;
     btn.textContent = '领取中...';
     isClaiming = true;
     document.getElementById('btnRefresh').disabled = true;
+    // 领取中禁用批量操作卡片（方案 6.2 并发领取与批量操作互斥）
+    const batchCard = document.getElementById('batchAction');
+    if (batchCard) batchCard.classList.add('is-locked');
 
     try {
-        await api('/api/claim', { method: 'POST' });
-        showToast('领取已开始', 'info');
+        // 搜索态：拉全部匹配的 phones（fetchAllSearchResultPhones，未滚动加载的搜索结果也包含在内）
+        // 非搜索态：无 body 走全体
+        const claimOpts = { method: 'POST' };
+        let claimCount = 0;
+        if (isSearching()) {
+            const phones = await fetchAllSearchResultPhones();
+            claimOpts.body = { phones };
+            claimCount = phones.length;
+        }
+        await api('/api/claim', claimOpts);
+        showToast(isSearching() ? `已开始领取 ${claimCount} 个搜索结果账号` : '领取已开始', 'info');
 
         document.getElementById('logList').innerHTML = '';
         document.getElementById('claimStatus').textContent = '进行中...';
@@ -2207,6 +2287,7 @@ async function startClaim() {
         btn.onclick = startClaim;
         isClaiming = false;
         document.getElementById('btnRefresh').disabled = false;
+        if (batchCard) batchCard.classList.remove('is-locked');
         showToast(e.message || '启动领取失败', 'error');
     }
 }
@@ -2228,13 +2309,6 @@ function pollClaimProgress() {
             const data = await api('/api/claim/progress');
             pollFailCount = 0;
             const logList = document.getElementById('logList');
-
-            // 总进度：直接采用后端聚合（PC + 手机端，含各端 initial + 本次领取增量）
-            if (data.total_progress) {
-                const tp = data.total_progress;
-                const elTotal = document.getElementById('totalProgress');
-                if (elTotal) elTotal.textContent = `${tp.watched}/${tp.total}`;
-            }
 
             data.progress.forEach(item => {
                 if (['partial', 'need_login', 'error', 'network_error'].includes(item.status)) {
@@ -2317,6 +2391,8 @@ function pollClaimProgress() {
                 btn.onclick = startClaim;
                 isClaiming = false;
                 document.getElementById('btnRefresh').disabled = false;
+                const batchCardEnd = document.getElementById('batchAction');
+                if (batchCardEnd) batchCardEnd.classList.remove('is-locked');
 
                 refreshAll();
             } else {
@@ -2337,6 +2413,8 @@ function pollClaimProgress() {
                 btn.onclick = startClaim;
                 isClaiming = false;
                 document.getElementById('btnRefresh').disabled = false;
+                const batchCardFail = document.getElementById('batchAction');
+                if (batchCardFail) batchCardFail.classList.remove('is-locked');
                 showToast('领取状态查询连续失败，已停止轮询，请刷新页面', 'error');
             } else {
                 claimPollTimer = setTimeout(_poll, 1000);
@@ -2379,9 +2457,11 @@ async function detectCliTrigger() {
             btn.disabled = false;
             btn.textContent = '查看日志';
             btn.onclick = showLogModal;
-            // 与 startClaim 行为对齐：暂停懒加载轮询、禁用刷新按钮（pollClaimProgress 停止时恢复）
+            // 与 startClaim 行为对齐：暂停懒加载轮询、禁用刷新按钮、禁用批量操作卡片（pollClaimProgress 停止时恢复）
             isClaiming = true;
             document.getElementById('btnRefresh').disabled = true;
+            const batchCard = document.getElementById('batchAction');
+            if (batchCard) batchCard.classList.add('is-locked');
             pollClaimProgress();
         }
     } catch (e) {
@@ -2580,11 +2660,420 @@ function showConfirmDialog(title, message, confirmText, cancelText) {
     });
 }
 
+// ===== 搜索卡片交互（方案 3.3 搜索相关）=====
+// 三态：idle（未搜索折叠）/ expanded（展开输入中）/ searched（已搜索折叠金盘）
+// searchKeyword 非空 = 已搜索态；searchKeyword 空 + .expanded = 展开输入态
+
+// 展开搜索卡片：加 .expanded 触发 CSS 宽度动画，120ms 后聚焦输入框（等动画过半焦点可见）
+function expandSearch() {
+    const card = document.getElementById('searchCard');
+    if (!card || card.classList.contains('expanded')) return;
+    card.classList.add('expanded');
+    searchState = 'expanded';
+    setTimeout(() => {
+        const input = document.getElementById('searchInput');
+        if (input && card.classList.contains('expanded')) input.focus();
+    }, 120);
+}
+
+// 折叠搜索卡片（不清除关键词）：移除 .expanded，blur 输入框，按是否有 keyword 切换 searched/idle
+function collapseSearch() {
+    const card = document.getElementById('searchCard');
+    if (!card) return;
+    card.classList.remove('expanded');
+    const input = document.getElementById('searchInput');
+    if (input) input.blur();
+    searchState = searchKeyword ? 'searched' : 'idle';
+}
+
+// 切换已搜索态 class（金盘高亮 + 右键提示清除）
+function setSearched(on) {
+    const card = document.getElementById('searchCard');
+    if (card) card.classList.toggle('searched', on);
+}
+
+// 执行搜索：空值调 clearSearch 退出；非空则设 keyword，重置搜索结果集合，拉首页分页并渲染
+async function doSearch() {
+    const input = document.getElementById('searchInput');
+    const q = input ? input.value.trim() : '';
+    if (!q) {
+        clearSearch();
+        return;
+    }
+    searchKeyword = q;
+    searchResultPhones.clear();
+    searchTotalCount = 0;
+    pageCache.clear();
+    pageCacheVersion++;
+    setSearched(true);
+    collapseSearch();
+    const capacity = viewportCapacity || 24;
+    try {
+        await fetchAccountsPage(0, capacity, searchKeyword);
+        renderViewport();
+        startLazyLoadPolling();
+    } catch (e) {
+        console.error('doSearch fetchAccountsPage error:', e);
+        showToast('搜索失败：' + (e.message || '未知错误'), 'error');
+    }
+}
+
+// 清除搜索：重置所有搜索态变量 + 重拉全体首页（恢复非搜索态列表）
+function clearSearch() {
+    searchKeyword = '';
+    searchResultPhones.clear();
+    searchTotalCount = 0;
+    searchEnabled = 0;
+    setSearched(false);
+    const input = document.getElementById('searchInput');
+    if (input) input.value = '';
+    collapseSearch();
+    pageCache.clear();
+    pageCacheVersion++;
+    refreshStatsCard();
+    const capacity = viewportCapacity || 24;
+    fetchAccountsPage(0, capacity, '').then(() => {
+        renderViewport();
+        startLazyLoadPolling();
+    }).catch(e => console.error('clearSearch fetchAccountsPage error:', e));
+}
+
+// 绑定搜索卡片所有事件：卡片点击展开、图标按钮点击、input Enter/Escape、外部点击折叠、右键清除
+function bindSearchEvents() {
+    const card = document.getElementById('searchCard');
+    const iconBtn = document.getElementById('searchIconBtn');
+    const input = document.getElementById('searchInput');
+    const statsBar = document.getElementById('statsBar');
+    if (!card || !iconBtn || !input) return;
+
+    // 卡片点击：未展开则展开（已展开时不重复触发，避免抢 input 焦点）
+    card.addEventListener('click', (e) => {
+        if (card.classList.contains('expanded')) return;
+        expandSearch();
+    });
+
+    // 图标按钮点击：已展开则执行搜索，未展开则展开
+    iconBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (card.classList.contains('expanded')) {
+            doSearch();
+        } else {
+            expandSearch();
+        }
+    });
+
+    // 输入框键盘事件：Enter 执行搜索，Escape 仅折叠（保留已搜索态，方案 5.2）
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); doSearch(); }
+        if (e.key === 'Escape') { e.preventDefault(); collapseSearch(); }
+    });
+
+    // 输入框点击不冒泡到 card（避免已展开时点击输入框又触发 expandSearch）
+    input.addEventListener('click', (e) => e.stopPropagation());
+
+    // 外部点击：展开输入态时折叠（已搜索态不折叠，保留金盘）
+    document.addEventListener('click', (e) => {
+        if (card.classList.contains('expanded')
+            && !card.contains(e.target)
+            && !iconBtn.contains(e.target)) {
+            collapseSearch();
+        }
+    });
+
+    // 右键搜索卡片或图标：退出已搜索态（清除搜索结果）
+    if (statsBar) {
+        statsBar.addEventListener('contextmenu', (e) => {
+            if (!card.contains(e.target) && !iconBtn.contains(e.target)) return;
+            // 已搜索态或展开态才拦截右键菜单
+            if (!card.classList.contains('searched') && !card.classList.contains('expanded')) return;
+            e.preventDefault();
+            clearSearch();
+            showToast('已清除搜索', 'info');
+        });
+    }
+}
+
+// ===== 批量操作卡片交互（方案 3.3 批量操作相关）=====
+// 三态：idle（默认）→ select（启用·禁用·删除）→ confirm（确认文字 + ✓/✗）
+// 大量删除（>DELETE_RECONFIRM_THRESHOLD）触发输入"确认删除"二次确认弹窗
+const DELETE_RECONFIRM_THRESHOLD = 50;
+const DELETE_RECONFIRM_TEXT = '确认删除';
+
+// 切换批量操作三态：移除所有 .action-state.active，给目标态加 active
+function showBatchState(state) {
+    const card = document.getElementById('batchAction');
+    if (!card) return;
+    card.querySelectorAll('.action-state').forEach(el => el.classList.remove('active'));
+    const target = card.querySelector('.as-' + state);
+    if (target) target.classList.add('active');
+    batchActionState = state;
+}
+
+// 回到 idle 态：清空待执行操作 + 切态
+function backToIdle() {
+    pendingBatchAction = null;
+    showBatchState('idle');
+}
+
+// idle 态点击卡片 → 进入 select 态
+function onBatchActionClick(e) {
+    // 仅 idle 态响应卡片整体点击；select/confirm 态由子元素各自处理
+    const card = document.getElementById('batchAction');
+    if (!card || batchActionState !== 'idle') return;
+    e.stopPropagation();
+    showBatchState('select');
+}
+
+// select 态点击操作项（enable/disable/delete）：记录待执行操作 + 更新确认文案 + 进 confirm 态
+function onBatchActionSelect(action) {
+    pendingBatchAction = action;
+    const count = isSearching() ? searchTotalCount : totalCount;
+    const labels = { enable: '启用', disable: '禁用', delete: '删除' };
+    const textEl = document.getElementById('confirmText');
+    if (textEl) textEl.textContent = `确认${labels[action] || ''} ${count} 个账号？`;
+    showBatchState('confirm');
+}
+
+// confirm 态点 ✓：删除需二次确认（决策#1：非搜索态无论数量都弹；决策#6：搜索态仅超阈值弹）
+async function onBatchActionConfirm() {
+    if (!pendingBatchAction) return;
+    const count = isSearching() ? searchTotalCount : totalCount;
+    const needReconfirm = pendingBatchAction === 'delete'
+        && (!isSearching() || count > DELETE_RECONFIRM_THRESHOLD);
+    if (needReconfirm) {
+        const ok = await showDeleteReconfirm(count);
+        if (!ok) { backToIdle(); return; }
+    }
+    await executeBatchAction();
+}
+
+// confirm 态点 ✗：取消回 idle
+function onBatchActionCancel() {
+    backToIdle();
+}
+
+// 执行批量操作：收集 phones（搜索态调 fetchAllSearchResultPhones 拉全部匹配，非搜索态调 fetchAllPhones 拉全体）
+// 调 POST /api/accounts/batch {action, phones}（后端契约见方案 4.1；上限 1000，超限前端预检拦截）
+async function executeBatchAction() {
+    const action = pendingBatchAction;
+    if (!action) return;
+    // 提前清空防止 async 执行期间用户重复点 ✓ 触发重复操作
+    pendingBatchAction = null;
+    // 领取中禁用（防御性：按钮已被 .is-locked 屏蔽，此处兜底）
+    if (isClaiming) {
+        showToast('领取中无法执行批量操作', 'error');
+        backToIdle();
+        return;
+    }
+    // phones 必须显式传列表（方案 5.5 决策：不接受 null）
+    // 搜索态：拉全部匹配的 phones（fetchAllSearchResultPhones）；非搜索态：拉全体 phones（fetchAllPhones）
+    let phones = null;
+    if (isSearching()) {
+        try {
+            phones = await fetchAllSearchResultPhones();
+        } catch (e) {
+            showToast('获取搜索结果失败：' + (e.message || '未知错误'), 'error');
+            backToIdle();
+            return;
+        }
+        if (phones.length === 0) {
+            showToast('搜索结果为空，无可操作账号', 'error');
+            backToIdle();
+            return;
+        }
+    } else {
+        // 非搜索态：拉全体 phone（一次分页拉取所有，受后端 limit clamp [1,200] 限制，
+        // 超过 200 需多次拉取；这里循环拉直到拉完）
+        try {
+            phones = await fetchAllPhones();
+            if (phones.length === 0) {
+                showToast('暂无账号可操作', 'error');
+                backToIdle();
+                return;
+            }
+        } catch (e) {
+            showToast('获取账号列表失败：' + (e.message || '未知错误'), 'error');
+            backToIdle();
+            return;
+        }
+    }
+    // 后端 /api/accounts/batch 上限 1000，超限前端预检拦截给出友好提示
+    if (phones.length > 1000) {
+        showToast(`账号数量超过 1000 上限（当前 ${phones.length} 个），请使用搜索筛选后批量操作`, 'error');
+        backToIdle();
+        return;
+    }
+    try {
+        const data = await api('/api/accounts/batch', {
+            method: 'POST',
+            body: { action, phones },
+        });
+        const affected = data.affected || 0;
+        const failed = data.failed || [];
+        const labels = { enable: '启用', disable: '禁用', delete: '删除' };
+        const toastType = action === 'enable' ? 'success' : (action === 'delete' ? 'error' : 'info');
+        let msg = `已批量${labels[action]} ${affected} 个账号`;
+        if (failed.length > 0) msg += `，${failed.length} 个失败`;
+        showToast(msg, toastType);
+        backToIdle();
+        // 清空 pageCache 确保批量操作后 enabled 状态从后端重新拉取
+        // （pageCache 中的 enabled 字段需刷新，refreshAll 非搜索态默认保留 pageCache 兜底）
+        pageCache.clear();
+        pageCacheVersion++;
+        refreshAll();
+    } catch (e) {
+        showToast('批量操作失败：' + (e.message || '未知错误'), 'error');
+        backToIdle();
+    }
+}
+
+// 拉取全体 phone 列表（非搜索态批量操作用，循环分页直到拉完）
+async function fetchAllPhones() {
+    const all = [];
+    const pageSize = 200;
+    let offset = 0;
+    while (true) {
+        const data = await api(`/api/accounts?offset=${offset}&limit=${pageSize}`);
+        const accs = data.accounts || [];
+        for (const a of accs) if (a && a.phone) all.push(a.phone);
+        if (accs.length < pageSize) break;
+        offset += pageSize;
+        if (offset > 100000) break;  // 兜底防死循环
+    }
+    return all;
+}
+
+// 拉取搜索结果全部匹配的 phone 列表（搜索态批量操作/开始领取用）
+// searchResultPhones 只含已加载分页的 phones，未滚动加载的部分不在其中，
+// 故批量操作/领取前需重新通过 q 参数分页拉完所有匹配账号的 phones
+async function fetchAllSearchResultPhones() {
+    const all = [];
+    const pageSize = 200;
+    let offset = 0;
+    while (true) {
+        const url = `/api/accounts?offset=${offset}&limit=${pageSize}&q=${encodeURIComponent(searchKeyword)}`;
+        const data = await api(url);
+        const accs = data.accounts || [];
+        for (const a of accs) if (a && a.phone) all.push(a.phone);
+        if (accs.length < pageSize) break;
+        offset += pageSize;
+        if (offset > 100000) break;  // 兜底防死循环
+    }
+    return all;
+}
+
+// 大量删除二次确认弹窗：输入"确认删除"文本才能点删除按钮，回车确认/抖动反馈
+// 返回 Promise<boolean>：true=确认删除，false=取消
+function showDeleteReconfirm(count) {
+    return new Promise(resolve => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay active';
+        overlay.innerHTML = `
+            <div class="modal" onclick="event.stopPropagation()">
+                <h3>批量删除确认</h3>
+                <p>即将删除 <strong style="color:var(--error)">${count}</strong> 个账号，此操作不可撤销。</p>
+                <p style="margin-top:8px">请输入 <strong style="color:var(--error)">${DELETE_RECONFIRM_TEXT}</strong> 以确认：</p>
+                <div class="modal-input-confirm">
+                    <input type="text" id="reconfirmInput" placeholder="${DELETE_RECONFIRM_TEXT}" autocomplete="off" />
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn-modal btn-modal-cancel" data-act="cancel">取消</button>
+                    <button type="button" class="btn-modal btn-modal-danger" data-act="ok" disabled>删除</button>
+                </div>
+            </div>
+        `;
+        document.body.appendChild(overlay);
+
+        const input = overlay.querySelector('#reconfirmInput');
+        const okBtn = overlay.querySelector('[data-act="ok"]');
+        const modalEl = overlay.querySelector('.modal');
+
+        function close(result) {
+            if (modalEl) modalEl.classList.add('closing');
+            setTimeout(() => { overlay.remove(); resolve(result); }, 180);
+        }
+        function triggerShake() {
+            input.classList.remove('shake');
+            void input.offsetWidth;
+            input.classList.add('shake');
+        }
+
+        input.addEventListener('input', () => {
+            okBtn.disabled = input.value.trim() !== DELETE_RECONFIRM_TEXT;
+            input.classList.remove('shake');
+        });
+        input.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter') return;
+            if (!okBtn.disabled) close(true);
+            else triggerShake();
+        });
+        overlay.querySelector('[data-act="cancel"]').addEventListener('click', () => close(false));
+        okBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (okBtn.disabled) { triggerShake(); return; }
+            close(true);
+        });
+
+        setTimeout(() => input.focus(), 60);
+    });
+}
+
+// 绑定批量操作卡片所有事件：idle 态点击进 select、select 态操作项点击、confirm 态 ✓/✗ 点击、外部点击回 idle、右键回 idle
+function bindBatchActionEvents() {
+    const card = document.getElementById('batchAction');
+    if (!card) return;
+
+    // idle 态点击卡片整体 → 进 select
+    card.addEventListener('click', (e) => {
+        // select/confirm 态由子元素 stopPropagation 处理，这里只处理 idle 态
+        if (batchActionState === 'idle') {
+            onBatchActionClick(e);
+        }
+    });
+
+    // select 态：操作项点击
+    card.querySelectorAll('.as-select .action-text').forEach(el => {
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            onBatchActionSelect(el.dataset.action);
+        });
+    });
+
+    // confirm 态：✓ 执行 / ✗ 取消
+    const okBtn = card.querySelector('.as-confirm [data-act="ok"]');
+    const cancelBtn = card.querySelector('.as-confirm [data-act="cancel"]');
+    if (okBtn) okBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onBatchActionConfirm();
+    });
+    if (cancelBtn) cancelBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onBatchActionCancel();
+    });
+
+    // 外部点击：select/confirm 态回到 idle（避免点空白处后卡片卡在中间态）
+    document.addEventListener('click', (e) => {
+        if (batchActionState !== 'idle' && !card.contains(e.target)) {
+            backToIdle();
+        }
+    });
+
+    // 右键卡片：回到 idle（快速取消路径）
+    card.addEventListener('contextmenu', (e) => {
+        if (batchActionState !== 'idle') {
+            e.preventDefault();
+            backToIdle();
+        }
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     initDrag();
     initRipple();
     initAccountsView();
     startCliTriggerDetect();
+    bindSearchEvents();
+    bindBatchActionEvents();
     setTimeout(() => {
         const splash = document.getElementById('splash');
         if (splash) {
