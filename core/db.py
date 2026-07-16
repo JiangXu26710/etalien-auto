@@ -13,6 +13,7 @@
 
 import logging
 import os
+import re
 import sqlite3
 import time
 from threading import Lock
@@ -147,51 +148,81 @@ class DbAccountRepository:
         return rows, total
 
     def list_page_search(self, offset: int, limit: int, keyword: str) -> tuple[list[dict], int, int]:
-        """分页搜索账号，按 name/phone/remark 子串模糊匹配，返回 (accounts, total, enabled_count)。
+        """分页搜索账号，支持多关键字 AND + 状态关键字，返回 (accounts, total, enabled_count)。
 
         只查基础字段（id + BASE_FIELDS），与 list_page 一致。
 
-        匹配规则（与方案文档 §4.1 一致）：
+        匹配规则：
+        - keyword 按空白（\\s+）切分为多个 token
+        - 状态关键字 token（完整匹配，大小写不敏感）：
+          - ``@启用`` / ``@on`` → 追加 ``enabled = 1``
+          - ``@禁用`` / ``@off`` → 追加 ``enabled = 0``
+          - 同时出现 @启用 与 @禁用 → ``enabled=1 AND enabled=0`` → 0 结果（矛盾语义）
+        - 文本 token：每个 token 对 name/phone/remark 三列各做一次 LIKE 子串匹配（OR），
+          多个文本 token 之间是 AND 关系
         - name/phone/remark 均用 LIKE，SQLite 默认 case_sensitive_like=OFF（实测 3.38.4），
           TEXT 列 LIKE 本身大小写不敏感，无需 LOWER() 包裹
-        - 子串包含（LIKE '%keyword%'）
-        - keyword 中的 ``%`` / ``_`` / ``\\`` 被 ESCAPE 转义，防止通配符注入
+        - 子串包含（LIKE '%token%'）
+        - 每个 token 中的 ``%`` / ``_`` / ``\\`` 被 ESCAPE 转义，防止通配符注入
         - 按 id ASC 排序（与 list_page 一致，新账号排在末尾）
+        - 空字符串或纯空白 keyword → 无 WHERE 子句，返回全体（与 list_page 一致行为，
+          API 层保证不传空 q，此为 Repository 层防御性兜底）
 
-        性能：原 list_page_search + count_search_enabled 共触发 3 次全表 LIKE 扫描
-        （SELECT + COUNT + COUNT enabled），现合并为 2 次（SELECT + 单 SQL 同时取
-        total 与 enabled_count），翻页延迟约降 30%+。
+        性能：SELECT + COUNT 合并 SQL 各扫一次，状态过滤走索引（enabled 无索引但
+        全表扫描代价小），翻页延迟与单关键字基本持平。
 
         Args:
             offset: 偏移量（clamp 由 API 层负责，与 list_page 一致）
             limit: 每页数量
-            keyword: 搜索关键词原始字符串（函数内部负责转义）
+            keyword: 搜索关键词原始字符串（函数内部负责分词与转义）
 
         Returns:
             (accounts, total, enabled_count)：accounts 为匹配的账号列表，total 为匹配总数，
             enabled_count 为匹配结果中 enabled=1 的账号数（搜索态合并卡片 m/n 用）。
         """
-        # 转义 LIKE 通配符：先转义 \ 自身，再转义 % 和 _（顺序不可换）
-        escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        pattern = f"%{escaped}%"
-        where_sql = (
-            "WHERE name LIKE ? ESCAPE '\\' "
-            "OR phone LIKE ? ESCAPE '\\' "
-            "OR remark LIKE ? ESCAPE '\\'"
-        )
+        # 分词 + 分类：状态 token 走等值过滤，文本 token 走 LIKE 三列 OR
+        tokens = re.split(r"\s+", keyword.strip()) if keyword and keyword.strip() else []
+        status_filters: list[str] = []
+        text_tokens: list[str] = []
+        for token in tokens:
+            low = token.lower()
+            if token == "@启用" or low == "@on":
+                status_filters.append("enabled = 1")
+            elif token == "@禁用" or low == "@off":
+                status_filters.append("enabled = 0")
+            else:
+                text_tokens.append(token)
+
+        # 拼接 WHERE 子句：每个文本 token 一组 (name OR phone OR remark LIKE)，
+        # 组间 AND；每个状态 token 一个 enabled=N，相互 AND
+        where_parts: list[str] = []
+        params: list[str] = []
+        for token in text_tokens:
+            # 转义 LIKE 通配符：先转义 \ 自身，再转义 % 和 _（顺序不可换）
+            escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            pattern = f"%{escaped}%"
+            where_parts.append(
+                "(name LIKE ? ESCAPE '\\' OR phone LIKE ? ESCAPE '\\' OR remark LIKE ? ESCAPE '\\')"
+            )
+            params.extend([pattern, pattern, pattern])
+        for sf in status_filters:
+            where_parts.append(sf)
+
+        where_sql = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
         # 读操作不持 _db_lock：WAL 模式下读不阻塞读/写，分页统计弱一致可接受
         # （用户翻页期间新账号加入导致的口径偏差属正常业务行为）
         cur = self._conn.execute(
             f"SELECT id, phone, name, remark, enabled, claim_target FROM accounts {where_sql} ORDER BY id ASC LIMIT ? OFFSET ?",
-            (pattern, pattern, pattern, limit, offset),
+            (*params, limit, offset),
         )
         rows = [_row_to_dict(r) for r in cur.fetchall()]
-        # 单 SQL 同时取 total 和 enabled_count，避免再走一次全表 LIKE 扫描
+        # 单 SQL 同时取 total 和 enabled_count，避免再走一次全表扫描
         # SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END)：enabled=0 行贡献 0；
         # 无匹配行时 SUM 返回 NULL，用 COALESCE 兜底为 0
         row = self._conn.execute(
             f"SELECT COUNT(*), COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0) FROM accounts {where_sql}",
-            (pattern, pattern, pattern),
+            params,
         ).fetchone()
         return rows, row[0], row[1]
 

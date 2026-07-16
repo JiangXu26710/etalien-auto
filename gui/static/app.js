@@ -1484,14 +1484,35 @@ function onAccountAdded() {
     totalCount++;  // 全体总数始终 +1（合并卡片下次 fetchStats 更新）
     const capacity = viewportCapacity || 24;
     if (isSearching()) {
-        // 搜索态：前端匹配预判（与后端 list_page_search 规则一致：name/remark 大小写不敏感子串、phone 子串）
+        // 搜索态：前端匹配预判（与后端 list_page_search 规则一致）
+        // 规则：keyword 按空白分词；@启用/@on→enabled=1，@禁用/@off→enabled=0，
+        //       文本 token 三列大小写不敏感子串；所有 token 之间 AND
         if (addedInfo) {
             const kw = searchKeyword;
-            const kwLower = kw.toLowerCase();
-            const phoneMatch = addedInfo.phone ? addedInfo.phone.includes(kw) : false;
-            const nameMatch = addedInfo.name ? addedInfo.name.toLowerCase().includes(kwLower) : false;
-            const remarkMatch = addedInfo.remark ? addedInfo.remark.toLowerCase().includes(kwLower) : false;
-            if (!(phoneMatch || nameMatch || remarkMatch)) {
+            const tokens = kw.trim().split(/\s+/).filter(t => t.length > 0);
+            const enabledBool = !!(addedInfo.enabled ?? true);  // 新增账号默认 enabled=true
+            let allMatch = true;
+            for (const token of tokens) {
+                const low = token.toLowerCase();
+                if (token === '@启用' || low === '@on') {
+                    if (enabledBool !== true) { allMatch = false; break; }
+                    continue;
+                }
+                if (token === '@禁用' || low === '@off') {
+                    if (enabledBool !== false) { allMatch = false; break; }
+                    continue;
+                }
+                // 文本 token：三列任一子串匹配即可
+                const lowToken = token.toLowerCase();
+                const phoneMatch = addedInfo.phone ? addedInfo.phone.includes(token) : false;
+                const nameMatch = addedInfo.name ? addedInfo.name.toLowerCase().includes(lowToken) : false;
+                const remarkMatch = addedInfo.remark ? addedInfo.remark.toLowerCase().includes(lowToken) : false;
+                if (!(phoneMatch || nameMatch || remarkMatch)) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (!allMatch) {
                 // 不匹配：toast 提示，不进列表（fetchStats 仍调用以同步 totalCount）
                 showToast('已添加账号，但当前搜索关键词不匹配，清除搜索后可见', 'info');
                 fetchStats();
