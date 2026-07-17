@@ -1583,6 +1583,7 @@ function onAccountAdded() {
 }
 
 function showAddAccount() {
+    const defaultClaimTarget = getSettingValue('default_claim_target', 'all');
     openModal(`
         <h3>添加账号</h3>
         <div class="form-group">
@@ -1600,7 +1601,7 @@ function showAddAccount() {
         <div class="settings-divider"></div>
         <div class="form-group">
             <label>领取权益</label>
-            ${claimSelectHTML('addClaimSelect', 'all')}
+            ${claimSelectHTML('addClaimSelect', defaultClaimTarget)}
         </div>
         <div class="modal-actions">
             <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
@@ -1667,13 +1668,17 @@ async function doAddAccountStep1() {
             body: { phone, name, remark, claim_target: claimTarget },
         });
 
+        const defaultMethod = getSettingValue('default_login_method', 'sms');
+        const smsActive = defaultMethod !== 'password' ? 'active' : '';
+        const pwdActive = defaultMethod === 'password' ? 'active' : '';
+        const initialFocusId = defaultMethod === 'password' ? 'addLoginPwd' : 'addLoginCode';
         openModal(`
             <h3>验证手机号 ${escapeHtml(phone)}</h3>
             <div class="login-method-tabs">
-                <button type="button" class="login-method-tab active" onclick="switchLoginTab(this, 'add-sms-panel')">短信验证码</button>
-                <button type="button" class="login-method-tab" onclick="switchLoginTab(this, 'add-pwd-panel')">账号密码</button>
+                <button type="button" class="login-method-tab ${smsActive}" onclick="switchLoginTab(this, 'add-sms-panel')">短信验证码</button>
+                <button type="button" class="login-method-tab ${pwdActive}" onclick="switchLoginTab(this, 'add-pwd-panel')">账号密码</button>
             </div>
-            <div class="login-form-panel active" id="add-sms-panel">
+            <div class="login-form-panel ${smsActive}" id="add-sms-panel">
                 <p class="login-hint">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
                 <div class="form-group">
                     <label>验证码 *</label>
@@ -1686,7 +1691,7 @@ async function doAddAccountStep1() {
                     <button type="button" class="btn-modal btn-modal-primary" id="btnLoginAdd" style="display:none" onclick="doAddAccountStep2(${jsStr(phone)})">登录</button>
                 </div>
             </div>
-            <div class="login-form-panel" id="add-pwd-panel">
+            <div class="login-form-panel ${pwdActive}" id="add-pwd-panel">
                 <p class="login-hint">使用外星仔加速器 App 的登录密码直接登录。</p>
                 <div class="form-group">
                     <label>密码 *</label>
@@ -1698,7 +1703,7 @@ async function doAddAccountStep1() {
                 </div>
             </div>
         `, true);
-        document.getElementById('addLoginCode').focus();
+        document.getElementById(initialFocusId)?.focus();
     } catch (e) { showToast(e.message || '添加账号失败', 'error'); }
 }
 
@@ -2191,13 +2196,17 @@ async function doDeleteAccount(phone) {
 }
 
 function showLogin(phone) {
+    const defaultMethod = getSettingValue('default_login_method', 'sms');
+    const smsActive = defaultMethod !== 'password' ? 'active' : '';
+    const pwdActive = defaultMethod === 'password' ? 'active' : '';
+    const initialFocusId = defaultMethod === 'password' ? 'loginPwd' : 'loginCode';
     openModal(`
         <h3>登录 ${escapeHtml(phone)}</h3>
         <div class="login-method-tabs" style="margin-top:4px">
-            <button type="button" class="login-method-tab active" onclick="switchLoginTab(this, 'login-sms-panel')">短信验证码</button>
-            <button type="button" class="login-method-tab" onclick="switchLoginTab(this, 'login-pwd-panel')">账号密码</button>
+            <button type="button" class="login-method-tab ${smsActive}" onclick="switchLoginTab(this, 'login-sms-panel')">短信验证码</button>
+            <button type="button" class="login-method-tab ${pwdActive}" onclick="switchLoginTab(this, 'login-pwd-panel')">账号密码</button>
         </div>
-        <div class="login-form-panel active" id="login-sms-panel">
+        <div class="login-form-panel ${smsActive}" id="login-sms-panel">
             <p class="login-hint" style="margin-top:12px">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
             <div class="form-group">
                 <label>验证码 *</label>
@@ -2210,7 +2219,7 @@ function showLogin(phone) {
                 <button type="button" class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify(${jsStr(phone)})">登录</button>
             </div>
         </div>
-        <div class="login-form-panel" id="login-pwd-panel">
+        <div class="login-form-panel ${pwdActive}" id="login-pwd-panel">
             <p class="login-hint" style="margin-top:12px">使用外星仔加速器 App 的登录密码直接登录。</p>
             <div class="form-group">
                 <label>密码 *</label>
@@ -2222,7 +2231,7 @@ function showLogin(phone) {
             </div>
         </div>
     `);
-    document.getElementById('loginCode').focus();
+    document.getElementById(initialFocusId)?.focus();
 }
 
 async function doVerify(phone) {
@@ -2522,6 +2531,28 @@ let commonDirty = false;    // 常规区脏标记
 let advDirty = false;       // 高级区脏标记
 let infoTooltipEl = null;   // 全局 info-tooltip 元素（懒加载）
 
+// 全局配置值缓存：供设置弹窗外的逻辑（如批量删除弹窗确认）读取配置项当前值。
+// DOMContentLoaded 时调 refreshSettingsCache 初始化；doSaveSettings 保存成功后刷新。
+window.__settingsValues = {};
+
+// 从缓存读取配置值，未缓存或类型异常时返回 defaultVal
+function getSettingValue(key, defaultVal) {
+    const v = window.__settingsValues[key];
+    return v === undefined ? defaultVal : v;
+}
+
+// 刷新全局配置值缓存：调 GET /api/settings，剥离 schema / actual_gui_port 元数据后只存配置项值
+async function refreshSettingsCache() {
+    try {
+        const settings = await api('/api/settings');
+        const { schema, actual_gui_port, ...values } = settings;
+        window.__settingsValues = values;
+    } catch (e) {
+        console.error('刷新配置缓存失败:', e);
+    }
+}
+
+
 /* 通用渲染器：按 schema 生成对应控件 HTML。用 schema.label 作为显示名（前端不维护 FIELD_LABELS） */
 function renderSettingsField(key, schema, value) {
     const label = schema.label || key;
@@ -2530,10 +2561,25 @@ function renderSettingsField(key, schema, value) {
 
     if (schema.type === 'int' || schema.type === 'float') {
         const step = schema.type === 'float' ? '0.01' : '1';
+        const nullable = schema.nullable === true;
+        // nullable 字段：value 为 null 时输入框留空（placeholder 显示「自动分配」）
+        const inputValue = (nullable && (value === null || value === undefined)) ? '' : value;
+        // actual_key 字段：在范围后缀中追加「· 当前:xxx」，配置与实际不符时整个后缀标红
+        let suffixText = `${schema.min} - ${schema.max}`;
+        let mismatchClass = '';
+        if (schema.actual_key) {
+            const response = window.__settingsResponse || {};
+            const actual = response[schema.actual_key];
+            const actualText = (actual === null || actual === undefined) ? '未知' : actual;
+            // configured !== null && configured !== actual → 标红（配置未生效）
+            const mismatch = value !== null && value !== undefined && value !== actual;
+            suffixText = `${schema.min} - ${schema.max} · 当前:${escapeHtml(String(actualText))}`;
+            mismatchClass = mismatch ? ' mismatch' : '';
+        }
         controlHTML = `
             <div class="adv-input-wrap">
-                <input type="number" data-key="${escapeHtml(key)}" value="${value}" min="${schema.min}" max="${schema.max}" step="${step}">
-                <span class="adv-range-suffix">「${schema.min} - ${schema.max}」</span>
+                <input type="number" data-key="${escapeHtml(key)}" value="${inputValue}" min="${schema.min}" max="${schema.max}" step="${step}"${nullable ? ' placeholder="自动分配" data-nullable="true"' : ''}>
+                <span class="adv-range-suffix${mismatchClass}">「${suffixText}」</span>
             </div>`;
     } else if (schema.type === 'bool') {
         controlHTML = `
@@ -2650,7 +2696,10 @@ function onAdvClose() {
         } else {
             const input = row.querySelector('input[data-key]');
             if (!input) return;
-            if (fieldSchema.type === 'int') val = parseInt(input.value, 10);
+            // nullable 字段空输入 → null（如 gui_port 留空表示自动分配）
+            if (fieldSchema.nullable === true && input.value === '') {
+                val = null;
+            } else if (fieldSchema.type === 'int') val = parseInt(input.value, 10);
             else if (fieldSchema.type === 'float') val = parseFloat(input.value);
             else val = input.value;
         }
@@ -2818,8 +2867,14 @@ function validateAll(common) {
     for (const [key, schema] of advEntries) {
         const v = advancedStaging[key];
         if (schema.type === 'int' || schema.type === 'float') {
+            // nullable 字段值为 null 时跳过范围校验（如 gui_port=null 表示自动分配）
+            if (v === null && schema.nullable === true) continue;
             if (Number.isNaN(v) || v < schema.min || v > schema.max) {
                 return { ok: false, field: key, msg: `${schema.label || key} 超出范围（${schema.min}-${schema.max}）` };
+            }
+            // forbidden 黑名单校验（如 gui_port 命中 Chromium 不安全端口）
+            if (schema.forbidden && schema.forbidden.includes(v)) {
+                return { ok: false, field: key, msg: `${schema.label || key} 的值 ${v} 不被允许（WebView2 不安全端口）` };
             }
         }
     }
@@ -2911,7 +2966,8 @@ function initLastValid() {
         const v = (fieldSchema.advanced && advancedStaging[key] !== undefined)
             ? advancedStaging[key]
             : input.value;
-        input.dataset.lastValid = v;
+        // nullable 字段值为 null 时，lastValid 用空字符串（与输入框空值一致，避免 "null" 字符串污染）
+        input.dataset.lastValid = (v === null ? '' : v);
     });
 }
 
@@ -3007,6 +3063,11 @@ document.addEventListener('focusout', e => {
     const raw = (target.value || '').trim();
     const lastValid = target.dataset.lastValid !== undefined ? target.dataset.lastValid : '';
     if (raw === '') {
+        // nullable 字段空输入是合法操作（置 null），不 shake
+        if (schema.nullable === true) {
+            target.dataset.lastValid = '';
+            return;
+        }
         if (lastValid !== '') target.value = lastValid;
         triggerShake(target);
         return;
@@ -3026,6 +3087,16 @@ document.addEventListener('focusout', e => {
         target.value = schema.max;
         triggerShake(target);
         target.dataset.lastValid = schema.max;
+    } else if (schema.forbidden && schema.forbidden.includes(v)) {
+        // forbidden 黑名单（如 gui_port 命中 Chromium 不安全端口）：shake + toast + 重置为 null（nullable）或恢复 lastValid
+        triggerShake(target);
+        showToast(`端口「${v}」是Chromium不安全端口，已清空`, 'error');
+        if (schema.nullable === true) {
+            target.value = '';
+            target.dataset.lastValid = '';
+        } else if (lastValid !== '') {
+            target.value = lastValid;
+        }
     } else {
         // 合法值：标准化显示（如 1.0 → 1，01 → 1），并记录为 lastValid
         target.value = v;
@@ -3085,6 +3156,8 @@ function showSettings() {
 
         // 从 GET /api/settings 返回值读取后端 schema（生产 schema 由后端驱动，前端不硬编码）
         window.__settingsSchema = settings.schema || {};
+        // 保存完整响应，供 renderSettingsField 取 actual_key 对应的实际值（如 actual_gui_port）
+        window.__settingsResponse = settings;
         // 初始化高级区暂存对象：从 settings 取所有 advanced=true 字段的当前值
         advancedStaging = {};
         Object.entries(window.__settingsSchema).forEach(([key, schema]) => {
@@ -3235,6 +3308,8 @@ async function doSaveSettings() {
         // 重置脏标记（保存成功后视为初始状态）
         commonDirty = false;
         advDirty = false;
+        // 刷新全局配置值缓存，让批量删除等设置弹窗外的逻辑读到最新值
+        refreshSettingsCache();
         closeModalForce();
     } catch (e) { showToast(e.message || '保存失败', 'error'); }
     finally { if (btn) btn.disabled = false; }
@@ -3402,8 +3477,8 @@ function bindSearchEvents() {
 
 // ===== 批量操作卡片交互（批量操作相关）=====
 // 三态：idle（默认）→ select（启用·禁用·删除）→ confirm（确认文字 + ✓/✗）
-// 大量删除（>DELETE_RECONFIRM_THRESHOLD）触发输入"确认删除"二次确认弹窗
-const DELETE_RECONFIRM_THRESHOLD = 50;
+// 批量删除弹窗确认规则：count > 阈值（batch_delete_reconfirm_threshold）永远弹；
+// 非搜索态 + 开关开启（batch_delete_reconfirm=true）且 count <= 阈值时也弹；其余不弹
 const DELETE_RECONFIRM_TEXT = '确认删除';
 
 // 切换批量操作三态：移除所有 .action-state.active，给目标态加 active
@@ -3441,12 +3516,16 @@ function onBatchActionSelect(action) {
     showBatchState('confirm');
 }
 
-// confirm 态点 ✓：删除需二次确认（决策#1：非搜索态无论数量都弹；决策#6：搜索态仅超阈值弹）
+// confirm 态点 ✓：删除弹窗确认规则——超阈值永远弹（搜索/非搜索都生效）；
+// 非搜索态 + 开关开启且 count <= 阈值时也弹；非搜索态 + 开关关闭时不弹；搜索态未超阈值不弹
 async function onBatchActionConfirm() {
     if (!pendingBatchAction) return;
     const count = isSearching() ? searchTotalCount : totalCount;
+    const forceReconfirm = getSettingValue('batch_delete_reconfirm', true);
+    const threshold = getSettingValue('batch_delete_reconfirm_threshold', 50);
     const needReconfirm = pendingBatchAction === 'delete'
-        && (!isSearching() || count > DELETE_RECONFIRM_THRESHOLD);
+        && (count > threshold
+            || (!isSearching() && forceReconfirm));
     if (needReconfirm) {
         const ok = await showDeleteReconfirm(count);
         if (!ok) { backToIdle(); return; }
@@ -3681,6 +3760,8 @@ document.addEventListener('DOMContentLoaded', () => {
     startCliTriggerDetect();
     bindSearchEvents();
     bindBatchActionEvents();
+    // 初始化全局配置值缓存（供批量删除弹窗确认等设置弹窗外的逻辑读取配置项当前值）
+    refreshSettingsCache();
     setTimeout(() => {
         const splash = document.getElementById('splash');
         if (splash) {

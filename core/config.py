@@ -25,6 +25,19 @@ VERSION = "1.0.1"
 # 定时执行时间格式校验正则（HH:MM）
 SCHEDULE_TIME_PATTERN = re.compile(r'^\d{2}:\d{2}$')
 
+# Chromium/WebView2 不安全端口黑名单（来源：Chromium 源码 net/base/port_util.cc 的 kRestrictedPorts）
+# pywebview 在 Windows 上使用 WebView2（Chromium 内核）渲染，访问这些端口的 URL 会被拦截（ERR_UNSAFE_PORT）。
+# gui_port 命中此黑名单时，Flask 服务器能正常监听，但 WebView2 无法加载页面 → 白屏。
+# 列表涵盖常见服务端口（FTP/SSH/SMTP/DNS/Telnet/IRC 等），防止浏览器被用作代理攻击本机服务。
+UNSAFE_PORTS = frozenset({
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77,
+    79, 87, 95, 101, 102, 103, 104, 109, 110, 111, 113, 115, 117, 119, 123,
+    135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515, 526,
+    530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
+    995, 1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665,
+    6666, 6667, 6668, 6669, 6697, 10080,
+})
+
 
 def get_project_dir() -> str:
     if getattr(sys, 'frozen', False):
@@ -47,6 +60,12 @@ DEFAULT_SETTINGS = {
     "schan_key": "",
     "max_retries": 3,        # 本地原因失败的最大重试次数（不含首次请求）
     "retry_delay": 1.0,      # 重试间隔（秒）
+    "gui_port": None,        # GUI 监听端口，None 表示由 OS 动态分配
+    "batch_delete_reconfirm": True,            # 非搜索态批量删除全部账号时是否强制弹窗确认（仅 count <= threshold 时生效）
+    "batch_delete_reconfirm_threshold": 50,    # 批量删除触发弹窗确认的账号数阈值（超阈值永远弹，不受开关影响）
+    "default_claim_target": "all",             # 新增账号默认领取目标（all/pc/mobile）
+    "default_account_enabled": True,           # 新增账号默认启用状态
+    "default_login_method": "sms",             # 登录弹窗默认登录方式（sms/password），仅影响手动登录弹窗
 }
 
 SETTINGS_SCHEMA = {
@@ -59,6 +78,12 @@ SETTINGS_SCHEMA = {
     "schan_key":         {"type": str,                            "advanced": False, "label": "Server 酱 SendKey", "description": "Server 酱 SendKey"},
     "max_retries":       {"type": int,   "min": 0,    "max": 10,   "advanced": True,  "label": "本地原因导致请求失败后的重试次数", "description": ""},
     "retry_delay":       {"type": float, "min": 0.01, "max": 30.0, "advanced": True,  "label": "本地原因导致请求失败后的每轮重试间隔", "description": ""},
+    "gui_port":          {"type": int,   "min": 1,    "max": 65535, "advanced": True,  "nullable": True, "actual_key": "actual_gui_port", "forbidden": UNSAFE_PORTS, "label": "GUI 监听端口", "description": "留空时由系统自动分配；填入端口则优先尝试，失败回退到自动分配"},
+    "batch_delete_reconfirm":           {"type": bool,                              "advanced": True,  "label": "批量删除全部账号时强制弹窗确认", "description": "仅在删除数量未达到下方阈值时生效。关闭后，小批量删除全部账号不再弹窗；超过阈值时仍会弹窗"},
+    "batch_delete_reconfirm_threshold": {"type": int,   "min": 1,    "max": 1000, "advanced": True,  "label": "批量删除触发弹窗确认的账号数阈值", "description": "批量删除账号数超过此值时强制弹窗，不受上方开关影响"},
+    "default_claim_target":  {"type": str, "options": {"all": "全部领取", "pc": "电脑端加速时长", "mobile": "手机端加速时长"}, "advanced": True, "label": "新增账号默认领取目标", "description": ""},
+    "default_account_enabled": {"type": bool,                            "advanced": True, "label": "新账号默认启用", "description": ""},
+    "default_login_method":  {"type": str, "options": {"sms": "短信验证码", "password": "账号密码"}, "advanced": True, "label": "账号默认登录方式", "description": "只影响手动登录弹窗，与密码自动重登无关联"},
 }
 
 
@@ -92,6 +117,9 @@ def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
                 return False, f"缺少必填设置 {key}", "validation"
             continue
         value = settings[key]
+        # nullable 字段允许 None（如 gui_port=null 表示自动分配），跳过类型/范围校验
+        if value is None and schema.get("nullable", False):
+            continue
         if not isinstance(value, schema["type"]):
             expected_type = schema["type"].__name__
             actual_type = type(value).__name__
@@ -100,6 +128,12 @@ def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
             return False, f"设置 {key} 不能小于 {schema['min']}", "validation"
         if "max" in schema and value > schema["max"]:
             return False, f"设置 {key} 不能大于 {schema['max']}", "validation"
+        # forbidden 黑名单校验（如 gui_port 的 Chromium 不安全端口）
+        if "forbidden" in schema and value in schema["forbidden"]:
+            return False, f"设置 {key} 的值 {value} 不被允许（WebView2 不安全端口）", "validation"
+        # enum 校验：value 必须在 options 的 key 集合中
+        if "options" in schema and value not in schema["options"]:
+            return False, f"设置 {key} 的值 {value!r} 不在允许的选项中", "validation"
     if "schedule_time" in settings and not SCHEDULE_TIME_PATTERN.match(settings["schedule_time"]):
         return False, "时间格式错误，应为 HH:MM", "validation"
     return True, None, None

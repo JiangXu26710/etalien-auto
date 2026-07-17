@@ -2586,6 +2586,11 @@ body {
 .adv-field-row:focus-within .adv-range-suffix {
     color: var(--gold);
 }
+/* actual_key 字段配置与实际不符时整个后缀标红（如 gui_port 配置值与 actual_gui_port 不一致） */
+.adv-range-suffix.mismatch {
+    color: var(--error);
+    font-weight: 600;
+}
 
 /* ===== Enum 自定义下拉框（参考 claim-select，去掉图标） ===== */
 .enum-select-wrap {

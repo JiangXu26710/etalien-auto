@@ -236,7 +236,7 @@ logger = logging.getLogger(__name__)
 
 import webview
 import gui.api as gui_api
-from core.config import reload_settings, migrate_settings, CONFIG_DIR, ACCOUNTS_FILE
+from core.config import reload_settings, migrate_settings, CONFIG_DIR, ACCOUNTS_FILE, UNSAFE_PORTS
 from core.db import DB_PATH, is_db_valid, migrate_from_json
 from werkzeug.serving import make_server
 
@@ -350,30 +350,47 @@ class WindowApi:
         self._window.destroy()
 
 
-def find_available_port(start_port: int = 52137, max_port: int = 52200) -> int:
-    """在指定端口范围内查找第一个可用的本地端口。
+def acquire_gui_port(preferred: int | None = None) -> int:
+    """获取可用的本地 GUI 监听端口。
 
     Args:
-        start_port: 起始端口号（含）。
-        max_port: 结束端口号（含）。
+        preferred: 期望端口。None 或非法时由 OS 动态分配；
+                   合法时优先尝试绑定，失败则回退到 OS 动态分配。
 
     Returns:
-        第一个成功绑定的端口号。
+        已成功获取的端口号（preferred 或 OS 动态分配）。
 
     Raises:
-        RuntimeError: 范围内所有端口均被占用。
+        OSError: preferred 绑定失败且 OS 动态分配也失败。
     """
-    for port in range(start_port, max_port + 1):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(1.0)
-        try:
-            sock.bind(('127.0.0.1', port))
-            sock.close()
-            return port
-        except OSError:
-            sock.close()
-            continue
-    raise RuntimeError(f"无法在端口范围 {start_port}-{max_port} 中找到可用端口")
+    # preferred 合法性校验：必须是非 bool 的 int 且在 1-65535 范围内
+    # （isinstance(True, int) 为 True，需显式排除 bool）
+    if isinstance(preferred, int) and not isinstance(preferred, bool) and 1 <= preferred <= 65535:
+        # Chromium 不安全端口黑名单检查：preferred 命中黑名单时跳过，直接动态分配
+        # （WebView2 基于 Chromium，访问这些端口的 URL 会被拦截 ERR_UNSAFE_PORT → 白屏）
+        if preferred in UNSAFE_PORTS:
+            logger.warning("gui_port 配置值 %d 在 Chromium 不安全端口黑名单中，回退到动态分配", preferred)
+        else:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind(('127.0.0.1', preferred))
+                sock.close()
+                return preferred
+            except OSError as e:
+                sock.close()
+                logger.warning("指定端口 %d 绑定失败，回退到动态分配: %s", preferred, e)
+    elif preferred is not None:
+        logger.warning("gui_port 配置值 %r 非法，回退到动态分配", preferred)
+    # 动态分配：bind(0) 由 OS 分配可用端口，必在 TCP 排除范围之外
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+    except OSError as e:
+        sock.close()
+        raise OSError(f"动态端口分配失败: {e}") from e
 
 
 def _perform_db_migration():
@@ -537,31 +554,32 @@ def main():
     # db 迁移流程（GUI 启动时执行，CLI 不迁移）
     _perform_db_migration()
 
-    # 查找可用端口
+    # 获取可用端口：settings.gui_port 指定则优先尝试，失败/未指定则 OS 动态分配
+    preferred = reload_settings().get('gui_port')
     try:
-        port = find_available_port()
-        if port != 52137:
-            logger.info("端口 52137 被占用，使用端口 %d", port)
-    except RuntimeError as e:
-        logger.error("%s", e)
+        port = acquire_gui_port(preferred)
+        if preferred is not None and port != preferred:
+            logger.warning("指定端口 %s 绑定失败，回退到动态端口 %d", preferred, port)
+        elif preferred is None:
+            logger.info("使用动态端口 %d", port)
+    except OSError as e:
+        logger.error("获取端口失败，GUI 启动失败: %s", e)
         sys.exit(1)
 
-    # 启动服务器：make_server 与 find_available_port 之间存在 TOCTOU 竞态，
-    # 失败时从当前端口+1 开始重试，最多 3 次
-    server = None
-    for attempt in range(3):
+    # 启动服务器：acquire_gui_port 与 make_server 之间存在 TOCTOU 竞态，
+    # 失败时强制动态分配再试一次
+    try:
+        server = make_server('127.0.0.1', port, gui_api.app, threaded=True)
+    except OSError as e:
+        logger.warning("make_server 端口 %d 失败（TOCTOU）: %s，强制动态分配重试", port, e)
         try:
+            port = acquire_gui_port(None)
             server = make_server('127.0.0.1', port, gui_api.app, threaded=True)
-            break
-        except OSError as e:
-            logger.warning("make_server 端口 %d 失败（attempt %d/3）: %s", port, attempt + 1, e)
-            if attempt == 2:
-                logger.error("无法绑定端口，GUI 启动失败")
-                sys.exit(1)
-            port += 1
-            if port > 52200:
-                logger.error("超出端口范围，GUI 启动失败")
-                sys.exit(1)
+        except OSError as e2:
+            logger.error("动态端口也失败，GUI 启动失败: %s", e2)
+            sys.exit(1)
+    # 写入实际端口供 API 暴露给前端（GET /api/settings 返回 actual_gui_port）
+    gui_api._actual_gui_port = port
     # 写入端口文件（CLI 通过此文件找到 GUI 端口，在 serve_forever 之前写入）
     # 同时生成随机 token 用于 CLI→GUI 触发领取的 Bearer 认证
     cli_trigger_token = secrets.token_hex(16)

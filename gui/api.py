@@ -155,6 +155,11 @@ claim_mgr = ClaimManager()
 # 防止本机其他进程未授权触发领取。
 _cli_trigger_token: str | None = None
 
+# GUI 实际监听端口（由 gui/app.py 在 make_server 成功后赋值）。
+# GET /api/settings 返回此值供前端显示「当前:xxx」提示，与 settings.gui_port 配置值对比。
+# 进程生命周期内不变；settings.gui_port 修改后需重启 GUI 才生效。
+_actual_gui_port: int | None = None
+
 
 @app.before_request
 def _check_origin():
@@ -295,10 +300,14 @@ def add_account():
     if repo.get(phone) is not None:
         return error_response("手机号已存在")
 
-    claim_target = data.get("claim_target", "all")
-    # 非法值回退到 "all"，防止前端传参异常导致领取阶段出错
+    # 新增账号默认值从 settings 读（default_claim_target / default_account_enabled）
+    settings = load_settings()
+    default_ct = settings.get("default_claim_target", "all")
+    claim_target = data.get("claim_target", default_ct)
+    # 非法值回退到默认值，防止前端传参异常导致领取阶段出错
     if claim_target not in ("all", "pc", "mobile"):
-        claim_target = "all"
+        claim_target = default_ct if default_ct in ("all", "pc", "mobile") else "all"
+    default_enabled = settings.get("default_account_enabled", True)
     # get_or_create 与 update_fields 一并放入 try：若 update_fields 失败，
     # except 中调用 repo.delete(phone) 清理残留空壳账号，避免脏污数据
     try:
@@ -307,7 +316,7 @@ def add_account():
             phone,
             name=data.get("name", "").strip(),
             remark=data.get("remark", "").strip(),
-            enabled=str(data.get("enabled", True)).lower() not in ("false", "0", "", "no"),
+            enabled=str(data.get("enabled", default_enabled)).lower() not in ("false", "0", "", "no"),
             claim_target=claim_target,
         )
     except Exception as e:
@@ -601,8 +610,7 @@ def _serialize_schema(schema):
     """将 SETTINGS_SCHEMA 序列化为可 JSON 化的字典，type 从 Python 类型对象转为字符串标识。
 
     int -> "int" / float -> "float" / bool -> "bool" / str -> "str"。
-    enum 类型当前生产 schema 未使用，前端渲染器已保留支持；实际新增 enum 字段时需在此补充
-    "enum" 类型标识与 options 字段输出。
+    enum 类型（schema 含 options 字段）：type 输出 "enum"，并附带 options 供前端渲染下拉框。
     min/max 仅在原 schema 中存在时输出；advanced/label/description 缺省时给安全默认值。
     """
     result = {}
@@ -615,6 +623,17 @@ def _serialize_schema(schema):
         item["advanced"] = meta.get("advanced", False)
         item["label"] = meta.get("label", "")
         item["description"] = meta.get("description", "")
+        if "nullable" in meta:
+            item["nullable"] = meta["nullable"]
+        if "actual_key" in meta:
+            item["actual_key"] = meta["actual_key"]
+        if "forbidden" in meta:
+            # frozenset → list，JSON 可序列化；前端按此列表做黑名单校验
+            item["forbidden"] = sorted(meta["forbidden"])
+        if "options" in meta:
+            # enum 类型：覆盖 type 为 "enum"，输出 options 供前端渲染自定义下拉框
+            item["type"] = "enum"
+            item["options"] = meta["options"]
         result[key] = item
     return result
 
@@ -624,10 +643,11 @@ def get_settings():
     """获取设置，刷新缓存以反映外部手动编辑。
 
     返回值在配置项值基础上增加 schema 字段，一次请求同时拿到值和元数据，
-    供前端 schema 驱动渲染。
+    供前端 schema 驱动渲染。同时返回 actual_gui_port（GUI 实际监听端口），
+    供前端在 gui_port 字段旁显示「当前:xxx」提示。
     """
     # 打开设置页时刷新缓存，应对外部手动编辑 settings.json 后的缓存过期
-    return jsonify({**reload_settings(), "schema": _serialize_schema(SETTINGS_SCHEMA)})
+    return jsonify({**reload_settings(), "actual_gui_port": _actual_gui_port, "schema": _serialize_schema(SETTINGS_SCHEMA)})
 
 
 @app.route("/api/settings", methods=["PUT"])
@@ -644,7 +664,7 @@ def update_settings():
     # 按字段类型转换值：int 类字段（max_concurrent 等）、float 类字段
     # （request_interval 等）、str 类字段（schedule_time/schan_key）、bool 类字段（schan_enabled）
     for key, value in data.items():
-        if key in ("max_concurrent", "max_rounds", "mobile_max_rounds", "max_retries"):
+        if key in ("max_concurrent", "max_rounds", "mobile_max_rounds", "max_retries", "batch_delete_reconfirm_threshold"):
             try:
                 settings[key] = int(value)
             except (ValueError, TypeError):
@@ -660,7 +680,7 @@ def update_settings():
                 pass
         elif key == "schedule_time":
             settings[key] = str(value)
-        elif key == "schan_enabled":
+        elif key in ("schan_enabled", "batch_delete_reconfirm", "default_account_enabled"):
             settings[key] = bool(value)
         elif key == "schan_key":
             schan_value = str(value)
@@ -670,6 +690,18 @@ def update_settings():
             # notify.py 直接拼接到 URL 不做格式校验。此处保留长度校验，
             # 不强制正则以兼容历史数据与现有测试用例
             settings[key] = schan_value
+        elif key in ("default_claim_target", "default_login_method"):
+            # enum 字段存储值为字符串，validate_settings 会校验是否在 options 中
+            settings[key] = str(value)
+        elif key == "gui_port":
+            # nullable int：null/空字符串 → None（自动分配）；否则转 int
+            if value is None or value == '':
+                settings[key] = None
+            else:
+                try:
+                    settings[key] = int(value)
+                except (ValueError, TypeError):
+                    pass
 
     is_valid, error_msg, error_cat = validate_settings(settings)
     if not is_valid:
