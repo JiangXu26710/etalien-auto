@@ -9,10 +9,11 @@ let refreshPromise = null;
 let modalMouseDownTarget = null;
 let vipFloatShown = new Set();
 let prevStats = { total: 0, active: 0 };
+// info-icon 内部 SVG（圆点 + 竖线，currentColor 跟随 .info-icon 的 color）
+const INFO_ICON_SVG = '<svg viewBox="0 0 14 14" fill="none"><circle cx="7" cy="3.5" r="1.2" fill="currentColor"/><rect x="6.25" y="6" width="1.5" height="5" rx="0.75" fill="currentColor"/></svg>';
 // 顶部"已启用"卡片数字来自后端 /api/accounts/stats（前端分页缓存无法统计全部账号）
 let statsFromBackend = { enabled: 0 };
 let hasRenderedOnce = false;
-let logMouseDownTarget = null;
 let menuCounter = 0;
 
 // ===== 搜索 + 批量操作卡片状态 =====
@@ -36,7 +37,6 @@ let pendingAddedAccountInfo = null;
 // vipFloatShown: 已显示过飘字动画的账号集合（PC/手机端），防止轮询重复触发
 // prevStats: 上一轮统计值（total/active），供 animateValue 做滚动计数
 // hasRenderedOnce: 首批卡片渲染标志，控制卡片入场交错动画是否播放（虚拟滚动下滚动替换不重置）
-// logMouseDownTarget: 日志弹窗 mousedown 目标，用于遮罩层点击关闭检测
 // menuCounter: 自增计数器，为 action-menu-wrap 生成唯一 ID
 
 // 手机端状态数据缓存
@@ -63,6 +63,43 @@ let viewportRange = { start: 0, end: 0 };
 let refreshGeneration = 0;
 // 领取中标志位：true 时暂停懒加载轮询、禁用刷新按钮
 let isClaiming = false;
+
+// ===== 领取结果弹窗 + 按钮翻面（4.1 / 4.3 / 4.5） =====
+// 翻面状态机：IDLE_FRONT（正面「开始领取」）/ IDLE_BACK（反面「查看结果」）/ CLAIMING_BACK（领取中反面）
+let currentFlipState = 'IDLE_FRONT';
+let currentFlipAngle = 0;            // 当前翻面角度（度），JS 跟踪避免 matrix3d 插值问题
+let opacitySyncRaf = null;           // rAF 句柄，用于同步翻面 opacity
+let rotationAnim = null;             // 翻面旋转 Animation 引用（便于 cancelResultRafs 精确取消）
+let rightMouseDown = false;          // 右键 mousedown 标记，与 mouseup 组合触发翻面
+const FLIP_STATE = { IDLE_FRONT: 'IDLE_FRONT', IDLE_BACK: 'IDLE_BACK', CLAIMING_BACK: 'CLAIMING_BACK' };
+
+// 结果弹窗虚拟列表状态
+let problemMap = new Map();          // phone -> entry（持久化跨轮询复用）
+let expandedSet = new Set();         // 展开行的 phone 集合
+let rowHeightMap = new Map();        // phone -> 实际渲染高度（可变行高用）
+let recentlyExpandedMap = new Map(); // phone -> 展开时间戳，仅用户主动展开时播一次入场动画
+let newPhoneMap = new Map();         // phone -> 进入问题态时间戳，用于闪烁动画续播
+let activeFilter = null;             // 当前筛选状态：null / 'partial' / 'need_login' / 'network_error' / 'error'
+let userClosedResult = false;        // 用户关闭弹窗后本次领取内不再自动弹出
+let lastResultSnapshot = null;       // 上次领取结果快照（浅拷贝 Array.from(problemMap.values())）
+let scrollRaf = null;                // 滚动事件 rAF 句柄
+let flipRafIds = [];                 // FLIP Invert→Play 的 rAF 句柄数组
+let measureRafId = null;             // 测量展开行高度的 rAF 句柄
+
+// 常量
+const COLLAPSED_ROW_HEIGHT = 40;
+const EXPANDED_FALLBACK_HEIGHT = 160;
+const FLIP_DURATION = 320;
+const PROBLEM_STATUSES = new Set(['partial', 'need_login', 'error', 'network_error']);
+const SUMMARY_CHIPS = [
+    { key: 'total',        cls: 'summary-total',   label: '账号数',   filter: '',              filterable: true  },
+    { key: 'success',      cls: 'summary-success', label: '成功',     filter: null,            filterable: false },
+    { key: 'partial',      cls: 'summary-partial', label: '部分完成', filter: 'partial',       filterable: true  },
+    { key: 'networkError', cls: 'summary-network', label: '网络错误', filter: 'network_error', filterable: true  },
+    { key: 'needLogin',    cls: 'summary-login',   label: '登录过期', filter: 'need_login',    filterable: true  },
+    { key: 'error',        cls: 'summary-error',   label: '错误',     filter: 'error',         filterable: true  },
+];
+
 // 单卡基准高度（从 CSS 变量 --card-base-height 读取，默认 98 = 正常账号卡片自然高度估算值）
 let cardBaseHeight = 98;
 // 卡片行间距（与 CSS .virtual-render 的 gap 一致，用于按行计算虚拟滚动）
@@ -531,30 +568,6 @@ function closeModalForce() {
 function _animateCloseModal() {
     const overlay = document.getElementById('modalOverlay');
     const modal = document.getElementById('modalContent');
-    if (!overlay.classList.contains('active')) return;
-    modal.classList.add('closing');
-    modal.addEventListener('animationend', function handler(e) {
-        if (e.target !== modal) return;
-        modal.classList.remove('closing');
-        overlay.classList.remove('active');
-        modal.removeEventListener('animationend', handler);
-    });
-}
-
-function showLogModal() {
-    document.getElementById('logOverlay').classList.add('active');
-}
-
-function closeLogModal(e) {
-    if (e && e.target !== document.getElementById('logOverlay')) return;
-    if (e && logMouseDownTarget !== document.getElementById('logOverlay')) return;
-    _animateCloseLogModal();
-    logMouseDownTarget = null;
-}
-
-function _animateCloseLogModal() {
-    const overlay = document.getElementById('logOverlay');
-    const modal = document.getElementById('logModalContent');
     if (!overlay.classList.contains('active')) return;
     modal.classList.add('closing');
     modal.addEventListener('animationend', function handler(e) {
@@ -2288,17 +2301,728 @@ async function doVerifyPwd(phone) {
     } catch (e) { showToast(e.message || '登录失败', 'error'); }
 }
 
-// 启动异步领取流程：调用后端 /api/claim，将按钮切换为"查看日志"，开始轮询进度。
+/* ====================================================================
+ * ===== 领取结果弹窗 + 按钮翻面（按 docs/claim-result-modal-design.md 4.1-4.6 实施） =====
+ * ==================================================================== */
+
+// ----- 4.1.3 翻面状态切换 + 4.1.5 opacity 同步（替代 backface-visibility）-----
+function setClaimFlipState(state) {
+    currentFlipState = state;
+    const flip = document.getElementById('claimFlip');
+    if (!flip) return;
+    const isFlipped = state === FLIP_STATE.CLAIMING_BACK || state === FLIP_STATE.IDLE_BACK;
+    flip.classList.toggle('flipped', isFlipped);
+    flip.classList.toggle('is-claiming', state === FLIP_STATE.CLAIMING_BACK);
+    isClaiming = (state === FLIP_STATE.CLAIMING_BACK);
+    animateFlipTo(isFlipped ? 180 : 0);
+}
+
+// 翻面动画 + rAF 内同步 opacity/pointer-events（替代 backface-visibility: hidden）
+function animateFlipTo(targetAngle) {
+    const inner = document.querySelector('.claim-flip-inner');
+    const front = document.querySelector('.claim-flip-front');
+    const back  = document.querySelector('.claim-flip-back');
+    if (!inner || !front || !back) return;
+
+    // 取消所有进行中的动画和 rAF
+    inner.getAnimations().forEach(a => a.cancel());
+    front.getAnimations().forEach(a => a.cancel());
+    back.getAnimations().forEach(a => a.cancel());
+    if (opacitySyncRaf) { cancelAnimationFrame(opacitySyncRaf); opacitySyncRaf = null; }
+
+    const fromAngle = currentFlipAngle;
+    currentFlipAngle = targetAngle;
+
+    // 无变化（初始化）：直接设置最终态，跳过动画
+    if (fromAngle === targetAngle) {
+        inner.style.transform = `rotateX(${targetAngle}deg)`;
+        const showFront = targetAngle === 0;
+        front.style.opacity = showFront ? '1' : '0';
+        front.style.pointerEvents = showFront ? 'auto' : 'none';
+        back.style.opacity = showFront ? '0' : '1';
+        back.style.pointerEvents = showFront ? 'none' : 'auto';
+        return;
+    }
+
+    const flippingToBack = targetAngle === 180;
+
+    rotationAnim = inner.animate([
+        { transform: `rotateX(${fromAngle}deg)` },
+        { transform: `rotateX(${targetAngle}deg)` }
+    ], { duration: 550, easing: 'cubic-bezier(0.25, 0.8, 0.25, 1)', fill: 'forwards' });
+
+    function syncOpacity() {
+        const st = rotationAnim.playState;
+        if (st === 'finished' || st === 'idle') {
+            const showFront = !flippingToBack;
+            front.style.opacity = showFront ? '1' : '0';
+            front.style.pointerEvents = showFront ? 'auto' : 'none';
+            back.style.opacity = showFront ? '0' : '1';
+            back.style.pointerEvents = showFront ? 'none' : 'auto';
+            opacitySyncRaf = null;
+            return;
+        }
+        const progress = rotationAnim.effect.getComputedTiming().progress;
+        if (progress !== null) {
+            const showFront = progress < 0.5 ? flippingToBack : !flippingToBack;
+            front.style.opacity = showFront ? '1' : '0';
+            front.style.pointerEvents = showFront ? 'auto' : 'none';
+            back.style.opacity = showFront ? '0' : '1';
+            back.style.pointerEvents = showFront ? 'none' : 'auto';
+        }
+        opacitySyncRaf = requestAnimationFrame(syncOpacity);
+    }
+    opacitySyncRaf = requestAnimationFrame(syncOpacity);
+}
+
+// ----- 4.1.4 右键翻面绑定（mousedown + mouseup，仅绑一次，dataset 去重）-----
+function bindClaimFlipRightKey() {
+    const flip = document.getElementById('claimFlip');
+    if (!flip || flip.dataset.rightKeyBound === '1') return;
+    flip.dataset.rightKeyBound = '1';
+
+    flip.addEventListener('mousedown', (e) => {
+        if (e.button === 2) {
+            e.preventDefault();
+            rightMouseDown = true;
+        }
+    });
+
+    flip.addEventListener('mouseup', (e) => {
+        if (e.button !== 2 || !rightMouseDown) return;
+        rightMouseDown = false;
+        if (isClaiming) {
+            showToast('领取进行中，无法翻面', 'info');
+            return;
+        }
+        const nextState = currentFlipState === FLIP_STATE.IDLE_FRONT
+            ? FLIP_STATE.IDLE_BACK
+            : FLIP_STATE.IDLE_FRONT;
+        setClaimFlipState(nextState);
+    });
+
+    flip.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+    });
+}
+
+// ----- 4.6.1 状态文本映射 + 4.6.2 详情内容 + 4.3.3 行 HTML 构建 -----
+
+// 时间戳格式化为 HH:MM:SS
+function formatTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000);
+    const h = String(d.getHours()).padStart(2, '0');
+    const m = String(d.getMinutes()).padStart(2, '0');
+    const s = String(d.getSeconds()).padStart(2, '0');
+    return `${h}:${m}:${s}`;
+}
+
+// 按 status 返回状态文本
+function getStatusText(item) {
+    switch (item.status) {
+        case 'need_login':    return '登录状态过期';
+        case 'network_error': return '网络/服务端错误，未能领取';
+        case 'error':         return '程序运行时出现报错，详见日志';
+        case 'partial':       return `部分完成 ${item.current || 0}/${item.total || 0} 个`;
+        default:              return '';
+    }
+}
+
+// 按 status 渲染展开详情内容
+function buildDetailHTML(item) {
+    if (item.status === 'need_login') {
+        return `<div class="detail-tip">请到账号卡片重新登录该账号，并考虑配置账号密码，以使用自动重登功能。</div>`;
+    }
+    if (item.status === 'network_error') {
+        const lastReq = item.lastReqTs ? formatTime(item.lastReqTs) : '—';
+        return `<div class="detail-block"><span class="detail-block-label">最后一次请求</span><span class="detail-block-value">${lastReq}</span></div>` +
+               `<div class="detail-tip">建议稍后重试或检查网络连接，或在高级配置项增加重试次数。</div>`;
+    }
+    if (item.status === 'error') {
+        const errText = item.error || '';
+        const errEncoded = encodeURIComponent(errText);
+        return `<div class="detail-block"><span class="detail-block-label">原始报错</span></div>` +
+               `<div class="detail-error-text">` +
+               `<button type="button" class="copy-btn" data-text="${errEncoded}" aria-label="复制错误文本">` +
+               `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +
+               `<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>` +
+               `<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>` +
+               `</svg></button>${escapeHtml(errText)}</div>`;
+    }
+    if (item.status === 'partial') {
+        const total = item.total || 0;
+        const claimed = item.current || 0;
+        const failed = Math.max(0, total - claimed);
+        const vipInc = (item.vip_after || 0) - (item.vip_before || 0);
+        const mobInc = (item.mobile_after || 0) - (item.mobile_before || 0);
+        return `<div class="detail-label">领取明细</div>` +
+               `<div class="detail-grid">` +
+               `<div class="detail-item"><span class="detail-item-label">成功</span><span class="detail-item-value success">${claimed} / ${total}</span></div>` +
+               `<div class="detail-item"><span class="detail-item-label">失败</span><span class="detail-item-value error">${failed}</span></div>` +
+               `<div class="detail-item"><span class="detail-item-label">PC时长增量</span><span class="detail-item-value gold">+${formatDuration(vipInc)}</span></div>` +
+               `<div class="detail-item"><span class="detail-item-label">手机时长增加</span><span class="detail-item-value gold">+${formatDuration(mobInc)}</span></div>` +
+               `</div>` +
+               `<div class="detail-tip">部分任务失败，请考虑重试领取任务。</div>`;
+    }
+    return '';
+}
+
+// 计算单行的类名（含 is-new 续播、just-expanded 入场动画标记）
+function computeRowClass(item, expanded) {
+    const isNew = newPhoneMap.has(item.phone) && (Date.now() - newPhoneMap.get(item.phone) < 1800);
+    let cls = `result-row status-${item.status}`;
+    if (expanded) cls += ' expanded';
+    if (isNew) cls += ' is-new';
+    if (expanded && recentlyExpandedMap.has(item.phone)) {
+        const ts = recentlyExpandedMap.get(item.phone);
+        if (Date.now() - ts < 300) cls += ' just-expanded';
+        recentlyExpandedMap.delete(item.phone);
+    }
+    return cls;
+}
+
+// 计算单行的 style 属性（is-new 的负 animation-delay，用于虚拟滚动刷新时续播）
+function computeRowStyleAttr(item) {
+    if (newPhoneMap.has(item.phone) && (Date.now() - newPhoneMap.get(item.phone) < 1800)) {
+        const elapsed = Date.now() - newPhoneMap.get(item.phone);
+        return `animation-delay: -${elapsed}ms;`;
+    }
+    return '';
+}
+
+// 构建单行内部 HTML（不含外层 .result-row div，每次轮询都重建可见行 innerHTML）
+function buildRowInnerHTML(item) {
+    const toggleHTML = '<span class="result-row-toggle">▶</span>';
+    const labelHTML = `<span class="result-row-label">${escapeHtml(item.label || item.phone)}</span>`;
+    const statusHTML = `<span class="result-row-status"><span class="status-dot"></span>${escapeHtml(getStatusText(item))}</span>`;
+    const timeHTML = `<span class="result-row-time">${formatTime(item.firstSeenTs)}</span>`;
+    const mainHTML = `<div class="result-row-main">${toggleHTML}${labelHTML}${statusHTML}${timeHTML}</div>`;
+    const detailHTML = `<div class="result-row-detail">${buildDetailHTML(item)}</div>`;
+    return mainHTML + detailHTML;
+}
+
+// 构建单行完整 HTML（仅用于首次创建新行节点）
+function buildResultRowHTML(item, expanded) {
+    const cls = computeRowClass(item, expanded);
+    const styleAttr = computeRowStyleAttr(item);
+    const styleStr = styleAttr ? ` style="${styleAttr}"` : '';
+    return `<div class="${cls}" data-phone="${escapeHtml(item.phone)}"${styleStr}>${buildRowInnerHTML(item)}</div>`;
+}
+
+// ----- 4.3.3 虚拟列表 -----
+
+// 单列虚拟滚动定位：折叠行固定 COLLAPSED_ROW_HEIGHT；展开行用 rowHeightMap || EXPANDED_FALLBACK_HEIGHT
+// 上下各缓冲 BUFFER=3 行；单次正向扫描 + yAtStart 数组避免二次遍历
+function computeResultVisibleRange(scrollTop, viewportH) {
+    const BUFFER = 3;
+    const phones = Array.from(problemMap.keys());
+    const rowH = (phone) => expandedSet.has(phone)
+        ? (rowHeightMap.get(phone) || EXPANDED_FALLBACK_HEIGHT)
+        : COLLAPSED_ROW_HEIGHT;
+
+    let y = 0;
+    let start = -1;
+    let totalH = 0;
+    const yAtStart = [];
+    for (let i = 0; i < phones.length; i++) {
+        yAtStart.push(y);
+        const h = rowH(phones[i]);
+        totalH += h;
+        if (start === -1 && y + h > scrollTop - BUFFER * COLLAPSED_ROW_HEIGHT) {
+            start = Math.max(0, i - BUFFER);
+        }
+        y += h;
+    }
+    if (start === -1) start = 0;
+    const offsetY = yAtStart[start];
+    let cursor = offsetY;
+    let end = phones.length;
+    for (let i = start; i < phones.length; i++) {
+        const h = rowH(phones[i]);
+        if (cursor > scrollTop + viewportH + BUFFER * COLLAPSED_ROW_HEIGHT) {
+            end = Math.min(phones.length, i + BUFFER);
+            break;
+        }
+        cursor += h;
+    }
+    return { start, end, totalH, offsetY };
+}
+
+// 渲染视口：增量更新 DOM + FLIP Last/Invert/Play + 测量展开行高度
+function renderResultViewport(useFLIP = false) {
+    const list = document.getElementById('resultList');
+    if (!list) return;
+    const viewportH = list.clientHeight;
+    const scrollTop = list.scrollTop;
+    const range = computeResultVisibleRange(scrollTop, viewportH);
+
+    const renderEl = document.getElementById('resultRender');
+    const spacerEl = document.getElementById('resultSpacer');
+    if (!renderEl || !spacerEl) return;
+
+    // FLIP First：重建前记录旧位置（仅 useFLIP=true 时）
+    const oldRects = new Map();
+    if (useFLIP) {
+        renderEl.querySelectorAll('.result-row').forEach(row => {
+            const phone = row.dataset.phone;
+            if (phone) oldRects.set(phone, row.getBoundingClientRect().top);
+        });
+    }
+
+    spacerEl.style.height = range.totalH + 'px';
+    renderEl.style.transform = `translateY(${range.offsetY}px)`;
+
+    // 构建本次目标 phone 列表（按 firstSeenTs 倒序，最新在顶部；应用 activeFilter）
+    let problems = Array.from(problemMap.values());
+    if (activeFilter) {
+        problems = problems.filter(p => p.status === activeFilter);
+    }
+    problems.sort((a, b) => (b.firstSeenTs || 0) - (a.firstSeenTs || 0));
+    const targetPhones = problems.slice(range.start, range.end).map(p => p.phone);
+    const targetSet = new Set(targetPhones);
+    const itemByPhone = new Map(problems.map(p => [p.phone, p]));
+
+    // 1) 删除：旧有但本次目标列表中没有的行
+    const rowsToRemove = [];
+    renderEl.querySelectorAll('.result-row').forEach(row => {
+        const phone = row.dataset.phone;
+        if (phone && !targetSet.has(phone)) rowsToRemove.push(row);
+    });
+    rowsToRemove.forEach(row => row.remove());
+
+    // 2) 记录 .detail-error-text 的 scrollTop（重建后恢复）
+    const errorScrollTops = new Map();
+    renderEl.querySelectorAll('.result-row.expanded .detail-error-text').forEach(el => {
+        const phone = el.closest('.result-row').dataset.phone;
+        if (phone && el.scrollTop > 0) errorScrollTops.set(phone, el.scrollTop);
+    });
+
+    // 3) 按目标顺序遍历：插入新行 + 更新已存在行 + 保证 DOM 顺序
+    let prevRow = null;
+    for (const phone of targetPhones) {
+        const item = itemByPhone.get(phone);
+        if (!item) continue;
+        const expanded = expandedSet.has(phone);
+        let row = renderEl.querySelector(`.result-row[data-phone="${CSS.escape(phone)}"]`);
+        if (row) {
+            // 已存在行：更新类名 + 重建 innerHTML（一次性替换）
+            row.className = computeRowClass(item, expanded);
+            row.setAttribute('style', computeRowStyleAttr(item));
+            row.innerHTML = buildRowInnerHTML(item);
+        } else {
+            // 新行：创建并插入
+            const tmp = document.createElement('div');
+            tmp.innerHTML = buildResultRowHTML(item, expanded);
+            row = tmp.firstElementChild;
+        }
+        // 保证 DOM 顺序
+        if (prevRow) {
+            if (prevRow.nextElementSibling !== row) {
+                prevRow.after(row);
+            }
+        } else {
+            if (renderEl.firstElementChild !== row) {
+                renderEl.prepend(row);
+            }
+        }
+        prevRow = row;
+    }
+
+    // 4) 恢复 .detail-error-text 的 scrollTop
+    errorScrollTops.forEach((savedScrollTop, phone) => {
+        const el = renderEl.querySelector(`.result-row[data-phone="${CSS.escape(phone)}"] .detail-error-text`);
+        if (el) el.scrollTop = savedScrollTop;
+    });
+
+    // 5) 空状态切换
+    const emptyEl = document.getElementById('resultEmpty');
+    if (emptyEl) {
+        const hasProblems = problems.length > 0;
+        emptyEl.hidden = hasProblems;
+        list.style.display = hasProblems ? '' : 'none';
+    }
+
+    bindResultListEvents();
+
+    // 6) FLIP Last + Invert + Play
+    if (useFLIP) {
+        let newRowCount = 0;
+        renderEl.querySelectorAll('.result-row').forEach(row => {
+            const phone = row.dataset.phone;
+            if (phone && !oldRects.has(phone)) newRowCount++;
+        });
+        const newRowOffsetPercent = -Math.min(newRowCount * 100, 100);
+
+        // 批量读所有 newTop 再批量写 transform（避免循环内读-写交替触发强制 reflow）
+        const newTops = new Map();
+        renderEl.querySelectorAll('.result-row').forEach(row => {
+            const phone = row.dataset.phone;
+            if (phone) newTops.set(phone, row.getBoundingClientRect().top);
+        });
+
+        renderEl.querySelectorAll('.result-row').forEach(row => {
+            const phone = row.dataset.phone;
+            if (!phone) return;
+            const newTop = newTops.get(phone);
+            const oldTop = oldRects.get(phone);
+            if (oldTop === undefined) {
+                // 新行：从顶部上方滑入
+                row.style.transform = `translateY(${newRowOffsetPercent}%)`;
+                row.style.transition = 'none';
+                const rafId = requestAnimationFrame(() => {
+                    const idx = flipRafIds.indexOf(rafId);
+                    if (idx !== -1) flipRafIds.splice(idx, 1);
+                    row.style.transition = `transform ${FLIP_DURATION}ms cubic-bezier(0.4, 0, 0.2, 1)`;
+                    row.style.transform = '';
+                });
+                flipRafIds.push(rafId);
+            } else {
+                // 旧行：FLIP 推下
+                const diff = newTop - oldTop;
+                if (Math.abs(diff) < 1) return;
+                row.style.transform = `translateY(${oldTop - newTop}px)`;
+                row.style.transition = 'none';
+                const rafId = requestAnimationFrame(() => {
+                    const idx = flipRafIds.indexOf(rafId);
+                    if (idx !== -1) flipRafIds.splice(idx, 1);
+                    row.style.transition = `transform ${FLIP_DURATION}ms cubic-bezier(0.4, 0, 0.2, 1)`;
+                    row.style.transform = '';
+                });
+                flipRafIds.push(rafId);
+            }
+        });
+    }
+
+    // 7) 测量展开行真实高度（rAF 内读写分离）
+    if (measureRafId) { cancelAnimationFrame(measureRafId); measureRafId = null; }
+    measureRafId = requestAnimationFrame(() => {
+        measureRafId = null;
+        const heightsChanged = [];
+        renderEl.querySelectorAll('.result-row.expanded').forEach(row => {
+            const phone = row.dataset.phone;
+            const h = row.getBoundingClientRect().height;
+            if (h && h !== rowHeightMap.get(phone)) {
+                heightsChanged.push({ phone, h });
+            }
+        });
+        if (heightsChanged.length > 0) {
+            heightsChanged.forEach(({ phone, h }) => rowHeightMap.set(phone, h));
+            renderResultViewport(false);
+        }
+    });
+}
+
+// 事件委托：点击 .copy-btn 复制错误文本；点击 .result-row 切换展开
+function bindResultListEvents() {
+    const renderEl = document.getElementById('resultRender');
+    if (!renderEl || renderEl.dataset.delegated === '1') return;
+    renderEl.dataset.delegated = '1';
+    renderEl.addEventListener('click', (e) => {
+        const copyBtn = e.target.closest('.copy-btn');
+        if (copyBtn) {
+            e.stopPropagation();
+            copyErrorText(copyBtn.dataset.text, copyBtn);
+            return;
+        }
+        const row = e.target.closest('.result-row');
+        if (row && row.dataset.phone) {
+            toggleExpand(row.dataset.phone);
+        }
+    });
+}
+
+// 展开/收起切换 + recentlyExpandedMap 标记 + 立即重渲染
+function toggleExpand(phone) {
+    if (expandedSet.has(phone)) {
+        expandedSet.delete(phone);
+    } else {
+        expandedSet.add(phone);
+        recentlyExpandedMap.set(phone, Date.now());
+    }
+    renderResultViewport(false);
+}
+
+// 复制错误文本到剪贴板 + .copied class + toast
+async function copyErrorText(text, btn) {
+    try {
+        await navigator.clipboard.writeText(decodeURIComponent(text));
+        btn.classList.add('copied');
+        showToast('已复制错误文本', 'success');
+        setTimeout(() => btn.classList.remove('copied'), 1500);
+    } catch (err) {
+        showToast('复制失败：' + err.message, 'error');
+    }
+}
+
+// ----- 4.4.3 数据更新 -----
+
+// 单次遍历同时完成：problemMap 新增/更新 + counts 累加 + 移除已恢复账号 + updateSummary
+function updateProblemListAndSummary(progress) {
+    const counts = { done: 0, already_done: 0, partial: 0, need_login: 0, network_error: 0, error: 0, running: 0 };
+    const seen = new Set();
+    for (const p of progress) {
+        counts[p.status] = (counts[p.status] || 0) + 1;
+        if (PROBLEM_STATUSES.has(p.status)) {
+            seen.add(p.phone);
+            const old = problemMap.get(p.phone);
+            if (!old || !old.firstSeenTs) {
+                // 首次进入问题态或旧记录无 firstSeenTs：用 p.firstSeenTs 或当前时间兜底
+                if (!p.firstSeenTs) p.firstSeenTs = Math.floor(Date.now() / 1000);
+                if (!newPhoneMap.has(p.phone)) newPhoneMap.set(p.phone, Date.now());
+            } else {
+                // 保留旧 firstSeenTs，避免后端未返回时丢失
+                if (!p.firstSeenTs) p.firstSeenTs = old.firstSeenTs;
+            }
+            problemMap.set(p.phone, p);
+        }
+    }
+    // 移除已恢复的账号 + 同步清理辅助 Map
+    const toDelete = [];
+    for (const phone of problemMap.keys()) {
+        if (!seen.has(phone)) toDelete.push(phone);
+    }
+    for (const phone of toDelete) {
+        problemMap.delete(phone);
+        expandedSet.delete(phone);
+        rowHeightMap.delete(phone);
+        newPhoneMap.delete(phone);
+        recentlyExpandedMap.delete(phone);
+    }
+    updateSummary(counts);
+}
+
+// 首次构建 chip DOM（dataset.initialized='1'）+ 差量更新 <b> + bump 动画（WAAPI + dataset.bumpAnim）
+function updateSummary(counts) {
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
+    const values = {
+        total: total,
+        success: counts.done + counts.already_done,
+        partial: counts.partial,
+        networkError: counts.network_error,
+        needLogin: counts.need_login,
+        error: counts.error,
+    };
+
+    const container = document.getElementById('resultSummary');
+    if (!container) return;
+    if (!container.dataset.initialized) {
+        container.innerHTML = SUMMARY_CHIPS.map(c => {
+            const filterAttr = c.filterable
+                ? ` data-filter="${c.filter}" tabindex="0"`
+                : '';
+            return `<span class="summary-chip ${c.cls}${c.filterable ? ' filterable' : ''}" data-key="${c.key}"${filterAttr}>${c.label} <b>0</b></span>`;
+        }).join('');
+        container.dataset.initialized = '1';
+        // chip 点击事件委托（仅绑一次）
+        container.addEventListener('click', (e) => {
+            const chip = e.target.closest('.summary-chip.filterable');
+            if (!chip) return;
+            onChipClick(chip.dataset.filter);
+        });
+        container.addEventListener('keydown', (e) => {
+            const chip = e.target.closest('.summary-chip.filterable');
+            if (!chip) return;
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                onChipClick(chip.dataset.filter);
+            }
+        });
+    }
+
+    SUMMARY_CHIPS.forEach((c) => {
+        const chip = container.querySelector(`.summary-chip[data-key="${c.key}"]`);
+        if (!chip) return;
+        const b = chip.querySelector('b');
+        const newVal = values[c.key];
+        const lastVal = Number(chip.dataset.lastVal || 0);
+        if (newVal === lastVal) return;
+        b.textContent = newVal;
+        chip.dataset.lastVal = newVal;
+        if (chip.dataset.bumpAnim) {
+            try { chip.dataset.bumpAnim.cancel(); } catch (e) {}
+            chip.dataset.bumpAnim = null;
+        }
+        const anim = chip.animate(
+            [{ transform: 'scale(1)' }, { transform: 'scale(1.06)' }, { transform: 'scale(1)' }],
+            { duration: 500, easing: 'cubic-bezier(0.4, 0, 0.2, 1)' }
+        );
+        chip.dataset.bumpAnim = anim;
+        anim.onfinish = () => { chip.dataset.bumpAnim = null; };
+        anim.oncancel  = () => { chip.dataset.bumpAnim = null; };
+    });
+}
+
+// chip 点击逻辑：再点一次取消；账号数 chip 清除筛选
+function onChipClick(filterStr) {
+    const filter = filterStr || null;
+    if (filter === null) {
+        activeFilter = null;
+    } else if (activeFilter === filter) {
+        activeFilter = null;
+    } else {
+        activeFilter = filter;
+    }
+    applyFilterAndRender();
+}
+
+// 基于已有 problemMap 重新筛选渲染（不更新 problemMap，不调 updateSummary）
+function applyFilterAndRender() {
+    updateChipActiveState();
+    const overlayActive = document.getElementById('resultOverlay').classList.contains('active');
+    if (overlayActive) renderResultViewport(false);
+}
+
+// 遍历 SUMMARY_CHIPS 切换 .active class
+function updateChipActiveState() {
+    const container = document.getElementById('resultSummary');
+    if (!container) return;
+    SUMMARY_CHIPS.forEach((c) => {
+        const chip = container.querySelector(`.summary-chip[data-key="${c.key}"]`);
+        if (!chip) return;
+        const isActive = c.filterable && c.filter === activeFilter;
+        chip.classList.toggle('active', isActive);
+    });
+}
+
+// ----- 4.3.5 滚动定位（自动跟随顶部）-----
+
+// FLIP 渲染路径：先快照 oldPhoneSet → 调 updateProblemListAndSummary → 按 firstSeenTs 倒序 → isAtTop 时 useFLIP=true
+function rebuildProblemList(progress) {
+    const oldPhoneSet = new Set(problemMap.keys());
+    updateProblemListAndSummary(progress);
+
+    let problems = Array.from(problemMap.values());
+    if (activeFilter) {
+        problems = problems.filter(p => p.status === activeFilter);
+    }
+    problems.sort((a, b) => (b.firstSeenTs || 0) - (a.firstSeenTs || 0));
+    const newRowCount = problems.filter(p => !oldPhoneSet.has(p.phone)).length;
+    const hasNewRow = newRowCount > 0;
+
+    const overlay = document.getElementById('resultOverlay');
+    if (!overlay || !overlay.classList.contains('active')) return;
+
+    const list = document.getElementById('resultList');
+    const isAtTop = !list || list.scrollTop <= 2;
+
+    if (hasNewRow && !isAtTop) {
+        renderResultViewport(false);
+    } else {
+        renderResultViewport(hasNewRow);
+    }
+}
+
+// ----- 4.4.4 弹窗控制 -----
+
+// 弹窗打开：异步函数，按 isClaiming 区分数据源
+async function showResultModal() {
+    const overlay = document.getElementById('resultOverlay');
+    if (!overlay) return;
+    overlay.classList.add('active');
+    const list = document.getElementById('resultList');
+    if (list) list.scrollTop = 0;
+    updateChipActiveState();
+
+    if (isClaiming) {
+        renderResultViewport();
+    } else {
+        try {
+            const data = await api('/api/claim/last-result');
+            // await 期间用户可能已关闭弹窗
+            if (!overlay.classList.contains('active')) return;
+            updateProblemListAndSummary(data.progress || []);
+            renderResultViewport();
+        } catch (e) {
+            showToast(e.message || '拉取上次结果失败', 'error');
+        }
+    }
+}
+
+// 关闭弹窗：userClosedResult=true + cancelResultRafs + recentlyExpandedMap.clear()
+function closeResultModal() {
+    const overlay = document.getElementById('resultOverlay');
+    if (overlay) overlay.classList.remove('active');
+    userClosedResult = true;
+    cancelResultRafs();
+    recentlyExpandedMap.clear();
+}
+
+// 取消所有 rAF 句柄 + 清理 FLIP 残留 transform/transition + 取消 chip bump + 取消翻面 rotationAnim
+function cancelResultRafs() {
+    if (scrollRaf) { cancelAnimationFrame(scrollRaf); scrollRaf = null; }
+    if (opacitySyncRaf) { cancelAnimationFrame(opacitySyncRaf); opacitySyncRaf = null; }
+    if (flipRafIds && flipRafIds.length) {
+        flipRafIds.forEach(id => cancelAnimationFrame(id));
+        flipRafIds.length = 0;
+    }
+    if (measureRafId) { cancelAnimationFrame(measureRafId); measureRafId = null; }
+    const renderEl = document.getElementById('resultRender');
+    if (renderEl) {
+        renderEl.querySelectorAll('.result-row').forEach(row => {
+            row.style.transform = '';
+            row.style.transition = '';
+        });
+    }
+    document.querySelectorAll('.summary-chip').forEach(chip => {
+        if (chip.dataset.bumpAnim) {
+            try { chip.dataset.bumpAnim.cancel(); } catch (e) {}
+            chip.dataset.bumpAnim = null;
+        }
+    });
+    if (rotationAnim) {
+        // 修复：cancel 前先把 currentFlipAngle 同步到 inner.style.transform。
+        // 原因：animateFlipTo 动画路径仅靠 WAAPI fill:forwards 保持 inner 的 rotateX，
+        // 未写入 inline style。cancel() 会撤销 fill:forwards，inner 回到 transform:none，
+        // 导致反面（自身 transform: rotateX(180deg)）相对屏幕变成 180° 文字上下颠倒。
+        const innerEl = document.querySelector('.claim-flip-inner');
+        if (innerEl) {
+            innerEl.style.transform = `rotateX(${currentFlipAngle}deg)`;
+        }
+        try { rotationAnim.cancel(); } catch (e) {}
+        rotationAnim = null;
+    }
+}
+
+// ----- 4.5.2 状态重置（9 项清空）-----
+function resetClaimState() {
+    lastResultSnapshot = null;
+    problemMap.clear();
+    expandedSet.clear();
+    rowHeightMap.clear();
+    newPhoneMap.clear();
+    recentlyExpandedMap.clear();
+    activeFilter = null;
+    userClosedResult = false;
+    cancelResultRafs();
+}
+
+// ----- 4.5.1a 调试接口（暴露只读 getter）-----
+function bindClaimDebug() {
+    if (window.__claimDebug) return;
+    window.__claimDebug = {
+        get rotationAnim() { return rotationAnim; },
+        get problemMap() { return problemMap; },
+        get flipRafIds() { return flipRafIds; },
+        get measureRafId() { return measureRafId; },
+        get scrollRaf() { return scrollRaf; },
+        get opacitySyncRaf() { return opacitySyncRaf; },
+        get activeFilter() { return activeFilter; },
+        get expandedSet() { return expandedSet; },
+        get isClaiming() { return isClaiming; },
+    };
+}
+
+// 启动异步领取流程：调用后端 /api/claim，按钮翻到反面（CLAIMING_BACK），开始轮询进度。
 async function startClaim() {
-    const btn = document.getElementById('btnClaim');
     // 搜索态：搜索结果为空时拒绝领取
     if (isSearching() && searchResultPhones.size === 0) {
         showToast('搜索结果为空，无可领取账号', 'error');
         return;
     }
-    btn.disabled = true;
-    btn.textContent = '领取中...';
-    isClaiming = true;
+    // 4.5.2：清空全部 9 项状态，避免跨领取周期残留
+    resetClaimState();
+    setClaimFlipState(FLIP_STATE.CLAIMING_BACK);
     document.getElementById('btnRefresh').disabled = true;
     // 领取中禁用批量操作卡片（并发领取与批量操作互斥）
     const batchCard = document.getElementById('batchAction');
@@ -2317,21 +3041,10 @@ async function startClaim() {
         await api('/api/claim', claimOpts);
         showToast(isSearching() ? `已开始领取 ${claimCount} 个搜索结果账号` : '领取已开始', 'info');
 
-        document.getElementById('logList').innerHTML = '';
-        document.getElementById('claimStatus').textContent = '进行中...';
         vipFloatShown.clear();
-
-        const btnClaim = document.getElementById('btnClaim');
-        btnClaim.disabled = false;
-        btnClaim.textContent = '查看日志';
-        btnClaim.onclick = showLogModal;
-
         pollClaimProgress();
     } catch (e) {
-        btn.disabled = false;
-        btn.textContent = '开始领取';
-        btn.onclick = startClaim;
-        isClaiming = false;
+        setClaimFlipState(FLIP_STATE.IDLE_FRONT);
         document.getElementById('btnRefresh').disabled = false;
         if (batchCard) batchCard.classList.remove('is-locked');
         showToast(e.message || '启动领取失败', 'error');
@@ -2339,9 +3052,9 @@ async function startClaim() {
 }
 
 /**
- * 领取进度轮询：每 1s 调用 /api/claim/progress，更新日志面板和卡片进度。
+ * 领取进度轮询：每 1s 调用 /api/claim/progress，更新结果弹窗和卡片进度。
  * 停止条件：data.running=false（领取完成）或连续失败 10 次（后端不可达）。
- * 领取完成时自动刷新状态并恢复按钮。
+ * 领取完成时自动刷新状态并保留反面「查看结果」可点击。
  */
 function pollClaimProgress() {
     if (claimPollTimer) clearTimeout(claimPollTimer);
@@ -2354,66 +3067,42 @@ function pollClaimProgress() {
         try {
             const data = await api('/api/claim/progress');
             pollFailCount = 0;
-            const logList = document.getElementById('logList');
 
+            // P5：先一次性建立 phone→element Map，避免 1 万次 document.querySelector
+            const cardByPhone = new Map();
+            document.querySelectorAll('.account-card').forEach(card => {
+                const phone = card.dataset.phone;
+                if (phone) cardByPhone.set(phone, card);
+            });
+
+            if (data.running) {
+                // 数据层更新 problemMap + updateSummary，并 FLIP 渲染视口
+                rebuildProblemList(data.progress);
+            } else {
+                // 领取完成：后端 finish() 已清空 _progress，此次 progress 为 []。
+                // 必须先缓存 problemMap 快照（用于 lastResultSnapshot 语义），
+                // 并跳过 rebuildProblemList 避免空 progress 清空 problemMap 与 chip，
+                // 保留完成态以供仍 active 的结果弹窗继续渲染。
+                lastResultSnapshot = Array.from(problemMap.values());
+            }
+
+            // 自动弹出条件：遇问题账号且用户未关闭弹窗时才自动弹出
+            // 注：完成态下后端 finish() 已清空 _progress，data.progress 为 []，
+            // 故 hasProblem 基于 problemMap 判断（problemMap 在两种状态下都保留正确数据：
+            // 领取中由 rebuildProblemList 实时更新；完成时跳过 rebuild 保留完成态）。
+            if (!userClosedResult) {
+                const overlay = document.getElementById('resultOverlay');
+                const hasProblem = Array.from(problemMap.values()).some(p => PROBLEM_STATUSES.has(p.status));
+                if (hasProblem && overlay && !overlay.classList.contains('active')) {
+                    overlay.classList.add('active');
+                }
+            }
+
+            // 卡片进度与 VIP 时长更新（保留原行为）
             data.progress.forEach(item => {
-                if (['partial', 'need_login', 'error', 'network_error'].includes(item.status)) {
-                    const overlay = document.getElementById('logOverlay');
-                    if (!overlay.classList.contains('active')) {
-                        overlay.classList.add('active');
-                    }
-                }
-
-                let entry = logList.querySelector(`[data-phone="${CSS.escape(item.phone)}"]`);
-                const now = new Date().toLocaleTimeString();
-
-                if (!entry) {
-                    entry = document.createElement('div');
-                    entry.className = 'log-entry';
-                    entry.dataset.phone = item.phone;
-                    logList.appendChild(entry);
-                }
-
-                if (item.status === 'need_login') {
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-error">${escapeHtml(item.phone)}</span> 需要登录`;
-                } else if (item.status === 'network_error') {
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-error">${escapeHtml(item.phone)}</span> 网络/服务端错误，未能领取`;
-                } else if (item.status === 'error') {
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-error">${escapeHtml(item.phone)}</span> 错误: ${escapeHtml(item.error || '未知')}`;
-                } else if (item.status === 'running') {
-                    const total = item.total || '?';
-                    const current = item.current || 0;
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-gold">${escapeHtml(item.phone)}</span> 领取中 ${current}/${total}`;
-                } else if (item.status === 'done') {
-                    const diff = item.vip_after - item.vip_before;
-                    const mobileDiff = (item.mobile_after || 0) - (item.mobile_before || 0);
-                    const total = item.total || '?';
-                    const current = item.current || 0;
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-gold">${escapeHtml(item.phone)}</span> 完成 ${current}/${total} +${formatDuration(diff)}`;
-                    if ((diff > 0 || mobileDiff > 0) && !vipFloatShown.has(item.phone)) {
-                        vipFloatShown.add(item.phone);
-                        if (diff > 0) showVipFloat(item.phone, diff);
-                        if (mobileDiff > 0) showMobileFloat(item.phone, mobileDiff);
-                    }
-                } else if (item.status === 'already_done') {
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-gold">${escapeHtml(item.phone)}</span> 已全部完成`;
-                } else if (item.status === 'partial') {
-                    const diff = item.vip_after - item.vip_before;
-                    const mobileDiff = (item.mobile_after || 0) - (item.mobile_before || 0);
-                    const total = item.total || '?';
-                    const current = item.current || 0;
-                    entry.innerHTML = `<span class="log-time">${now}</span> <span class="log-warning">${escapeHtml(item.phone)}</span> 部分完成 ${current}/${total} +${formatDuration(diff)}`;
-                    if ((diff > 0 || mobileDiff > 0) && !vipFloatShown.has(item.phone)) {
-                        vipFloatShown.add(item.phone);
-                        if (diff > 0) showVipFloat(item.phone, diff);
-                        if (mobileDiff > 0) showMobileFloat(item.phone, mobileDiff);
-                    }
-                }
-
-                logList.scrollTop = logList.scrollHeight;
                 updateCardProgress(item.phone, item.current || 0, item.total || 0, item.phase);
                 if (['done', 'partial', 'already_done'].includes(item.status) && item.vip_after > 0) {
-                    const claimCard = document.querySelector(`.account-card[data-phone="${CSS.escape(item.phone)}"]`);
+                    const claimCard = cardByPhone.get(item.phone);
                     if (claimCard) {
                         // 精确定位 .card-front 内的 .account-vip，避免更新到 .card-sizer 占位元素
                         const vipEl = claimCard.querySelector('.card-front .account-vip');
@@ -2421,21 +3110,24 @@ function pollClaimProgress() {
                             vipEl.firstChild.textContent = formatDuration(item.vip_after);
                         }
                     }
-                    // 领取期间进度更新只直接操作 DOM，不写 statusCache
-                    // 领取结束后走全量刷新流程（refreshAll），queriedPhones.clear() 触发懒加载重新查询覆盖旧数据
+                }
+                // VIP 飘字动画（done/partial 时若有增量）
+                if (item.status === 'done' || item.status === 'partial') {
+                    const diff = item.vip_after - item.vip_before;
+                    const mobileDiff = (item.mobile_after || 0) - (item.mobile_before || 0);
+                    if ((diff > 0 || mobileDiff > 0) && !vipFloatShown.has(item.phone)) {
+                        vipFloatShown.add(item.phone);
+                        if (diff > 0) showVipFloat(item.phone, diff);
+                        if (mobileDiff > 0) showMobileFloat(item.phone, mobileDiff);
+                    }
                 }
             });
 
             if (!data.running) {
                 claimPollTimer = null;
-                document.getElementById('claimStatus').textContent = '已完成';
-                document.getElementById('claimStatus').style.animation = 'none';
-
-                const btn = document.getElementById('btnClaim');
-                btn.disabled = false;
-                btn.textContent = '开始领取';
-                btn.onclick = startClaim;
-                isClaiming = false;
+                // 领取完成：按钮停在反面（IDLE_BACK），可查看上次结果
+                // lastResultSnapshot 已在上方 rebuildProblemList 之前缓存
+                setClaimFlipState(FLIP_STATE.IDLE_BACK);
                 document.getElementById('btnRefresh').disabled = false;
                 const batchCardEnd = document.getElementById('batchAction');
                 if (batchCardEnd) batchCardEnd.classList.remove('is-locked');
@@ -2448,16 +3140,8 @@ function pollClaimProgress() {
             pollFailCount += 1;
             if (pollFailCount >= POLL_MAX_FAIL) {
                 claimPollTimer = null;
-                const statusEl = document.getElementById('claimStatus');
-                if (statusEl) {
-                    statusEl.textContent = '领取状态查询失败，请刷新页面';
-                    statusEl.style.animation = 'none';
-                }
-                const btn = document.getElementById('btnClaim');
-                btn.disabled = false;
-                btn.textContent = '开始领取';
-                btn.onclick = startClaim;
-                isClaiming = false;
+                // 连续失败：异常回退到正面
+                setClaimFlipState(FLIP_STATE.IDLE_FRONT);
                 document.getElementById('btnRefresh').disabled = false;
                 const batchCardFail = document.getElementById('batchAction');
                 if (batchCardFail) batchCardFail.classList.remove('is-locked');
@@ -2496,15 +3180,11 @@ async function detectCliTrigger() {
         const data = await api('/api/claim/progress');
         if (data.running) {
             // 后端在领取但前端无感知（CLI 触发），接管 UI 至领取中状态
-            document.getElementById('logList').innerHTML = '';
-            document.getElementById('claimStatus').textContent = '进行中...';
+            // 4.5.3：清空状态 + 翻到反面 + 启动轮询
+            resetClaimState();
+            setClaimFlipState(FLIP_STATE.CLAIMING_BACK);
             vipFloatShown.clear();
-            const btn = document.getElementById('btnClaim');
-            btn.disabled = false;
-            btn.textContent = '查看日志';
-            btn.onclick = showLogModal;
-            // 与 startClaim 行为对齐：暂停懒加载轮询、禁用刷新按钮、禁用批量操作卡片（pollClaimProgress 停止时恢复）
-            isClaiming = true;
+            // 与 startClaim 行为对齐：禁用刷新按钮、禁用批量操作卡片（pollClaimProgress 停止时恢复）
             document.getElementById('btnRefresh').disabled = true;
             const batchCard = document.getElementById('batchAction');
             if (batchCard) batchCard.classList.add('is-locked');
@@ -2613,7 +3293,7 @@ function renderSettingsField(key, schema, value) {
     }
 
     const infoIconHTML = desc
-        ? `<span class="info-icon" data-tooltip="${escapeHtml(desc)}">i</span>`
+        ? `<span class="info-icon" data-tooltip="${escapeHtml(desc)}">${INFO_ICON_SVG}</span>`
         : '';
 
     return `
@@ -3104,14 +3784,87 @@ document.addEventListener('focusout', e => {
     }
 });
 
-// ESC 关闭：高级区打开时关闭高级区（不关闭主弹窗）
+// ESC 关闭：高级区打开时关闭高级区（不关闭主弹窗）；结果弹窗打开时关闭结果弹窗
 document.addEventListener('keydown', e => {
     if (e.key !== 'Escape') return;
     const advPanel = document.getElementById('advPanel');
     if (advPanel && advPanel.classList.contains('active')) {
         onAdvClose();
+        return;
+    }
+    const resultOverlay = document.getElementById('resultOverlay');
+    if (resultOverlay && resultOverlay.classList.contains('active')) {
+        closeResultModal();
     }
 });
+
+// F5 / Ctrl+R：重载前端（仅重载 WebView，保留 Flask 后端进程）
+document.addEventListener('keydown', e => {
+    if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r')) {
+        e.preventDefault();
+        location.reload();
+    }
+});
+
+// 标题栏右键菜单：右键标题栏空白处弹出，最小化/最大化/关闭按钮上不响应
+(() => {
+    const menu = document.getElementById('titleContextMenu');
+    const titleBar = document.getElementById('titleBar');
+    if (!menu || !titleBar) return;
+
+    const closeMenu = () => {
+        menu.classList.remove('open');
+        menu.hidden = true;
+    };
+
+    const openMenu = (x, y) => {
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+        menu.hidden = false;
+        // 重置动画（已打开时再次右键可平滑切换位置）
+        menu.classList.remove('open');
+        void menu.offsetWidth;
+        menu.classList.add('open');
+    };
+
+    // 标题栏右键：弹出菜单（控制按钮区域不响应，让浏览器默认行为发生）
+    titleBar.addEventListener('contextmenu', (e) => {
+        if (e.target.closest('.title-btn')) return;
+        e.preventDefault();
+        openMenu(e.clientX, e.clientY);
+    });
+
+    // 点击菜单项：执行对应动作后关闭
+    menu.addEventListener('click', (e) => {
+        const item = e.target.closest('.title-context-item');
+        if (!item) return;
+        const act = item.dataset.act;
+        closeMenu();
+        if (act === 'reload-frontend') location.reload();
+    });
+
+    // 点击菜单外部：关闭
+    document.addEventListener('click', (e) => {
+        if (menu.hidden) return;
+        if (menu.contains(e.target)) return;
+        closeMenu();
+    });
+
+    // 右键其他位置：关闭（标题栏内的右键由 titleBar 监听器处理，这里跳过）
+    document.addEventListener('contextmenu', (e) => {
+        if (menu.hidden) return;
+        if (titleBar.contains(e.target) && !e.target.closest('.title-btn')) return;
+        closeMenu();
+    });
+
+    // ESC：关闭菜单
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !menu.hidden) closeMenu();
+    });
+
+    // 窗口失焦：关闭菜单（避免失焦后菜单残留）
+    window.addEventListener('blur', closeMenu);
+})();
 
 // scroll capture：隐藏 info-tooltip + 关闭 enum dropdown
 window.addEventListener('scroll', () => {
@@ -3192,7 +3945,7 @@ function showSettings() {
             </div>
             <!-- Server酱领取情况通知 -->
             <div class="form-group">
-                <label>领取情况通知（<a href="https://sct.ftqq.com/login" target="_blank" class="label-link">Server酱</a>）<span class="info-icon" data-tooltip="只有通过计划任务领取权益时，才会进行一次通知">i</span></label>
+                <label>领取情况通知（<a href="https://sct.ftqq.com/login" target="_blank" class="label-link">Server酱</a>）<span class="info-icon" data-tooltip="只有通过计划任务领取权益时，才会进行一次通知">${INFO_ICON_SVG}</span></label>
                 <div class="schedule-row">
                     <input type="password" id="setSchanKey" value="${escapeHtml(schanKey)}" placeholder="SendKey" class="schan-key-input" onfocus="this.type='text'" onblur="if(this.value)this.type='password'">
                     <label class="toggle-rect">
@@ -3762,6 +4515,12 @@ document.addEventListener('DOMContentLoaded', () => {
     bindBatchActionEvents();
     // 初始化全局配置值缓存（供批量删除弹窗确认等设置弹窗外的逻辑读取配置项当前值）
     refreshSettingsCache();
+    // 4.1.4 / 4.1.5 / 4.3.3 / 4.5.1a：领取按钮翻面右键绑定、结果列表事件委托、调试接口
+    bindClaimFlipRightKey();
+    bindResultListEvents();
+    bindClaimDebug();
+    // 4.1.3 初始化翻面状态：fromAngle === targetAngle，跳过动画直接设置最终态
+    setClaimFlipState(FLIP_STATE.IDLE_FRONT);
     setTimeout(() => {
         const splash = document.getElementById('splash');
         if (splash) {
@@ -3772,9 +4531,12 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // 初始化按钮涟漪按压反馈：mousedown 时从鼠标位置生成金色渐变涟漪圆，0.5s 扩散淡出。
+// 含 .claim-flip-face（领取按钮翻面后两面）以提供按压反馈。
 function initRipple() {
+    if (document.documentElement.dataset.rippleBound === '1') return;  // 【补 R15】去重标记，避免重复绑定
+    document.documentElement.dataset.rippleBound = '1';
     document.addEventListener('mousedown', (e) => {
-        const btn = e.target.closest('.btn-primary, .btn-secondary, .btn-accent, .btn-small, .btn-modal, .login-method-tab');
+        const btn = e.target.closest('.btn-primary, .btn-secondary, .btn-accent, .btn-small, .btn-modal, .login-method-tab, .claim-flip-face');
         if (!btn) return;
         const rect = btn.getBoundingClientRect();
         const size = Math.max(rect.width, rect.height) * 2;

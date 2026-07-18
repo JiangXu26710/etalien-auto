@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import threading
+import time
 
 from typing import Any
 from urllib.parse import urlparse
@@ -18,7 +19,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from core.config import load_settings, save_settings, reload_settings, validate_settings, VERSION, SETTINGS_SCHEMA
 from core.db import DbAccountRepository
-from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, batch_get_account_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule, batch_update_accounts, get_enabled_accounts_by_phones
+from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, batch_get_account_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule, batch_update_accounts, get_enabled_accounts_by_phones, PROBLEM_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -87,10 +88,11 @@ class ClaimManager:
     """
 
     def __init__(self):
-        """初始化锁、运行标记和进度列表。"""
+        """初始化锁、运行标记和进度字典。"""
         self._lock = threading.Lock()
         self._running = False
-        self._progress: list[dict[str, Any]] = []
+        self._progress: dict[str, dict[str, Any]] = {}  # P9: dict[str, dict]，key 为 phone
+        self._last_progress: list[dict[str, Any]] = []  # R43: finish 浅拷贝结果，list[dict]
 
     @property
     def running(self) -> bool:
@@ -108,13 +110,19 @@ class ClaimManager:
             if self._running:
                 return False
             self._running = True
-            self._progress = []
+            self._progress = {}  # P9/R43: 重置为空 dict
             return True
 
     def finish(self) -> None:
-        """标记当前领取任务结束。"""
+        """标记当前领取任务结束，并将 _progress 浅拷贝保存为上次结果快照。
+
+        R43 与 P9 dict 改造一致：_progress 是 dict[str, dict]，浅拷贝其 values()。
+        避免 deepcopy 在 1 万规模下持锁 50-100ms 阻塞 get_progress。
+        """
         with self._lock:
+            self._last_progress = [dict(e) for e in self._progress.values()]
             self._running = False
+            self._progress = {}  # R43/P9: 重置为空 dict
 
     def get_progress(self) -> dict:
         """返回当前进度快照。
@@ -126,26 +134,62 @@ class ClaimManager:
             不再聚合为顶层汇总字段（前端已砍掉总进度卡片）。
         """
         with self._lock:
+            # R19/P10: 先快照 keys 避免 iterate 期间并发 add 新增 key 触发 RuntimeError
+            keys = list(self._progress.keys())
             return {
                 "running": self._running,
-                # 浅拷贝列表 + 浅拷贝每个 dict：progress 条目字段全是基本类型（str/int/float），
+                # 浅拷贝每个 dict：progress 条目字段全是基本类型（str/int/float），
                 # 无嵌套 list/dict，浅拷贝比 deepcopy 快 5-10 倍且语义等价。
                 # 持锁期间快照，释放锁后后端 update 修改的是原 dict（已不在快照中）。
-                "progress": [dict(e) for e in self._progress],
+                "progress": [dict(self._progress[k]) for k in keys],
+            }
+
+    def get_last_progress(self) -> dict:
+        """持锁返回上次结果快照的浅拷贝。
+
+        与 get_progress 实现一致：避免返回原 dict 引用被外部修改。
+        从未领取过时 _last_progress 为 []，progress 返回空列表。
+        """
+        with self._lock:
+            return {
+                "running": self._running,
+                "progress": [dict(e) for e in self._last_progress],
             }
 
     def add_progress_entry(self, entry: dict[str, Any]) -> None:
-        """添加新账号的进度条目。"""
+        """添加新账号的进度条目。
+
+        R30/P10: 预填 firstSeenTs/lastReqTs/error 占位 None，
+        避免 service.py L778/L1308 update 新增 key 触发
+        get_progress / finish() 浅拷贝 iterate 时的 RuntimeError
+        （dict size 变化是 RuntimeError 触发条件，预填后只改 value 不增 key）。
+        兜底：直接以问题态 add 时（如 network_error 首次 add）写入 firstSeenTs/lastReqTs。
+        """
         with self._lock:
-            self._progress.append(entry)
+            entry.setdefault('firstSeenTs', None)
+            entry.setdefault('lastReqTs', None)
+            entry.setdefault('error', None)
+            if entry.get('status') in PROBLEM_STATUSES and not entry.get('firstSeenTs'):
+                entry['firstSeenTs'] = time.time()
+            if entry.get('status') == 'network_error':
+                entry['lastReqTs'] = time.time()
+            self._progress[entry["phone"]] = entry  # P9: dict[key]=value 替代 list.append
 
     def update_progress_entry(self, phone: str, updates: dict[str, Any]) -> None:
-        """按手机号更新已有进度条目。"""
+        """按手机号更新已有进度条目。
+
+        P9: O(1) 查找替代 for 循环 O(N) 线性扫描。
+        异常兜底路径同样写入 firstSeenTs/lastReqTs（与 add 一致）。
+        """
         with self._lock:
-            for entry in self._progress:
-                if entry["phone"] == phone:
-                    entry.update(updates)
-                    break
+            entry = self._progress.get(phone)
+            if entry is not None:
+                entry.update(updates)
+                status = entry.get('status')
+                if status in PROBLEM_STATUSES and not entry.get('firstSeenTs'):
+                    entry['firstSeenTs'] = time.time()
+                if status == 'network_error':
+                    entry['lastReqTs'] = time.time()
 
 
 claim_mgr = ClaimManager()
@@ -574,6 +618,17 @@ def start_claim():
 def get_claim_progress():
     """获取当前领取进度。"""
     return jsonify(claim_mgr.get_progress())
+
+
+@app.route("/api/claim/last-result", methods=["GET"])
+def get_claim_last_result():
+    """获取上次领取结果快照。
+
+    返回结构与 /api/claim/progress 一致：{ running, progress }。
+    progress 取 _last_progress（finish 时浅拷贝的快照）；
+    若从未领取过则 progress 为空列表。
+    """
+    return jsonify(claim_mgr.get_last_progress())
 
 
 @app.route("/api/cli-trigger-claim", methods=["POST"])

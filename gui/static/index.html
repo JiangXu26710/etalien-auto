@@ -25,9 +25,9 @@
       <div class="title-bar-text">外星仔加速器 - 免广告自动领时长 F</div>
     </div>
     <div class="title-bar-controls">
-      <button type="button" class="title-btn title-btn-min" onclick="windowMinimize()" title="最小化"></button>
-      <button type="button" class="title-btn title-btn-max" onclick="windowMaximize()" title="最大化"></button>
-      <button type="button" class="title-btn title-btn-close" onclick="windowClose()" title="关闭"></button>
+      <button type="button" class="title-btn title-btn-min" onclick="windowMinimize()" aria-label="最小化"></button>
+      <button type="button" class="title-btn title-btn-max" onclick="windowMaximize()" aria-label="最大化"></button>
+      <button type="button" class="title-btn title-btn-close" onclick="windowClose()" aria-label="关闭"></button>
     </div>
   </header>
 
@@ -35,10 +35,12 @@
     <section class="stats-bar" id="statsBar">
       <!-- 第一张：启用 / 总数 合并卡片 -->
       <div class="stat-card" id="statCount">
-        <div class="stat-count">
-          <span id="enabledCount">0</span><span class="sep">/</span><span class="total" id="totalCount">0</span>
+        <div class="stat-content">
+          <div class="stat-count">
+            <span id="enabledCount">0</span><span class="sep">/</span><span class="total" id="totalCount">0</span>
+          </div>
+          <div class="stat-label">启用 / 总数</div>
         </div>
-        <div class="stat-label">启用 / 总数</div>
       </div>
 
       <!-- 第二张：批量操作卡片（三态变形 idle→select→confirm） -->
@@ -83,9 +85,12 @@
 
     <section class="action-bar">
       <div class="action-bar-left">
-        <button type="button" class="btn-primary" id="btnClaim" onclick="startClaim()">
-          开始领取
-        </button>
+        <div class="claim-flip" id="claimFlip">
+          <div class="claim-flip-inner">
+            <button type="button" class="claim-flip-face claim-flip-front" id="btnClaimFront" onclick="startClaim()">开始领取</button>
+            <button type="button" class="claim-flip-face claim-flip-back" id="btnClaimBack" onclick="showResultModal()">查看结果</button>
+          </div>
+        </div>
         <button type="button" class="btn-secondary" id="btnRefresh" onclick="refreshAll()">
           刷新状态
         </button>
@@ -116,17 +121,37 @@
   </div>
 </div>
 
-<div class="modal-overlay" id="logOverlay" onmousedown="logMouseDownTarget=event.target" onclick="closeLogModal(event)">
-  <div class="modal log-modal" id="logModalContent" onclick="event.stopPropagation()">
-    <div class="log-modal-header">
-      <h2>领取日志</h2>
-      <span class="claim-status" id="claimStatus"></span>
+<div class="modal-overlay" id="resultOverlay" onclick="closeResultModal(event)">
+  <div class="result-modal" id="resultModalContent" onclick="event.stopPropagation()">
+    <div class="result-modal-header">
+      <h2>领取结果</h2>
+      <button class="result-modal-close" onclick="closeResultModal()" aria-label="关闭">×</button>
     </div>
-    <div class="log-list" id="logList"></div>
+    <div class="result-summary" id="resultSummary">
+      <!-- 顶部汇总统计，由 JS 动态填充 -->
+    </div>
+    <div class="result-list-wrapper">
+      <div class="result-list" id="resultList">
+        <div class="result-spacer" id="resultSpacer"></div>
+        <div class="result-render" id="resultRender"></div>
+      </div>
+      <div class="result-empty" id="resultEmpty" hidden>
+        <div class="result-empty-icon">✓</div>
+        <div>暂无问题账号</div>
+      </div>
+    </div>
   </div>
 </div>
 
 <div class="toast-container" id="toastContainer"></div>
+
+<!-- 标题栏右键菜单（用于"重载前端"等不常用功能入口） -->
+<div class="title-context-menu" id="titleContextMenu" hidden>
+  <button type="button" class="title-context-item" data-act="reload-frontend">
+    <span class="title-context-label">重载前端</span>
+    <span class="title-context-hotkey">F5</span>
+  </button>
+</div>
 
 <script src="app.js"></script>
 </body>
