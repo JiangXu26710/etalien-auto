@@ -80,12 +80,12 @@ SETTINGS_SCHEMA = {
     "max_retries":       {"type": int,   "min": 0,    "max": 10,   "advanced": True,  "label": "本地原因导致请求失败后的重试次数", "description": ""},
     "retry_delay":       {"type": float, "min": 0.01, "max": 30.0, "advanced": True,  "label": "本地原因导致请求失败后的每轮重试间隔", "description": ""},
     "gui_port":          {"type": int,   "min": 1,    "max": 65535, "advanced": True,  "nullable": True, "actual_key": "actual_gui_port", "forbidden": UNSAFE_PORTS, "label": "GUI 监听端口", "description": "留空时由系统自动分配；填入端口则优先尝试，失败回退到自动分配"},
-    "batch_delete_reconfirm":           {"type": bool,                              "advanced": True,  "label": "批量删除全部账号时强制弹窗确认", "description": "仅在删除数量未达到下方阈值时生效。关闭后，小批量删除全部账号不再弹窗；超过阈值时仍会弹窗"},
+    "batch_delete_reconfirm":           {"type": bool,                              "advanced": True,  "label": "批量删除全部账号时强制弹窗确认", "description": "仅在删除数量未达到下方阈值时生效。关闭后，小批量删除全部账号不再弹窗；超过阈值时仍会弹窗", "display_on": "出现弹窗", "display_off": "隐藏弹窗"},
     "batch_delete_reconfirm_threshold": {"type": int,   "min": 1,    "max": 1000, "advanced": True,  "label": "批量删除触发弹窗确认的账号数阈值", "description": "批量删除账号数超过此值时强制弹窗，不受上方开关影响"},
     "default_claim_target":  {"type": str, "options": {"all": "全部领取", "pc": "电脑端加速时长", "mobile": "手机端加速时长"}, "advanced": True, "label": "新增账号默认领取目标", "description": ""},
-    "default_account_enabled": {"type": bool,                            "advanced": True, "label": "新账号默认启用", "description": ""},
+    "default_account_enabled": {"type": bool,                            "advanced": True, "label": "新账号默认启用", "description": "", "display_on": "默认启用", "display_off": "默认禁用"},
     "default_login_method":  {"type": str, "options": {"sms": "短信验证码", "password": "账号密码"}, "advanced": True, "label": "账号默认登录方式", "description": "只影响手动登录弹窗，与密码自动重登无关联"},
-    "show_tip":              {"type": bool,                            "advanced": True, "label": "显示 tip 提示", "description": ""},
+    "show_tip":              {"type": bool,                            "advanced": True, "label": "显示 tip 提示", "description": "", "display_on": "显示TIP", "display_off": "隐藏TIP"},
 }
 
 

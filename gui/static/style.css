@@ -2579,6 +2579,28 @@ body {
     font-weight: 600;
 }
 
+/* ===== Bool 字段（高级配置）：左侧 disabled 占位输入框 + 右侧开关 =====
+ * 视觉与 int/float 字段对齐：开关复用 .adv-range-suffix 位置（min-width:100px, 右对齐）
+ */
+.adv-bool-wrap input:disabled {
+    background: var(--bg-locked);
+    color: var(--text-secondary);
+    cursor: not-allowed;
+    border-color: var(--border);
+    box-shadow: none;
+    text-align: center;
+    font-family: var(--font-sans);
+    letter-spacing: 1px;
+}
+.adv-bool-wrap input:disabled::placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+/* 开关在 .adv-range-suffix 内右对齐：让 toggle-rect 与右侧范围提示的右边缘对齐 */
+.adv-bool-toggle {
+    /* 复用 .adv-range-suffix 的 min-width:100px / justify-content:flex-end，无需覆盖 */
+}
+
 /* ===== Enum 自定义下拉框（参考 claim-select，去掉图标） ===== */
 .enum-select-wrap {
     position: relative;

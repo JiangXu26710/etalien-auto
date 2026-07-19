@@ -3276,11 +3276,26 @@ function renderSettingsField(key, schema, value) {
                 <span class="adv-range-suffix${mismatchClass}">「${suffixText}」</span>
             </div>`;
     } else if (schema.type === 'bool') {
+        // 与 int/float 字段视觉对齐：左侧 disabled 占位输入框 + 右侧开关（开关复用 .adv-range-suffix 的位置，右对齐）
+        // schema 提供 display_on/off 时，输入框显示当前开关状态文字；切换开关时 onBoolToggle 同步更新
+        const hasDisplay = !!(schema.display_on && schema.display_off);
+        const displayText = hasDisplay ? (value ? schema.display_on : schema.display_off) : '';
+        const displayAttr = hasDisplay
+            ? `value="${escapeHtml(displayText)}"`
+            : `placeholder="—"`;
+        const changeAttr = hasDisplay
+            ? ` onchange="onBoolToggle(this, ${jsStr(schema.display_on)}, ${jsStr(schema.display_off)})"`
+            : '';
         controlHTML = `
-            <label class="toggle-rect">
-                <input type="checkbox" data-key="${escapeHtml(key)}" ${value ? 'checked' : ''}>
-                <span class="toggle-rect-slider"></span>
-            </label>`;
+            <div class="adv-input-wrap adv-bool-wrap">
+                <input type="text" disabled ${displayAttr} aria-label="${escapeHtml(label)} 状态">
+                <span class="adv-range-suffix adv-bool-toggle">
+                    <label class="toggle-rect">
+                        <input type="checkbox" data-key="${escapeHtml(key)}" ${value ? 'checked' : ''}${changeAttr}>
+                        <span class="toggle-rect-slider"></span>
+                    </label>
+                </span>
+            </div>`;
     } else if (schema.type === 'enum') {
         const opts = Object.entries(schema.options || {});
         const selOpt = opts.find(([v]) => v === value) || opts[0] || ['', ''];
@@ -3514,6 +3529,14 @@ function pickEnumSelect(id, value, label, btn) {
         dropdown.classList.remove('open');
         dropdown.classList.remove('drop-up');
     }
+}
+
+/* bool 字段开关切换：同步更新左侧 disabled 占位输入框的状态文字 */
+function onBoolToggle(checkbox, onText, offText) {
+    const wrap = checkbox.closest('.adv-bool-wrap');
+    if (!wrap) return;
+    const display = wrap.querySelector('input[type="text"]');
+    if (display) display.value = checkbox.checked ? onText : offText;
 }
 
 /* 关闭所有 enum dropdown */
@@ -4063,7 +4086,10 @@ async function doSaveSettings() {
                     method: 'POST',
                     body: { time: common.schedule_time },
                 });
-                showToast(result.msg || '计划任务已创建', 'success');
+                // 后端判定无变化时（任务已存在、时间相同且启用中），不弹"计划任务已创建"提示
+                if (!result.unchanged) {
+                    showToast(result.msg || '计划任务已创建', 'success');
+                }
             } catch (e) { showToast('请确保程序以管理员权限运行，且杀毒软件已经关闭', 'error'); }
         } else {
             try {

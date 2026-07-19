@@ -689,6 +689,10 @@ def _serialize_schema(schema):
             # enum 类型：覆盖 type 为 "enum"，输出 options 供前端渲染自定义下拉框
             item["type"] = "enum"
             item["options"] = meta["options"]
+        if "display_on" in meta:
+            # bool 类型：开关开启/关闭时 disabled 占位输入框显示的状态文字
+            item["display_on"] = meta["display_on"]
+            item["display_off"] = meta["display_off"]
         result[key] = item
     return result
 

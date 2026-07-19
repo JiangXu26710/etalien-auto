@@ -646,6 +646,12 @@ def create_schedule(schedule_time: str) -> dict[str, Any]:
     if err:
         return {"error": err, "error_category": err_cat or "system"}
 
+    # 覆盖前先检查：若任务已存在、时间相同且处于启用状态，则跳过 schtasks /create，
+    # 避免重复注册、避免误清用户在外部做的修改；前端据此不弹"计划任务已创建"提示。
+    current = query_schedule()
+    if current.get("exists") and current.get("enabled") and current.get("time") == schedule_time:
+        return {"ok": True, "unchanged": True}
+
     cli_cmd = _get_cli_exe_path()
     if getattr(sys, "frozen", False):
         task_cmd = cli_cmd
