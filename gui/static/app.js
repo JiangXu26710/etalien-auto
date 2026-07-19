@@ -1795,8 +1795,17 @@ async function toggleAccount(phone, enabled) {
             body: { enabled },
         });
         // 局部更新 pageCache 中该 phone 的 enabled 字段，不重新请求分页
+        // 先读旧值以判断 searchEnabled 增减方向
+        const found = findInPageCache(phone);
+        const wasEnabled = found ? !!found.page[found.idxInPage].enabled : null;
         updatePageCacheEntry(phone, { enabled });
         rerenderCardByPhone(phone);
+        // 搜索态：phone 在搜索结果分页缓存中时，局部调整 searchEnabled
+        // （fetchStats 只更新全体 statsFromBackend.enabled，不更新 searchEnabled）
+        if (isSearching() && wasEnabled !== null && wasEnabled !== !!enabled) {
+            searchEnabled += enabled ? 1 : -1;
+            refreshStatsCard();
+        }
         // 启用/禁用直接影响"已启用"卡片数字，从后端确认
         fetchStats();
     } catch (e) { showToast(e.message || '切换失败', 'error'); }
@@ -3080,9 +3089,14 @@ function pollClaimProgress() {
                 rebuildProblemList(data.progress);
             } else {
                 // 领取完成：后端 finish() 已清空 _progress，此次 progress 为 []。
-                // 必须先缓存 problemMap 快照（用于 lastResultSnapshot 语义），
-                // 并跳过 rebuildProblemList 避免空 progress 清空 problemMap 与 chip，
-                // 保留完成态以供仍 active 的结果弹窗继续渲染。
+                // 直接跳过会导致 chip 错过最后一批从 running 变 done 的账号，
+                // 故拉取 _last_progress（包含所有账号最终状态）刷新 chip 与 problemMap。
+                try {
+                    const lastData = await api('/api/claim/last-result');
+                    if (Array.isArray(lastData.progress) && lastData.progress.length > 0) {
+                        rebuildProblemList(lastData.progress);
+                    }
+                } catch (e) { /* 拉取失败静默，chip 保留上次值 */ }
                 lastResultSnapshot = Array.from(problemMap.values());
             }
 
@@ -4063,6 +4077,12 @@ async function doSaveSettings() {
         advDirty = false;
         // 刷新全局配置值缓存，让批量删除等设置弹窗外的逻辑读到最新值
         refreshSettingsCache();
+        // 同步 tip 可见性（设置页修改 show_tip 后立即同步到 action-bar 的 tip 模块）
+        if (typeof advancedStaging !== 'undefined' && advancedStaging && typeof advancedStaging.show_tip !== 'undefined') {
+            if (typeof syncTipVisibilityFromSettings === 'function') {
+                syncTipVisibilityFromSettings(advancedStaging.show_tip);
+            }
+        }
         closeModalForce();
     } catch (e) { showToast(e.message || '保存失败', 'error'); }
     finally { if (btn) btn.disabled = false; }
@@ -4506,7 +4526,28 @@ function bindBatchActionEvents() {
     });
 }
 
+// 全局禁用浏览器原生 title 悬停提示（不保留内容，未来动态新增的 title 也会被自动清除）
+function disableTitleGlobally() {
+    // 初始扫描：清除现有 DOM 中所有 title 属性
+    document.querySelectorAll('[title]').forEach(el => el.removeAttribute('title'));
+    // 监听未来动态插入的节点 + title 属性变化（覆盖 JS 动态设置的 title）
+    new MutationObserver((mutations) => {
+        for (const m of mutations) {
+            if (m.type === 'attributes' && m.attributeName === 'title') {
+                m.target.removeAttribute('title');
+            } else if (m.type === 'childList') {
+                m.addedNodes.forEach(n => {
+                    if (n.nodeType !== 1) return;
+                    if (n.hasAttribute('title')) n.removeAttribute('title');
+                    n.querySelectorAll?.('[title]').forEach(el => el.removeAttribute('title'));
+                });
+            }
+        }
+    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['title'] });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
+    disableTitleGlobally();
     initDrag();
     initRipple();
     initAccountsView();
@@ -4514,7 +4555,10 @@ document.addEventListener('DOMContentLoaded', () => {
     bindSearchEvents();
     bindBatchActionEvents();
     // 初始化全局配置值缓存（供批量删除弹窗确认等设置弹窗外的逻辑读取配置项当前值）
-    refreshSettingsCache();
+    // 缓存就绪后初始化 tip 模块（读取 show_tip 决定可见性，需在缓存填充后再调用 initTipModule）
+    refreshSettingsCache().then(() => {
+        if (typeof initTipModule === 'function') initTipModule();
+    });
     // 4.1.4 / 4.1.5 / 4.3.3 / 4.5.1a：领取按钮翻面右键绑定、结果列表事件委托、调试接口
     bindClaimFlipRightKey();
     bindResultListEvents();
@@ -4551,3 +4595,495 @@ function initRipple() {
         ripple.addEventListener('animationend', () => ripple.remove());
     });
 }
+
+// === tip 模块 ===
+// 来源：demo/tip-demo.html 第 400-838 行 script 块，已移除 hint-section 状态点相关代码
+// （dotPaused/dotHidden/stateIndex/stateQueue 在主项目不存在）
+// 算法：洗牌轮播（一整轮不重复）+ JS rAF 驱动动画（动态追加 + 凸曲线递减速度）
+// 暴露：window.initTipModule（页面加载后调用）、window.syncTipVisibilityFromSettings（设置页保存后调用）
+(function() {
+    // 文案集中维护在 gui/static/tip-content.js（window.TipContent.list），由 index.html 在 app.js 之前同步加载
+    // 兜底空数组：tip-content.js 加载失败时仍能安全初始化（TIP_LIST.length <= 1 守卫会跳过轮播）
+    const TIP_LIST = (window.TipContent && Array.isArray(window.TipContent.list)) ? window.TipContent.list : [];
+
+    const TIP_ITEM_HEIGHT = 22;
+    const TIP_INTERVAL = 5000;
+    const TIP_FAST_TRANSITION = 300;   // 单次切换的固定每格时长（useDynamicSpeed=false 时使用）
+    const TIP_MIN_STEP_DURATION = 60;  // 每格时长下限（remainingCount ≥ 6 时）
+
+    // 累计减少量表（索引 = remainingCount - 1），边际递减形成凸曲线（仅多格动画使用）
+    // 边际递减量：90, 60, 30, 30, 15, 15（开始减少快，后面减少慢）
+    // 剩1格: 300-90=210ms, 剩2格: 300-150=150ms, 剩3格: 300-180=120ms,
+    // 剩4格: 300-210=90ms, 剩5格: 300-225=75ms, 剩6格: 300-240=60ms（下限）
+    const TIP_STEP_DECREASE_TABLE = [90, 150, 180, 210, 225, 240];
+
+    // 根据 remainingCount（剩余格数）动态计算每格时长（凸曲线递减，仅多格动画使用）
+    // remainingCount 越多，每格越快；≥6 时达到下限 60ms
+    // 注意：单次切换（useDynamicSpeed=false）不调用此函数，直接用 TIP_FAST_TRANSITION=300ms
+    function getStepDuration(remainingCount) {
+        if (remainingCount <= 0) return TIP_FAST_TRANSITION;
+        const idx = Math.min(remainingCount - 1, TIP_STEP_DECREASE_TABLE.length - 1);
+        const decrease = TIP_STEP_DECREASE_TABLE[idx];
+        return Math.max(TIP_MIN_STEP_DURATION, TIP_FAST_TRANSITION - decrease);
+    }
+
+    // 状态变量
+    let currentIndex = 0;        // 当前 tip 在原 TIP_LIST 数组中的下标
+    let shuffled = [];           // 当前一整轮的洗牌下标序列
+    let shufflePos = 0;          // 当前在 shuffled 中的位置
+    let paused = false;
+    let hidden = false;
+    let timer = null;
+    let isSwitching = false;     // 切换动画进行中标志（防重入）
+    // 当前动画状态（动态追加方案：动画进行中点击直接追加到当前动画，不再入队）
+    // {
+    //   slidCount: 已滑动格数, slidingCount: 当前动画要滑动的格数,
+    //   useDynamicSpeed: 是否启用动态速度（单次切换=false 用 300ms/格；多格动画=true 用查表法凸曲线递减后逐步恢复）,
+    //   totalDuration: 兜底 setTimeout 时长(ms，仅记录用，rAF 不依赖), startMs: 动画开始时间(仅记录用，rAF 不依赖),
+    //   timeoutId: setTimeout ID（兜底）, newIndices: 新 tip 的下标数组
+    // }
+    let animState = null;
+
+    // JS 动画状态（rAF 驱动，基于每帧速度推进，速度根据剩余格数动态调整）
+    let rafId = null;           // requestAnimationFrame ID
+    let lastFrameMs = 0;        // 上一帧时间戳（用于计算 deltaTime）
+    let currentY = 0;           // 当前 translateY（px，每帧更新）
+    let animTargetY = 0;        // 动画目标 translateY（px）
+
+    function getTipModule() { return document.getElementById('tipModule'); }
+    function getTipTrack() { return document.getElementById('tipTrack'); }
+    function getTipTooltip() { return document.getElementById('tipTooltip'); }
+
+    // 洗牌轮播（一整轮不重复）：track 只保留 2 个 item（当前 tip + 占位），
+    // 每次 next() 从洗牌序列取下一条写入占位，上滑后搬运复位，避免穿过中间 tip 造成视觉混乱
+    function buildTrack() {
+        const tipTrack = getTipTrack();
+        if (!tipTrack) return;
+        tipTrack.innerHTML = '';
+        // 第 1 个：当前 tip
+        const cur = document.createElement('div');
+        cur.className = 'tip-item';
+        cur.textContent = TIP_LIST[currentIndex];
+        tipTrack.appendChild(cur);
+        // 第 2 个：占位（next() 时动态填入随机下一条）
+        const placeholder = document.createElement('div');
+        placeholder.className = 'tip-item';
+        tipTrack.appendChild(placeholder);
+    }
+
+    function getItem(i) {
+        const tipTrack = getTipTrack();
+        return tipTrack ? tipTrack.children[i] : null;
+    }
+
+    // noAnim=true：无动画重置到 0（显示 item[0]）；noAnim=false：上滑到 -22px（显示 item[1]）
+    function applyTransform(noAnim) {
+        const tipTrack = getTipTrack();
+        if (!tipTrack) return;
+        const y = noAnim ? 0 : TIP_ITEM_HEIGHT;
+        tipTrack.style.transform = `translateY(-${y}px)`;
+    }
+
+    function updateTooltip() {
+        const tipModule = getTipModule();
+        const tipTooltip = getTipTooltip();
+        const item = getItem(0);
+        if (!tipModule || !tipTooltip || !item) return;
+        const isOverflow = item.scrollWidth > item.clientWidth;
+        tipModule.classList.toggle('is-ellipsis', isOverflow);
+        tipTooltip.textContent = item.textContent;
+    }
+
+    // 主项目无 hint-section，updateState 精简为 no-op
+    // （dotPaused/dotHidden/stateIndex/stateQueue 在主项目不存在；currentIndex 由各处维护）
+    function updateState() {
+        // no-op
+    }
+
+    // Fisher-Yates 洗牌：打乱数组顺序
+    function shuffleIndices(arr) {
+        const a = arr.slice();
+        for (let i = a.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [a[i], a[j]] = [a[j], a[i]];
+        }
+        return a;
+    }
+
+    // 生成一整轮的下标序列，保证第一个不等于 lastIndex（避免与上一轮最后一条相邻重复）
+    function buildShuffleSequence(lastIndex) {
+        const indices = TIP_LIST.map((_, i) => i);
+        const seq = shuffleIndices(indices);
+        if (seq.length > 1 && seq[0] === lastIndex) {
+            // 第一个与上一轮最后一个相同，与末尾交换
+            [seq[0], seq[seq.length - 1]] = [seq[seq.length - 1], seq[0]];
+        }
+        return seq;
+    }
+
+    // 从洗牌序列取下一个下标（越界时自动重新洗牌）
+    function getNextIndex() {
+        if (shufflePos >= shuffled.length) {
+            shuffled = buildShuffleSequence(currentIndex);
+            shufflePos = 0;
+        }
+        return shuffled[shufflePos++];
+    }
+
+    function next() {
+        // 自动轮播：动画中或 paused/hidden 时跳过（不排队）
+        if (paused || hidden || TIP_LIST.length <= 1 || isSwitching) return;
+        performSwitch();
+    }
+
+    // 实际执行切换（无守卫检查，供 next() 与 click 事件复用）
+    // 动态追加方案：动画进行中点击直接追加到当前动画（不归位、不重建 track），无需队列
+    function performSwitch() {
+        if (TIP_LIST.length <= 1) return;
+        const tipTrack = getTipTrack();
+        if (!tipTrack) return;
+
+        // 准备初始 1 个新下标（单次切换）
+        const newIndices = [getNextIndex()];
+
+        // 重建 track：当前 tip + 1 个新 tip
+        tipTrack.innerHTML = '';
+        const cur = document.createElement('div');
+        cur.className = 'tip-item';
+        cur.textContent = TIP_LIST[currentIndex];
+        tipTrack.appendChild(cur);
+        newIndices.forEach(idx => {
+            const div = document.createElement('div');
+            div.className = 'tip-item';
+            div.textContent = TIP_LIST[idx];
+            tipTrack.appendChild(div);
+        });
+        // 无动画归位到 0（用户看到的仍是当前 tip，无视觉变化）
+        applyTransform(true);
+
+        // 初始化 animState
+        animState = {
+            slidCount: 0,       // 已滑动格数
+            slidingCount: 1,    // 当前动画要滑动的格数
+            useDynamicSpeed: false,  // 单次切换用固定 300ms/格；appendToCurrentAnimation 会改为 true
+            totalDuration: 0,
+            startMs: 0,
+            timeoutId: null,
+            newIndices: newIndices
+        };
+
+        startAnimationStep(1);
+    }
+
+    // JS 驱动动画：用 requestAnimationFrame 每帧基于速度推进 translateY
+    // 速度根据剩余格数动态调整：连点时 slidingCount 大 → stepDuration 小（快）
+    //                               停止后剩余格数减少 → stepDuration 逐步恢复到 210ms（慢）
+    function runJsAnimation() {
+        if (rafId) cancelAnimationFrame(rafId);
+        lastFrameMs = performance.now();
+
+        function tick(now) {
+            // 动画已被取消（右击隐藏）或已完成，停止 rAF
+            if (!animState || !isSwitching) {
+                rafId = null;
+                return;
+            }
+
+            const deltaTime = Math.min(now - lastFrameMs, 100);  // 限幅 100ms，避免页面失焦恢复后单帧跳过若干格
+            lastFrameMs = now;
+
+            // 计算剩余格数（向上取整，确保最后一格也能感知到减速）
+            const remainingDistance = Math.abs(animTargetY - currentY);
+            const remainingCount = Math.ceil(remainingDistance / TIP_ITEM_HEIGHT);
+
+            if (remainingCount <= 0 || currentY <= animTargetY) {
+                // 动画结束，归位到目标
+                const tipTrack = getTipTrack();
+                if (tipTrack) tipTrack.style.transform = `translateY(${animTargetY}px)`;
+                currentY = animTargetY;
+                rafId = null;
+                finishAnimationStep();
+                return;
+            }
+
+            // 根据剩余格数动态计算每格时长
+            // 单次切换（useDynamicSpeed=false）：固定 300ms/格
+            // 多格动画（useDynamicSpeed=true）：查表法凸曲线递减，剩余越多越快，剩余越少越慢（逐步恢复到 210ms/格）
+            const stepDuration = animState.useDynamicSpeed
+                ? getStepDuration(remainingCount)
+                : TIP_FAST_TRANSITION;
+
+            // 每ms推进的距离（负方向）
+            const speedPerMs = TIP_ITEM_HEIGHT / stepDuration;
+            // 本帧推进的距离
+            currentY -= speedPerMs * deltaTime;
+
+            // 防止越过目标
+            if (currentY <= animTargetY) {
+                const tipTrack = getTipTrack();
+                if (tipTrack) tipTrack.style.transform = `translateY(${animTargetY}px)`;
+                currentY = animTargetY;
+                rafId = null;
+                finishAnimationStep();
+                return;
+            }
+
+            const tipTrack = getTipTrack();
+            if (tipTrack) tipTrack.style.transform = `translateY(${currentY}px)`;
+            rafId = requestAnimationFrame(tick);
+        }
+
+        rafId = requestAnimationFrame(tick);
+    }
+
+    // 启动单段动画：从当前位置连续上滑 slidingCount 格
+    // JS 驱动：基于每帧速度推进，所有情况统一用 getStepDuration(remainingCount) 动态减速
+    function startAnimationStep(slidingCount) {
+        // 兜底时长：用最坏情况（全程 300ms/格）计算
+        const fallbackDuration = slidingCount * TIP_FAST_TRANSITION + 100;
+
+        isSwitching = true;
+        animState.slidingCount = slidingCount;
+        animState.totalDuration = fallbackDuration;
+        animState.startMs = performance.now();
+
+        // JS 动画参数（基于每帧速度推进）
+        currentY = -animState.slidCount * TIP_ITEM_HEIGHT;  // 从当前位置开始
+        animTargetY = -(animState.slidCount + slidingCount) * TIP_ITEM_HEIGHT;
+
+        runJsAnimation();
+
+        // setTimeout 作为兜底（rAF 在页面失焦时可能不触发）
+        if (animState.timeoutId) clearTimeout(animState.timeoutId);
+        animState.timeoutId = setTimeout(finishAnimationStep, fallbackDuration + 50);
+    }
+
+    // 单段动画结束处理
+    function finishAnimationStep() {
+        // 清理 rAF 和 setTimeout
+        if (rafId) {
+            cancelAnimationFrame(rafId);
+            rafId = null;
+        }
+        if (animState && animState.timeoutId) {
+            clearTimeout(animState.timeoutId);
+            animState.timeoutId = null;
+        }
+        if (!animState) return;  // 已被清理（右击隐藏）
+
+        animState.slidCount += animState.slidingCount;
+        // 更新 currentIndex 到当前可见的 tip（newIndices[slidCount - 1]）
+        currentIndex = animState.newIndices[animState.slidCount - 1];
+
+        // 重建 2-item track、归位、清理
+        buildTrack();
+        applyTransform(true);
+        updateTooltip();
+        updateState();
+        isSwitching = false;
+        animState = null;
+    }
+
+    // 动态追加到当前动画（动画进行中点击时调用）
+    // 核心：track 末尾追加 1 个 item + animTargetY 延长 1 格（速度由 tick 根据 remainingCount 动态计算）
+    // currentY 由 rAF tick 维护，追加时无需重新计算（rAF 会在下一帧继续推进）
+    function appendToCurrentAnimation() {
+        if (!animState) return;
+        const tipTrack = getTipTrack();
+        if (!tipTrack) return;
+
+        // 1. 追加 1 个新 item 到 track 末尾
+        const idx = getNextIndex();
+        animState.newIndices.push(idx);
+        const div = document.createElement('div');
+        div.className = 'tip-item';
+        div.textContent = TIP_LIST[idx];
+        tipTrack.appendChild(div);
+
+        // 2. 更新 slidingCount
+        animState.slidingCount += 1;
+
+        // 3. 计算新目标（延长 1 格）
+        const newTargetY = -(animState.slidCount + animState.slidingCount) * TIP_ITEM_HEIGHT;
+
+        // 4. 追加后一定是多格动画，启用动态速度（查表法凸曲线递减后逐步恢复）
+        animState.useDynamicSpeed = true;
+
+        // 5. 更新 JS 动画参数（currentY 保持当前值，animTargetY 延长）
+        animTargetY = newTargetY;
+
+        // 6. 重启 rAF 动画（cancelAnimationFrame 在 runJsAnimation 内部处理，lastFrameMs 在内部重置）
+        runJsAnimation();
+
+        // 7. 重设 setTimeout 兜底（用最坏情况：全程 300ms/格）
+        const fallbackDuration = animState.slidingCount * TIP_FAST_TRANSITION + 100;
+        if (animState.timeoutId) clearTimeout(animState.timeoutId);
+        animState.timeoutId = setTimeout(finishAnimationStep, fallbackDuration + 50);
+
+        updateState();   // 实时反馈滑动格数变化
+    }
+
+    function startTimer() {
+        clearInterval(timer);
+        timer = setInterval(next, TIP_INTERVAL);
+    }
+
+    // 持久化 tip 可见性到 /api/settings，成功后刷新前端缓存
+    // 失败处理：仅 console.warn，不回滚 UI（用户已看到的交互结果优先）
+    async function persistTipVisibility(visible) {
+        try {
+            const res = await fetch('/api/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ show_tip: visible })
+            });
+            if (!res.ok) {
+                console.warn('tip 可见性持久化失败', res.status);
+            } else {
+                // 复用主项目已有的缓存刷新函数，避免下次 getSettingValue 读到旧值
+                if (typeof refreshSettingsCache === 'function') {
+                    refreshSettingsCache();
+                }
+            }
+        } catch (err) {
+            console.warn('tip 可见性持久化请求异常', err);
+        }
+    }
+
+    // 事件绑定：hover 暂停、左击提前切换（动态追加）、右击切换可见性、窗口失焦暂停
+    function bindTipEvents() {
+        const tipModule = getTipModule();
+        if (!tipModule) return;
+
+        // hover 暂停
+        tipModule.addEventListener('mouseenter', () => {
+            if (hidden) return;
+            paused = true;
+            updateState();
+        });
+        tipModule.addEventListener('mouseleave', () => {
+            if (hidden) return;
+            paused = false;
+            updateState();
+        });
+
+        // 左键点击：提前跳到下一条（隐藏态不响应；重置 5s 倒计时）
+        // 动画进行中点击 → 动态追加到当前动画（track 末尾加 item + translateY 延长 + duration 延长）
+        tipModule.addEventListener('click', () => {
+            if (hidden || TIP_LIST.length <= 1) return;
+            clearInterval(timer);
+            if (isSwitching && animState) {
+                appendToCurrentAnimation();
+            } else {
+                performSwitch();
+            }
+            startTimer();
+        });
+
+        // 右击切换可见性
+        tipModule.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            hidden = !hidden;
+            tipModule.classList.toggle('is-hidden', hidden);
+            if (hidden) {
+                paused = true;
+                clearInterval(timer);
+                // 动画进行中右击隐藏：立即终止动画并归位，避免隐藏态下动画结束后继续消费
+                if (animState) {
+                    // 取消 rAF 动画
+                    if (rafId) {
+                        cancelAnimationFrame(rafId);
+                        rafId = null;
+                    }
+                    if (animState.timeoutId) {
+                        clearTimeout(animState.timeoutId);
+                    }
+                    // 更新 currentIndex 到当前动画应到达的最终 tip
+                    animState.slidCount += animState.slidingCount;
+                    currentIndex = animState.newIndices[animState.slidCount - 1];
+                    buildTrack();
+                    applyTransform(true);
+                    isSwitching = false;
+                    animState = null;
+                    // 重置 JS 动画状态变量，避免残留
+                    currentY = 0;
+                    animTargetY = 0;
+                    lastFrameMs = 0;
+                }
+            } else {
+                paused = false;
+                applyTransform(true);
+                updateTooltip();
+                startTimer();
+            }
+            updateState();
+            // 立即持久化到 settings.json
+            persistTipVisibility(!hidden);
+        });
+
+        // 窗口失焦时暂停（避免后台轮播）
+        window.addEventListener('blur', () => {
+            paused = true;
+            updateState();
+        });
+        window.addEventListener('focus', () => {
+            if (!hidden) {
+                paused = false;
+                updateState();
+            }
+        });
+    }
+
+    // 暴露给外部：页面加载后调用，读取 show_tip 并启动轮播
+    window.initTipModule = function() {
+        const showTip = (typeof getSettingValue === 'function')
+            ? getSettingValue('show_tip', true)
+            : true;
+        buildTrack();
+        applyTransform(true);
+        updateTooltip();
+        if (showTip) {
+            startTimer();
+        } else {
+            // 初始隐藏态：不启动定时器，添加 is-hidden class
+            hidden = true;
+            const tipModule = getTipModule();
+            if (tipModule) tipModule.classList.add('is-hidden');
+        }
+        updateState();
+    };
+
+    // 暴露给外部：设置页保存后同步 tip 可见性（与右击切换走同一套逻辑）
+    window.syncTipVisibilityFromSettings = function(showTip) {
+        const wasHidden = hidden;
+        const shouldHide = !showTip;
+        if (wasHidden !== shouldHide) {
+            hidden = shouldHide;
+            const tipModule = getTipModule();
+            if (tipModule) tipModule.classList.toggle('is-hidden', shouldHide);
+            if (shouldHide) {
+                paused = true;
+                if (timer) clearInterval(timer);
+            } else {
+                paused = false;
+                applyTransform(true);
+                updateTooltip();
+                startTimer();
+            }
+            updateState();
+        }
+    };
+
+    // 自动初始化事件绑定（app.js 在 <body> 末尾加载，DOMContentLoaded 即将触发或已触发）
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', bindTipEvents);
+    } else {
+        bindTipEvents();
+    }
+
+    // 初始化：首条 tip 随机选取，构建第一轮洗牌序列（保证下一条 ≠ 当前 currentIndex，避免相邻重复）
+    currentIndex = Math.floor(Math.random() * TIP_LIST.length);
+    buildTrack();
+    shuffled = buildShuffleSequence(currentIndex);
+    shufflePos = 0;
+})();

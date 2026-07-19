@@ -328,6 +328,11 @@ body {
     margin-bottom: 24px;
 }
 
+.action-bar-left-group {
+    display: flex;
+    align-items: center;
+}
+
 .action-bar-left {
     display: flex;
     gap: 10px;
@@ -3406,4 +3411,150 @@ input.shake {
 }
 .title-context-item:hover .title-context-hotkey {
     color: var(--gold);
+}
+
+/* === tip 模块（纯文本流，无卡片样式） === */
+/* tip 距"添加账号"按钮 90px 间隔（与 action-bar-left 作为同一组紧贴左侧，"设置"按钮靠右） */
+.tip-module {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 2px 8px;
+    height: 34px;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    font-size: 12.5px;
+    margin-left: 90px;
+    /* min-width: 400px（25 汉字 + "tip:" 前缀留余量，25 × 12.5 ≈ 313px + 前缀 40px ≈ 353px） */
+    /* max-width: 500px（上限） */
+    max-width: 500px;
+    min-width: 400px;
+    cursor: pointer;
+    user-select: none;
+    overflow: hidden;
+    transition: opacity 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* hover 时极轻反馈：前缀色变亮 + 底部金色细线 */
+.tip-module::after {
+    content: '';
+    position: absolute;
+    left: 0;
+    bottom: 2px;
+    width: 100%;
+    height: 1px;
+    background: var(--border-gold-dim);
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+}
+
+.tip-module:hover::after {
+    opacity: 1;
+}
+
+.tip-module:hover .tip-prefix {
+    color: var(--gold-light);
+}
+
+.tip-module.is-hidden {
+    opacity: 0;
+    /* 不设置 pointer-events: none，保留占位可接收右击事件恢复 */
+}
+
+/* 隐藏态连底部金色细线也一并消除 */
+.tip-module.is-hidden::after {
+    opacity: 0 !important;
+}
+
+/* 隐藏态 hover 时不显示底部细线与前缀变色（完全透明） */
+.tip-module.is-hidden:hover::after {
+    opacity: 0 !important;
+}
+
+.tip-module.is-hidden:hover .tip-prefix {
+    color: var(--gold);
+}
+
+.tip-module.is-hidden .tip-viewport {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.tip-module.is-hidden .tip-tooltip {
+    display: none;
+}
+
+.tip-prefix {
+    color: var(--gold);
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    flex-shrink: 0;
+    font-size: 12.5px;
+    transition: color 0.2s;
+}
+
+.tip-viewport {
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+    height: 22px;
+    min-width: 0;
+    transition: opacity 0.25s;
+}
+
+.tip-track {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    /* 由 JS rAF 驱动 transform，不使用 CSS transition（避免缓动曲线在动态追加时重置速度） */
+}
+
+.tip-item {
+    height: 22px;
+    line-height: 22px;
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* tooltip when text overflow */
+.tip-tooltip {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-gold-dim);
+    color: var(--text-primary);
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    line-height: 1.5;
+    max-width: 320px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s;
+    z-index: 10;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.5);
+    white-space: normal;
+    word-break: break-all;
+}
+
+.tip-tooltip::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border: 5px solid transparent;
+    border-top-color: var(--border-gold-dim);
+}
+
+.tip-module.is-ellipsis:hover .tip-tooltip {
+    opacity: 1;
 }

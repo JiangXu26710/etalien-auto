@@ -66,6 +66,7 @@ DEFAULT_SETTINGS = {
     "default_claim_target": "all",             # 新增账号默认领取目标（all/pc/mobile）
     "default_account_enabled": True,           # 新增账号默认启用状态
     "default_login_method": "sms",             # 登录弹窗默认登录方式（sms/password），仅影响手动登录弹窗
+    "show_tip": True,                          # 是否显示 action-bar 中的 tip 轮播模块
 }
 
 SETTINGS_SCHEMA = {
@@ -84,6 +85,7 @@ SETTINGS_SCHEMA = {
     "default_claim_target":  {"type": str, "options": {"all": "全部领取", "pc": "电脑端加速时长", "mobile": "手机端加速时长"}, "advanced": True, "label": "新增账号默认领取目标", "description": ""},
     "default_account_enabled": {"type": bool,                            "advanced": True, "label": "新账号默认启用", "description": ""},
     "default_login_method":  {"type": str, "options": {"sms": "短信验证码", "password": "账号密码"}, "advanced": True, "label": "账号默认登录方式", "description": "只影响手动登录弹窗，与密码自动重登无关联"},
+    "show_tip":              {"type": bool,                            "advanced": True, "label": "显示 tip 提示", "description": ""},
 }
 
 

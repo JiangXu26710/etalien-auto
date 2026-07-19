@@ -84,6 +84,7 @@
     </section>
 
     <section class="action-bar">
+      <div class="action-bar-left-group">
       <div class="action-bar-left">
         <div class="claim-flip" id="claimFlip">
           <div class="claim-flip-inner">
@@ -97,6 +98,14 @@
         <button type="button" class="btn-accent" onclick="showAddAccount()">
           添加账号
         </button>
+      </div>
+      <div class="tip-module" id="tipModule" title="右击切换可见性 · 鼠标悬停暂停">
+          <span class="tip-prefix">tip:</span>
+          <div class="tip-viewport">
+              <div class="tip-track" id="tipTrack"></div>
+          </div>
+          <div class="tip-tooltip" id="tipTooltip"></div>
+      </div>
       </div>
       <div class="action-bar-right">
         <button type="button" class="btn-secondary" onclick="showSettings()">
@@ -153,6 +162,7 @@
   </button>
 </div>
 
+<script src="tip-content.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
