@@ -481,16 +481,27 @@ def migrate_from_json(json_path: str, db_path: str = DB_PATH) -> None:
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
             # 批量插入账号数据
+            # - INSERT OR IGNORE 跳过 UNIQUE 冲突（旧 json 历史脏数据：空 phone / 重复 phone）
+            #   避免单条脏数据导致整个迁移失败、用户无法启动 GUI
+            # - 显式 BEGIN/commit 包裹批量插入：sqlite3 默认 isolation_level 下每个 INSERT
+            #   是独立事务（隐式 BEGIN/COMMIT），每个 INSERT 都触发 fsync，1000 账号场景下慢
+            skipped = 0
+            conn.execute("BEGIN")
             for acc in accounts:
+                phone = acc.get("phone", "")
+                if not phone:
+                    # 空 phone 直接跳过，避免触发 UNIQUE 冲突（与重复 phone 走 INSERT OR IGNORE 路径区分日志）
+                    skipped += 1
+                    continue
                 # 兼容旧 json 字段缺失：enabled 默认 True，claim_target 默认 'all'
                 enabled = 1 if acc.get("enabled", True) else 0
-                conn.execute(
-                    """INSERT INTO accounts
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO accounts
                        (phone, name, remark, enabled, claim_target, password,
                         auth_token, user_id, device_id, saved_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        acc.get("phone", ""),
+                        phone,
                         acc.get("name", ""),
                         acc.get("remark", ""),
                         enabled,
@@ -502,7 +513,13 @@ def migrate_from_json(json_path: str, db_path: str = DB_PATH) -> None:
                         acc.get("saved_at"),
                     ),
                 )
+                if cur.rowcount == 0:
+                    # INSERT OR IGNORE 跳过（UNIQUE 冲突，重复 phone）
+                    skipped += 1
+                    logger.warning("迁移跳过重复 phone: %s", phone)
             conn.commit()
+            if skipped:
+                logger.warning("迁移共跳过 %d 条无效/重复记录", skipped)
         finally:
             conn.close()
 

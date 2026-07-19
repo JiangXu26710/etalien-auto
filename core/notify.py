@@ -9,6 +9,7 @@
   - 不修改 core/service.py，错误原因由 status 映射得到
 """
 import logging
+import re
 import time
 
 import requests
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 # Server酱 Turbo API
 SCHAN_API_BASE = "https://sctapi.ftqq.com"
 TIMEOUT = 10  # 请求超时（秒）
+
+# Server酱 SendKey 格式：SCT<数字><字母>（如 SCT123456abcdef...）
+# 限制为字母数字以避免误填含 / ? # 等字符构造异常 URL
+SENDKEY_PATTERN = re.compile(r'^SCT[A-Za-z0-9]+$')
 
 
 def send_schan(sendkey: str, title: str, desp: str) -> bool:
@@ -33,6 +38,9 @@ def send_schan(sendkey: str, title: str, desp: str) -> bool:
     Returns:
         True 发送成功，False 发送失败
     """
+    if not SENDKEY_PATTERN.match(sendkey):
+        logger.error("Server酱 SendKey 格式错误（应为 SCT 开头 + 字母数字）: %s", sendkey)
+        return False
     url = f"{SCHAN_API_BASE}/{sendkey}.send"
     payload = {"title": title, "desp": desp}
     try:

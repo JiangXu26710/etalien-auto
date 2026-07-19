@@ -266,6 +266,7 @@ class WindowApi:
         Returns:
             bool: 当前是否处于最大化状态。
         """
+        self._sync_maximized_state()
         if self._is_maximized:
             self._window.restore()
             self._is_maximized = False
@@ -280,8 +281,14 @@ class WindowApi:
         self._is_maximized = False
 
     def close(self):
-        """关闭窗口并停止服务器。"""
-        self._shutdown()
+        """关闭窗口并停止服务器。
+
+        启动后台线程执行 _shutdown，避免在 pywebview JS→Python 桥接中
+        同步轮询 claim_mgr.running 最长 30 秒导致 UI 卡死。
+        close() 立即返回，窗口在后台线程完成清理后 destroy。
+        _shutdown 内部通过 _shutdown_called 保证幂等性。
+        """
+        threading.Thread(target=self._shutdown, daemon=True).start()
 
     def is_maximized(self):
         """查询窗口是否处于最大化状态。
@@ -289,7 +296,27 @@ class WindowApi:
         Returns:
             bool: 是否最大化。
         """
+        self._sync_maximized_state()
         return self._is_maximized
+
+    def _sync_maximized_state(self):
+        """从 Win32 系统查询窗口实际最大化状态并同步到 _is_maximized。
+
+        Win+Up/Win+Down/Snap 等系统级操作会绕过 Python 侧 maximize()/restore()，
+        导致 _is_maximized 与系统状态不同步。此方法在 is_maximized/maximize 前
+        调用，确保决策基于系统真实状态。
+
+        查询失败时（如测试 mock 环境、非 Win32 平台）保留 _is_maximized 现状。
+        MagicMock 的 .native.Handle.ToInt32() 返回 MagicMock 对象（非 int），
+        isinstance 检查失败时直接 return，不影响测试。
+        """
+        try:
+            hwnd = self._window.native.Handle.ToInt32()
+            if not isinstance(hwnd, int):
+                return  # mock 环境（MagicMock 返回非 int）
+            self._is_maximized = bool(ctypes.windll.user32.IsZoomed(hwnd))
+        except Exception:
+            pass
 
     def get_position(self):
         """获取窗口当前位置。
@@ -320,6 +347,11 @@ class WindowApi:
         return True
 
     def _shutdown(self):
+        """后台线程执行：等待领取任务完成 → 关闭服务器 → 销毁窗口。
+
+        由 close() 启动，避免阻塞 pywebview JS→Python 桥接线程。
+        _shutdown_called 保证幂等性：多次调用只执行一次关闭逻辑。
+        """
         if self._shutdown_called:
             return
         self._shutdown_called = True

@@ -1,8 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
 
-block_cipher = None
-
 PROJECT_DIR = SPECPATH
 
 a = Analysis(
@@ -11,18 +9,7 @@ a = Analysis(
     binaries=[],
     datas=[
         (os.path.join(PROJECT_DIR, 'gui', 'static'), 'gui/static'),
-        (os.path.join(PROJECT_DIR, 'gui', 'api.py'), 'gui'),
-        (os.path.join(PROJECT_DIR, 'gui', '__init__.py'), 'gui'),
-        (os.path.join(PROJECT_DIR, 'core', '__init__.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'core', 'config.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'core', 'client.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'core', 'notify.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'core', 'service.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'core', 'sign.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'core', 'db.py'), 'core'),
-        (os.path.join(PROJECT_DIR, 'account_pb2.py'), '.'),
-        (os.path.join(PROJECT_DIR, 'apiv2_pb2.py'), '.'),
-        (os.path.join(PROJECT_DIR, 'error_pb2.py'), '.'),
+        (os.path.join(PROJECT_DIR, 'proto'), 'proto'),
     ],
     hiddenimports=[
         'core',
@@ -39,19 +26,26 @@ a = Analysis(
         'error_pb2',
         'flask',
         'webview',
+        'webview.guilib',
+        'webview.util',
+        'webview.platforms.edgechromium',
+        'webview.platforms.winforms',
         'requests',
         'google.protobuf',
     ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'tkinter', 'PyQt5', 'PySide6', 'matplotlib', 'numpy', 'pandas',
+        'scipy', 'IPython', 'pytest', 'pydoc',
+        'distutils', 'lib2to3', 'turtle', 'turtledemo',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure, a.zipped_data)
 
 exe = EXE(
     pyz,
@@ -74,6 +68,10 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=True,
-    upx_exclude=[],
+    upx_exclude=[
+        'python311.dll', 'vcruntime140.dll', 'vcruntime140_1.dll',
+        'pywintypes311.dll', 'pythoncom311.dll',
+        'WebView2Loader.dll',  # pywebview 依赖
+    ],
     name='etalien-auto',
 )

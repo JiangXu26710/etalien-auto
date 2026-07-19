@@ -267,84 +267,102 @@ async function windowClose() {
  * 初始化窗口标题栏拖拽。
  * 含 3px 移动阈值（避免双击误触发）、异步竞态防护（每次 await 后检查 isMouseDown）、
  * 最大化状态下拖拽自动还原、双击切换最大化。
+ *
+ * mousemove/mouseup 仅在 mousedown 时绑定到 document，mouseup 时解绑，
+ * 避免全局永久监听 mousemove 造成不必要开销。
  */
 function initDrag() {
     const titleBarDrag = document.getElementById('titleBarDrag');
     if (!titleBarDrag) return;
 
-    // mousedown: 同步记录按下位置（不调用 API，避免 async 竞态）
+    // 闭包内持有当前拖拽会话的 handler 引用，供解绑使用
+    let moveHandler = null;
+    let upHandler = null;
+
+    // mousedown: 同步记录按下位置（不调用 API，避免 async 竞态）+ 绑定 mousemove/mouseup
     titleBarDrag.addEventListener('mousedown', (e) => {
         if (e.button !== 0) return;
         e.preventDefault();
         isMouseDown = true;
         mouseDownPos = { x: e.screenX, y: e.screenY };
-    });
 
-    document.addEventListener('mousemove', async (e) => {
-        if (mouseDownPos && !dragState && !dragInitiating) {
-            // 延迟初始化：移动超过 3px 阈值才启动拖拽，避免双击触发拖拽
-            const dx = e.screenX - mouseDownPos.x;
-            const dy = e.screenY - mouseDownPos.y;
-            if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
+        moveHandler = async (ev) => {
+            if (mouseDownPos && !dragState && !dragInitiating) {
+                // 延迟初始化：移动超过 3px 阈值才启动拖拽，避免双击触发拖拽
+                const dx = ev.screenX - mouseDownPos.x;
+                const dy = ev.screenY - mouseDownPos.y;
+                if (Math.abs(dx) < 3 && Math.abs(dy) < 3) return;
 
-            dragInitiating = true;
-            const startPos = { ...mouseDownPos };
-            mouseDownPos = null;
+                dragInitiating = true;
+                const startPos = { ...mouseDownPos };
+                mouseDownPos = null;
 
-            try {
-                const isMax = await pywebview.api.is_maximized();
-                // 竞态防护：每次 await 后检查 isMouseDown，鼠标已释放则中止
-                if (!isMouseDown) return;
-                if (isMax) {
-                    document.body.classList.add('win-state-out');
-                    await new Promise(r => setTimeout(r, 150));
-                    if (!isMouseDown) {
+                try {
+                    const isMax = await pywebview.api.is_maximized();
+                    // 竞态防护：每次 await 后检查 isMouseDown，鼠标已释放则中止
+                    if (!isMouseDown) return;
+                    if (isMax) {
+                        document.body.classList.add('win-state-out');
+                        await new Promise(r => setTimeout(r, 150));
+                        if (!isMouseDown) {
+                            document.body.classList.remove('win-state-out');
+                            return;
+                        }
+                        await pywebview.api.maximize();
+                        const btn = document.querySelector('.title-btn-max');
+                        if (btn) btn.title = '最大化';
                         document.body.classList.remove('win-state-out');
-                        return;
+                        document.body.classList.add('win-restore-in');
+                        document.body.addEventListener('animationend', function handler(e) {
+                            if (e.target !== document.body) return;
+                            document.body.classList.remove('win-restore-in');
+                            document.body.removeEventListener('animationend', handler);
+                        });
                     }
-                    await pywebview.api.maximize();
-                    const btn = document.querySelector('.title-btn-max');
-                    if (btn) btn.title = '最大化';
-                    document.body.classList.remove('win-state-out');
-                    document.body.classList.add('win-restore-in');
-                    document.body.addEventListener('animationend', function handler(e) {
-                        if (e.target !== document.body) return;
-                        document.body.classList.remove('win-restore-in');
-                        document.body.removeEventListener('animationend', handler);
-                    });
+                    if (!isMouseDown) return;
+                    const pos = await pywebview.api.get_position();
+                    if (!isMouseDown) return;
+                    dragState = {
+                        startX: startPos.x,
+                        startY: startPos.y,
+                        winX: pos.x,
+                        winY: pos.y
+                    };
+                } catch(err) {
+                    console.error('Drag init failed:', err);
+                } finally {
+                    dragInitiating = false;
                 }
-                if (!isMouseDown) return;
-                const pos = await pywebview.api.get_position();
-                if (!isMouseDown) return;
-                dragState = {
-                    startX: startPos.x,
-                    startY: startPos.y,
-                    winX: pos.x,
-                    winY: pos.y
-                };
-            } catch(err) {
-                console.error('Drag init failed:', err);
-            } finally {
-                dragInitiating = false;
+                return;
             }
-            return;
-        }
 
-        // 拖拽中：计算偏移并调用 move_window；dragInFlight 防止异步调用堆积
-        if (!dragState || dragInFlight) return;
-        dragInFlight = true;
-        const dx = e.screenX - dragState.startX;
-        const dy = e.screenY - dragState.startY;
-        pywebview.api.move_window(dragState.winX + dx, dragState.winY + dy).finally(() => {
-            dragInFlight = false;
-        });
-    });
+            // 拖拽中：计算偏移并调用 move_window；dragInFlight 防止异步调用堆积
+            if (!dragState || dragInFlight) return;
+            dragInFlight = true;
+            const dx = ev.screenX - dragState.startX;
+            const dy = ev.screenY - dragState.startY;
+            pywebview.api.move_window(dragState.winX + dx, dragState.winY + dy).finally(() => {
+                dragInFlight = false;
+            });
+        };
 
-    // mouseup: 清除所有拖拽状态
-    document.addEventListener('mouseup', () => {
-        isMouseDown = false;
-        mouseDownPos = null;
-        dragState = null;
+        upHandler = () => {
+            isMouseDown = false;
+            mouseDownPos = null;
+            dragState = null;
+            // 解绑本次拖拽会话的 mousemove/mouseup
+            if (moveHandler) {
+                document.removeEventListener('mousemove', moveHandler);
+                moveHandler = null;
+            }
+            if (upHandler) {
+                document.removeEventListener('mouseup', upHandler);
+                upHandler = null;
+            }
+        };
+
+        document.addEventListener('mousemove', moveHandler);
+        document.addEventListener('mouseup', upHandler);
     });
 
     // dblclick: 清除拖拽状态后切换最大化（避免残留 dragState 导致窗口跟随鼠标）
@@ -408,6 +426,8 @@ function showMobileFloat(phone, diffSeconds) {
 }
 
 function animateValue(el, start, end, duration) {
+    // 短时间内多次调用同一 el 时取消旧 RAF，避免并发循环互相覆盖 textContent 导致视觉抖动
+    if (el._animRaf) cancelAnimationFrame(el._animRaf);
     const startTime = performance.now();
     function update(now) {
         const elapsed = now - startTime;
@@ -415,9 +435,10 @@ function animateValue(el, start, end, duration) {
         const eased = 1 - Math.pow(1 - progress, 3);
         const current = Math.round(start + (end - start) * eased);
         el.textContent = current;
-        if (progress < 1) requestAnimationFrame(update);
+        if (progress < 1) el._animRaf = requestAnimationFrame(update);
+        else el._animRaf = null;
     }
-    requestAnimationFrame(update);
+    el._animRaf = requestAnimationFrame(update);
 }
 
 /**
@@ -468,36 +489,32 @@ function updateCardProgress(phone, current, total, phase) {
 }
 
 async function api(path, options = {}) {
-    try {
-        const headers = {};
-        if (options.body) {
-            headers['Content-Type'] = 'application/json';
-        }
-        const resp = await fetch(path, {
-            headers,
-            ...options,
-            body: options.body ? JSON.stringify(options.body) : undefined,
-        });
-        const text = await resp.text();
-        let data;
-        try {
-            data = JSON.parse(text);
-        } catch (_) {
-            throw new Error('服务器返回了非JSON响应');
-        }
-        if (!resp.ok && data.error) {
-            throw new Error(data.error);
-        }
-        if (data.ok === false) {
-            throw new Error(data.error || '请求失败');
-        }
-        if (!resp.ok) {
-            throw new Error(`请求失败 (${resp.status})`);
-        }
-        return data;
-    } catch (e) {
-        throw e;
+    const headers = {};
+    if (options.body) {
+        headers['Content-Type'] = 'application/json';
     }
+    const resp = await fetch(path, {
+        headers,
+        ...options,
+        body: options.body ? JSON.stringify(options.body) : undefined,
+    });
+    const text = await resp.text();
+    let data;
+    try {
+        data = JSON.parse(text);
+    } catch (_) {
+        throw new Error('服务器返回了非JSON响应');
+    }
+    if (!resp.ok && data.error) {
+        throw new Error(data.error);
+    }
+    if (data.ok === false) {
+        throw new Error(data.error || '请求失败');
+    }
+    if (!resp.ok) {
+        throw new Error(`请求失败 (${resp.status})`);
+    }
+    return data;
 }
 
 function showToast(msg, type = 'info') {
@@ -969,13 +986,21 @@ function initVirtualScrollOnce() {
     listEl.addEventListener('scroll', handleScroll, { passive: true });
     listEl.addEventListener('wheel', handleWheel, { passive: false });
     window.addEventListener('resize', handleResize);
-    window.addEventListener('beforeunload', () => {
-        stopLazyLoadPolling();
-        if (cliTriggerDetectTimer) {
-            clearTimeout(cliTriggerDetectTimer);
-            cliTriggerDetectTimer = null;
-        }
-    });
+    window.addEventListener('beforeunload', cleanupAllTimers);
+}
+
+// 统一清理所有模块级定时器/rAF（beforeunload 时调用）
+// 注意：hoverTimer/flipTimer 在 initCardHoverFlip 闭包内，无法外部访问，
+// 随窗口关闭 GC 回收；此处只清理模块级可达的定时器。
+function cleanupAllTimers() {
+    stopLazyLoadPolling();
+    if (cliTriggerDetectTimer) { clearTimeout(cliTriggerDetectTimer); cliTriggerDetectTimer = null; }
+    if (claimPollTimer) { clearTimeout(claimPollTimer); claimPollTimer = null; }
+    if (mobileCountdownTimer) { clearInterval(mobileCountdownTimer); mobileCountdownTimer = null; }
+    if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null; }
+    if (refreshAllTimer) { clearTimeout(refreshAllTimer); refreshAllTimer = null; }
+    // cancelResultRafs 内部清理 scrollRaf/opacitySyncRaf/flipRafIds/measureRafId
+    cancelResultRafs();
 }
 
 // 基于 visibleRange 渲染当前视口（含分页缺失时按需请求）
@@ -1426,16 +1451,19 @@ async function queryPhonesBatched(phones) {
             inFlightPhones.add(p);
         });
         const gen = refreshGeneration;
+        // 用 localController 闭包捕获本批次控制器：即使 timeoutId 未及时清理，
+        // 100s 后 setTimeout 回调也只中止本批次控制器，不会误伤后续批次的 batchAbortController。
+        let timeoutId = null;
         try {
-            batchAbortController = new AbortController();
-            const timeoutId = setTimeout(() => batchAbortController.abort(), LAZY_LOAD_FETCH_TIMEOUT);
+            const localController = new AbortController();
+            batchAbortController = localController;
+            timeoutId = setTimeout(() => localController.abort(), LAZY_LOAD_FETCH_TIMEOUT);
             const resp = await fetch('/api/accounts/status', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ phones: batch }),
-                signal: batchAbortController.signal,
+                signal: localController.signal,
             });
-            clearTimeout(timeoutId);
             if (!resp.ok) {
                 // HTTP 错误：整批走查询超时占位
                 batch.forEach(p => {
@@ -1477,6 +1505,9 @@ async function queryPhonesBatched(phones) {
                 statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
                 rerenderCardByPhone(p);
             });
+        } finally {
+            // 无论成功/失败/continue 都清理 timeout，避免遗留定时器在 100s 后触发无谓的 abort
+            if (timeoutId !== null) clearTimeout(timeoutId);
         }
     }
 }
@@ -1626,6 +1657,7 @@ function showAddAccount() {
 
 async function sendLoginCode(phone, btnGetId, btnLoginId, btnResendId) {
     const btnGet = document.getElementById(btnGetId);
+    if (!btnGet) return;
     btnGet.disabled = true;
     btnGet.textContent = '发送中...';
     try {
@@ -1643,6 +1675,7 @@ async function sendLoginCode(phone, btnGetId, btnLoginId, btnResendId) {
 
 async function resendLoginCode(phone, btnId) {
     const btn = document.getElementById(btnId);
+    if (!btn) return;
     btn.disabled = true;
     btn.textContent = '发送中...';
     try {
@@ -2739,6 +2772,23 @@ function bindResultListEvents() {
             toggleExpand(row.dataset.phone);
         }
     });
+    // 虚拟滚动：scroll 事件触发 rAF 节流的视口重渲染（与 #accountsList 一致）
+    // 修复前 #resultList 缺失 scroll 监听，滚动后视口下方空白
+    const listEl = document.getElementById('resultList');
+    if (listEl && listEl.dataset.scrollBound !== '1') {
+        listEl.dataset.scrollBound = '1';
+        listEl.addEventListener('scroll', handleResultScroll, { passive: true });
+    }
+}
+
+// 结果列表 scroll rAF 节流：复用模块级 scrollRaf 句柄
+// cancelResultRafs 已在 closeResultModal 中取消未完成的 rAF，无需额外清理
+function handleResultScroll() {
+    if (scrollRaf) cancelAnimationFrame(scrollRaf);
+    scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = null;
+        renderResultViewport(false);
+    });
 }
 
 // 展开/收起切换 + recentlyExpandedMap 标记 + 立即重渲染
@@ -2754,8 +2804,21 @@ function toggleExpand(phone) {
 
 // 复制错误文本到剪贴板 + .copied class + toast
 async function copyErrorText(text, btn) {
+    const decoded = decodeURIComponent(text);
     try {
-        await navigator.clipboard.writeText(decodeURIComponent(text));
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(decoded);
+        } else {
+            // fallback for older WebView2 / 非 secure context
+            const ta = document.createElement('textarea');
+            ta.value = decoded;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            ta.remove();
+        }
         btn.classList.add('copied');
         showToast('已复制错误文本', 'success');
         setTimeout(() => btn.classList.remove('copied'), 1500);
@@ -2848,17 +2911,19 @@ function updateSummary(counts) {
         if (newVal === lastVal) return;
         b.textContent = newVal;
         chip.dataset.lastVal = newVal;
-        if (chip.dataset.bumpAnim) {
-            try { chip.dataset.bumpAnim.cancel(); } catch (e) {}
-            chip.dataset.bumpAnim = null;
+        // 注意：dataset 只能存字符串，存 Animation 对象会被 toString 为 "[object Animation]"，
+        // 导致取消逻辑失效。改用普通 JS 属性 _bumpAnim 存储 Animation 引用。
+        if (chip._bumpAnim) {
+            try { chip._bumpAnim.cancel(); } catch (e) {}
+            chip._bumpAnim = null;
         }
         const anim = chip.animate(
             [{ transform: 'scale(1)' }, { transform: 'scale(1.06)' }, { transform: 'scale(1)' }],
             { duration: 500, easing: 'cubic-bezier(0.4, 0, 0.2, 1)' }
         );
-        chip.dataset.bumpAnim = anim;
-        anim.onfinish = () => { chip.dataset.bumpAnim = null; };
-        anim.oncancel  = () => { chip.dataset.bumpAnim = null; };
+        chip._bumpAnim = anim;
+        anim.onfinish = () => { chip._bumpAnim = null; };
+        anim.oncancel  = () => { chip._bumpAnim = null; };
     });
 }
 
@@ -2974,9 +3039,9 @@ function cancelResultRafs() {
         });
     }
     document.querySelectorAll('.summary-chip').forEach(chip => {
-        if (chip.dataset.bumpAnim) {
-            try { chip.dataset.bumpAnim.cancel(); } catch (e) {}
-            chip.dataset.bumpAnim = null;
+        if (chip._bumpAnim) {
+            try { chip._bumpAnim.cancel(); } catch (e) {}
+            chip._bumpAnim = null;
         }
     });
     if (rotationAnim) {
@@ -3240,6 +3305,10 @@ async function refreshSettingsCache() {
     try {
         const settings = await api('/api/settings');
         const { schema, actual_gui_port, ...values } = settings;
+        // 屏蔽敏感字段 schan_key：__settingsValues 供 getSettingValue 全局读取，
+        // 但 getSettingValue 仅用于 default_claim_target/default_login_method 等非敏感字段，
+        // schan_key 仅在设置弹窗中通过 __settingsResponse 读取，无需常驻全局缓存。
+        if ('schan_key' in values) values.schan_key = '***';
         window.__settingsValues = values;
     } catch (e) {
         console.error('刷新配置缓存失败:', e);
@@ -4394,7 +4463,7 @@ async function executeBatchAction() {
             body: { action, phones },
         });
         const affected = data.affected || 0;
-        const failed = data.failed || [];
+        const failed = data.failed_phones || [];
         const labels = { enable: '启用', disable: '禁用', delete: '删除' };
         const toastType = action === 'enable' ? 'success' : (action === 'delete' ? 'error' : 'info');
         let msg = `已批量${labels[action]} ${affected} 个账号`;

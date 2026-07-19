@@ -11,6 +11,9 @@ import time
 import uuid
 from urllib.parse import quote, unquote
 
+# 签名版本号，逆向自 APK 的 SignInterceptor，固定值
+SIGN_VERSION = "2023-08-28"
+
 
 def get_sort_parameters(query_params: dict | None) -> str:
     """
@@ -33,7 +36,7 @@ def get_sort_parameters(query_params: dict | None) -> str:
     params["ts"] = str(int(time.time()))
     nonce = uuid.uuid4().hex
     params["nonce"] = nonce
-    params["ver"] = "2023-08-28"  # 签名版本号，逆向自 APK 的 SignInterceptor，固定值
+    params["ver"] = SIGN_VERSION
 
     sorted_keys = sorted(params.keys())
     parts = []

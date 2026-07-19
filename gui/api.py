@@ -7,6 +7,7 @@
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -111,6 +112,9 @@ class ClaimManager:
                 return False
             self._running = True
             self._progress = {}  # P9/R43: 重置为空 dict
+            # 清空上次结果快照：开始新一次领取后，「上次结果」语义上不再存在，
+            # 避免新领取期间 /api/claim/last-result 返回上次结果误导用户。
+            self._last_progress = []
             return True
 
     def finish(self) -> None:
@@ -207,19 +211,26 @@ _actual_gui_port: int | None = None
 
 @app.before_request
 def _check_origin():
-    """CSRF 防护：校验写请求来源（POST/PUT/DELETE）。
+    """CSRF 防护：校验写请求来源（POST/PUT/DELETE/PATCH）。
 
-    pywebview 内部请求可能不带 Origin/Referer 头，空值放行；
-    非空且非本机来源（127.0.0.1/localhost）的请求拒绝（403）。
-    GET 请求不校验。
+    严格模式：写请求必须携带本机 Origin 头（127.0.0.1/localhost/::1），
+    缺失或非本机来源一律拒绝（403），防止本机其他进程绕过 CSRF 防护。
+    GET/HEAD 等安全请求不校验。
+
+    豁免：/api/cli-trigger-claim 路径已有 Bearer Token 强校验（secrets.compare_digest），
+    且 CLI 通过 Python requests 库调用（默认不发 Origin 头），故豁免 Origin 校验。
     """
-    if request.method not in ("POST", "PUT", "DELETE"):
+    if request.method not in ("POST", "PUT", "DELETE", "PATCH"):
         return None
-    origin = request.headers.get("Origin") or request.headers.get("Referer")
+    # CLI 触发领取：Bearer Token 已强校验，requests 库默认不发 Origin 头
+    if request.path == "/api/cli-trigger-claim":
+        return None
+    origin = request.headers.get("Origin")
     if not origin:
-        return None
+        logger.warning("Rejected write request without Origin header: %s %s", request.method, request.path)
+        return error_response("非法请求来源", 403)
     parsed = urlparse(origin)
-    if parsed.hostname in ("127.0.0.1", "localhost"):
+    if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
         return None
     logger.warning("Rejected request with origin: %s", origin)
     return error_response("非法请求来源", 403)
@@ -232,6 +243,30 @@ def _check_json_body():
         if request.content_length and request.content_length > 0:
             if request.get_json(silent=True) is None:
                 return error_response("请求体必须是有效的 JSON")
+
+
+@app.after_request
+def _set_security_headers(resp):
+    """添加安全响应头：CSP / X-Frame-Options / X-Content-Type-Options。
+
+    - CSP：允许本机资源和内联脚本（pywebview 桥接 + 现有 onclick 内联事件需要）
+    - X-Frame-Options: DENY：禁止被任何页面 iframe 嵌套
+    - X-Content-Type-Options: nosniff：禁止浏览器 MIME 嗅探
+
+    已知技术债：script-src 'unsafe-inline' 削弱 XSS 防护。短期内保留以兼容
+    index.html 内联 <script>（pywebview 桥接初始化）与内联 onclick 事件属性。
+    长期应改为 nonce-based CSP + 移除所有内联事件属性，需前端重构单独立项。
+    """
+    resp.headers.setdefault(
+        'Content-Security-Policy',
+        "default-src 'self' http://127.0.0.1:* http://localhost:*; "
+        "script-src 'self' 'unsafe-inline' http://127.0.0.1:* http://localhost:*; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:;"
+    )
+    resp.headers.setdefault('X-Frame-Options', 'DENY')
+    resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
+    return resp
 
 
 @app.before_request
@@ -417,7 +452,7 @@ def delete_account(phone):
         repo.delete(phone)
     except Exception as e:
         logger.error("删除账号失败: %s", e)
-        return error_response("保存账号失败，请检查磁盘空间或文件权限", 500)
+        return error_response("删除账号失败，请检查磁盘空间或文件权限", 500)
     return jsonify({"ok": True})
 
 
@@ -427,9 +462,9 @@ def batch_accounts():
 
     请求体：{"action": "enable"|"disable"|"delete", "phones": ["138...", ...]}
     - action 必传，phones 必传且为数组，上限 1000（防止误操作）
-    - 单条失败不影响其他，返回 failed 列表告知前端
+    - 单条失败不影响其他，返回 failed_phones 列表告知前端
 
-    响应成功：{"ok": true, "affected": int, "failed": ["139...", ...]}
+    响应成功：{"ok": true, "affected": int, "failed_phones": ["139...", ...]}
     """
     data = request.get_json(silent=True) or {}
     action = data.get("action")
@@ -647,7 +682,7 @@ def cli_trigger_claim():
     expected = _cli_trigger_token
     auth_header = request.headers.get("Authorization", "")
     token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
-    if not expected or token != expected:
+    if not expected or not secrets.compare_digest(token, expected):
         return error_response("非法请求", 403)
 
     if not claim_mgr.start():

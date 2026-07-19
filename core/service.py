@@ -265,8 +265,16 @@ def get_account_status(account: dict, enable_relogin: bool = False) -> dict:
             t_tasks = Thread(target=_fetch_tasks)
             t_dur.start()
             t_tasks.start()
-            t_dur.join()
-            t_tasks.join()
+            # join 传 timeout 防止线程卡死导致前端 loading 永不消失
+            # 底层 _request_with_retry 最坏约 (max_retries+1)*(30+retry_delay)≈124s，130s 略加冗余
+            t_dur.join(timeout=130)
+            t_tasks.join(timeout=130)
+            if t_dur.is_alive():
+                logger.warning("[%s] fetch_pc_duration join 超时", phone)
+                dur_exc[0] = requests.Timeout("fetch_pc_duration join timeout")
+            if t_tasks.is_alive():
+                logger.warning("[%s] fetch_pc_ad_config join 超时", phone)
+                tasks_exc[0] = requests.Timeout("fetch_pc_ad_config join timeout")
 
             # 优先抛 NeedLoginError（让调用方感知 token 过期）
             if isinstance(dur_exc[0], NeedLoginError):
@@ -282,12 +290,12 @@ def get_account_status(account: dict, enable_relogin: bool = False) -> dict:
             tasks_result = tasks_result_ref[0]
         except NeedLoginError:
             info["token_expired"] = True
-            client.close()
             return info
         except Exception:
             logger.exception("get_account_status API call failed for %s", phone)
-            client.close()
             return info
+        finally:
+            client.close()
         # 正常路径（未抛异常）下显式标记 token 有效，否则前端无法区分"未登录"和"token 有效"
         info["token_valid"] = True
         if not dur.get("_error"):
@@ -303,7 +311,6 @@ def get_account_status(account: dict, enable_relogin: bool = False) -> dict:
             info["tasks"] = tasks
         else:
             info["pc_error"] = True
-        client.close()
     return info
 
 
@@ -356,8 +363,16 @@ def get_account_mobile_status(account: dict) -> dict:
         t_prof = Thread(target=_fetch_profile)
         t_act.start()
         t_prof.start()
-        t_act.join()
-        t_prof.join()
+        # join 传 timeout 防止线程卡死导致前端 loading 永不消失
+        # 底层 _request_with_retry 最坏约 (max_retries+1)*(30+retry_delay)≈124s，130s 略加冗余
+        t_act.join(timeout=130)
+        t_prof.join(timeout=130)
+        if t_act.is_alive():
+            logger.warning("[%s] fetch_mobile_ad_activity join 超时", phone)
+            act_exc[0] = requests.Timeout("fetch_mobile_ad_activity join timeout")
+        if t_prof.is_alive():
+            logger.warning("[%s] fetch_mobile_profile join 超时", phone)
+            prof_exc[0] = requests.Timeout("fetch_mobile_profile join timeout")
 
         if isinstance(act_exc[0], NeedLoginError):
             raise act_exc[0]
@@ -372,12 +387,12 @@ def get_account_mobile_status(account: dict) -> dict:
         profile = prof_result[0]
     except NeedLoginError:
         info["token_expired"] = True
-        client.close()
         return info
     except Exception:
         logger.exception("get_account_mobile_status API call failed for %s", phone)
-        client.close()
         return info
+    finally:
+        client.close()
 
     info["token_valid"] = True
 
@@ -401,7 +416,6 @@ def get_account_mobile_status(account: dict) -> dict:
     else:
         info["mobile_error"] = True
 
-    client.close()
     return info
 
 
@@ -480,9 +494,14 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
         # as_completed 会一直阻塞到所有 future 完成，导致 90s 总超时失效。
         # timeout 到期后 __next__() 抛 TimeoutError，由外层 except 捕获处理剩余 future。
         remaining = max(0.1, deadline - time.monotonic())
+        # processed_phones 记录正常路径已处理的 phone，避免 TimeoutError 路径重复 append
+        # （as_completed 抛 TimeoutError 时 futures 字典仍含已 yield 过的 future，无法区分
+        # "已处理"与"未处理"，需用显式集合去重）
+        processed_phones: set[str] = set()
         try:
             for future in as_completed(futures, timeout=remaining):
                 phone = futures[future]
+                processed_phones.add(phone)
                 # 防御性兜底：as_completed yield 的 future 可能已完成但 deadline 已过
                 if time.monotonic() >= deadline:
                     future.cancel()
@@ -504,9 +523,23 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
                     # 前端按 token_valid=false 走 account-disabled 样式，由设计文档 4.2 失败处理定义）
                     results.append(_placeholder(phone))
         except TimeoutError:
-            # as_completed 总超时：剩余未完成的 future 填 query_timeout 占位
+            # as_completed 总超时：遍历所有 future，done() 的提取结果（as_completed 抛
+            # TimeoutError 瞬间可能有 future 已完成但未被 yield，结果不应丢弃），
+            # 未 done() 的填 query_timeout 占位
             for future, phone in futures.items():
-                if not future.done():
+                if phone in processed_phones:
+                    continue  # 正常路径已处理，跳过避免重复 append
+                if future.done():
+                    try:
+                        info = future.result()
+                        for k, v in _default_for_real.items():
+                            info.setdefault(k, v)
+                        status_item = {k: v for k, v in info.items()
+                                       if k not in ("name", "remark", "enabled", "claim_target", "tasks")}
+                        results.append(status_item)
+                    except Exception:
+                        results.append(_placeholder(phone))
+                else:
                     future.cancel()
                     results.append(_placeholder(phone, marker="query_timeout"))
     finally:
@@ -523,7 +556,7 @@ def batch_update_accounts(phones: list[str], action: str) -> dict:
     替代逐条 update_fields/delete 的 N 次 commit 模式，大幅减少 fsync 次数。
 
     非原子语义保留：affected 返回实际受影响行数（不含不存在的 phone），
-    failed 返回不存在的 phone（affected + len(failed) 可能 < len(phones)
+    failed_phones 返回不存在的 phone（affected + len(failed_phones) 可能 < len(phones)
     因重复 phone 被 SQL IN 自动去重）。
 
     性能：用 get_existing_phones（仅 SELECT phone）替代 get_by_phones（SELECT *），
@@ -534,12 +567,12 @@ def batch_update_accounts(phones: list[str], action: str) -> dict:
         action: ``"enable"`` / ``"disable"`` / ``"delete"``
 
     Returns:
-        ``{"ok": True, "affected": int, "failed": list[str]}``：
+        ``{"ok": True, "affected": int, "failed_phones": list[str]}``：
         - affected：实际成功处理的账号数
-        - failed：处理失败的 phone 列表
+        - failed_phones：处理失败的 phone 列表
     """
     if not phones:
-        return {"ok": True, "affected": 0, "failed": []}
+        return {"ok": True, "affected": 0, "failed_phones": []}
 
     try:
         # 仅 SELECT phone 列判断存在性，避免 SELECT * 载入敏感字段
@@ -556,8 +589,8 @@ def batch_update_accounts(phones: list[str], action: str) -> dict:
             affected = repo.batch_delete(existing_list)
     except Exception as e:
         logger.error("batch_update_accounts %s failed: %s", action, e)
-        return {"ok": True, "affected": 0, "failed": list(phones)}
-    return {"ok": True, "affected": affected, "failed": not_found}
+        return {"ok": True, "affected": 0, "failed_phones": list(phones)}
+    return {"ok": True, "affected": affected, "failed_phones": not_found}
 
 
 def get_enabled_accounts_by_phones(phones: list[str]) -> list[dict]:
@@ -844,6 +877,10 @@ def _claim_pc_phase(client: EtAlienClient, phone: str,
             logger.info("  [%s] 连续%d次补发失败，停止", phone, consecutive_fail)
             break
 
+        # 已领够则不再 sleep，避免最后一轮成功后多等 interval 秒
+        if local_success >= unwatched_before:
+            break
+
         time.sleep(interval)
 
     # 结束查1次config校准真实领取数
@@ -960,6 +997,10 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
             logger.info("  [%s] 手机端连续%d次补发失败，停止", phone, consecutive_fail)
             break
 
+        # 已领够则不再 sleep，避免最后一轮成功后多等 interval 秒
+        if local_success >= pending_count:
+            break
+
         time.sleep(interval)
 
     # 结束查1次activity校准真实领取数（用 user_watch_cnt 差值，因含无奖励任务）
@@ -1063,8 +1104,16 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
             t_dur = Thread(target=_fetch_pc_dur)
             t_ad.start()
             t_dur.start()
-            t_ad.join()
-            t_dur.join()
+            # join 传 timeout 防止线程卡死导致领取流程卡死
+            # 底层 _request_with_retry 最坏约 (max_retries+1)*(30+retry_delay)≈124s，130s 略加冗余
+            t_ad.join(timeout=130)
+            t_dur.join(timeout=130)
+            if t_ad.is_alive():
+                logger.warning("  [%s] fetch_pc_ad_config join 超时", phone)
+                ad_exc[0] = requests.Timeout("fetch_pc_ad_config join timeout")
+            if t_dur.is_alive():
+                logger.warning("  [%s] fetch_pc_duration join 超时", phone)
+                dur_exc[0] = requests.Timeout("fetch_pc_duration join timeout")
 
             # 检查 NeedLoginError / RequestException 优先上抛（保持原有异常语义）
             if isinstance(ad_exc[0], NeedLoginError):
@@ -1170,8 +1219,16 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
             t_prof = Thread(target=_fetch_mobile_prof)
             t_act.start()
             t_prof.start()
-            t_act.join()
-            t_prof.join()
+            # join 传 timeout 防止线程卡死导致领取流程卡死
+            # 底层 _request_with_retry 最坏约 (max_retries+1)*(30+retry_delay)≈124s，130s 略加冗余
+            t_act.join(timeout=130)
+            t_prof.join(timeout=130)
+            if t_act.is_alive():
+                logger.warning("  [%s] fetch_mobile_ad_activity join 超时", phone)
+                act_exc[0] = requests.Timeout("fetch_mobile_ad_activity join timeout")
+            if t_prof.is_alive():
+                logger.warning("  [%s] fetch_mobile_profile join 超时", phone)
+                prof_exc[0] = requests.Timeout("fetch_mobile_profile join timeout")
 
             # 检查 NeedLoginError / RequestException 优先上抛（保持原有异常语义）
             if isinstance(act_exc[0], NeedLoginError):
@@ -1363,6 +1420,8 @@ def run_concurrent_claim(accounts: list[dict], settings: dict, claim_mgr: Any = 
                 result = future.result()
                 results.append(result)
             except Exception as e:
+                # 防御性兜底：理论上 claim_for_account 内部已 try/except 全部异常，
+                # 不会向上抛出。保留此分支以防未来 claim_for_account 改为抛异常。
                 account = futures[future]
                 logger.exception("Claim failed for %s", account['phone'])
                 logger.error("  [%s] 异常: %s", account['phone'], e)

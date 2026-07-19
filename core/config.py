@@ -136,8 +136,12 @@ def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
         # enum 校验：value 必须在 options 的 key 集合中
         if "options" in schema and value not in schema["options"]:
             return False, f"设置 {key} 的值 {value!r} 不在允许的选项中", "validation"
-    if "schedule_time" in settings and not SCHEDULE_TIME_PATTERN.match(settings["schedule_time"]):
-        return False, "时间格式错误，应为 HH:MM", "validation"
+    if "schedule_time" in settings:
+        if not SCHEDULE_TIME_PATTERN.match(settings["schedule_time"]):
+            return False, "时间格式错误，应为 HH:MM", "validation"
+        hh, mm = settings["schedule_time"].split(":")
+        if not (0 <= int(hh) <= 23 and 0 <= int(mm) <= 59):
+            return False, "时间范围错误，HH 应为 00-23，MM 应为 00-59", "validation"
     return True, None, None
 
 
@@ -165,7 +169,20 @@ def _load_accounts_json(json_path: str = ACCOUNTS_FILE) -> list[dict]:
 
 def _atomic_write(filepath: str, data: str) -> None:
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(filepath), suffix=".tmp")
+    # 清理同目录下残留的 .settings.tmp 文件（前次写入被 Ctrl+C/进程崩溃中断时遗留）
+    # 注意：必须用专属后缀 .settings.tmp，不能用通用的 .tmp，否则会误删
+    # core/db.py migrate_from_json 正在使用的 accounts.db.tmp
+    tmp_dir = os.path.dirname(filepath)
+    try:
+        for f in os.listdir(tmp_dir):
+            if f.endswith(".settings.tmp"):
+                try:
+                    os.unlink(os.path.join(tmp_dir, f))
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, suffix=".settings.tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(data)
@@ -249,19 +266,19 @@ def save_settings(settings: dict) -> None:
     新值但磁盘仍是旧值，后续 load_settings 走缓存读到未持久化的"幽灵配置"，重启后丢失）。
     调用方需捕获 OSError 以感知失败。
 
-    并发说明：_atomic_write 在 _settings_lock 外执行以避免阻塞读操作，两个并发
-    save_settings 可能导致缓存与磁盘不一致（A 写盘 → B 写盘覆盖 → A 更新缓存 →
-    B 更新缓存，中间状态缓存为 A 值但磁盘已是 B 值）。由于写盘与加锁相互独立，
-    最终磁盘值（最后完成的写盘）与缓存值（最后获取锁的 save）可能来自不同线程，
-    但后续 reload_settings 可纠正。save_settings 是低频操作（用户改设置），当前权衡可接受。
+    并发说明：写盘与缓存更新都在 _settings_lock 内执行，确保"磁盘值"与"缓存值"
+    来自同一次 save_settings 调用，避免并发 save 时的幽灵缓存（A 写盘 → B 写盘覆盖
+    → A 更新缓存 → B 更新缓存，中间状态缓存为 A 值但磁盘已是 B 值）。
+    代价：写盘期间阻塞 load_settings/reload_settings，但 save_settings 是低频操作
+    （用户改设置），可接受。
     """
     global _settings_cache
-    try:
-        _atomic_write(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=4))
-    except OSError as e:
-        logger.error("Failed to save settings: %s", e)
-        raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
     with _settings_lock:
+        try:
+            _atomic_write(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=4))
+        except OSError as e:
+            logger.error("Failed to save settings: %s", e)
+            raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
         _settings_cache = copy.deepcopy(settings)  # 缓存写入的深拷贝副本
 
 

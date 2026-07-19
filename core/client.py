@@ -7,6 +7,7 @@ et-api.com Protobuf 接口客户端模块。
 """
 
 import logging
+import threading
 import time
 import uuid
 from typing import Any, Callable
@@ -82,7 +83,16 @@ class EtAlienClient:
         # token 过期自动重登能力（可选，仅领取流程注入）
         self._password = password
         self._on_relogin = on_relogin   # 回调：持久化新 token / 清除密码
+        # 一次性标志：设为 True 后永不重置，client 实例生命周期内只重登一次。
+        # 假设：client 实例不跨"token 周期"复用（claim_for_account/get_account_status 等
+        # 每次创建新 client）。如未来改为长期复用（守护进程/连接池场景），需配合
+        # 中#2 并发重登问题的修复方案一起调整为可重置。
         self._relogin_attempted = False  # 防止循环重登
+        # 重登串行化锁：service.py 用 Thread 并发调用同一 client 实例的多个接口，
+        # token 过期时多个线程可能同时进入 _handle_auth_error_and_retry 的 check-then-act，
+        # 用 RLock 串行化整个重登流程（RLock 允许同线程递归，因 login_by_password 走
+        # _post 可能递归进入此函数）
+        self._relogin_lock = threading.RLock()
 
         # 重试机制配置（从 settings.json 注入）
         # clamp 到 >=0，避免 max_retries 为负数时 range(0) 不执行循环导致 raise None
@@ -141,6 +151,8 @@ class EtAlienClient:
                     last_exc = requests.HTTPError(f"server returned {resp.status_code}")
                     time.sleep(self._retry_delay)
                     continue
+                # 非重试场景（2xx/4xx 或 5xx 最后一次）：直接返回，由调用方通过 _parse_response 解析
+                last_exc = None
                 return resp.status_code, resp.content
             except requests.ConnectionError as e:
                 last_exc = e
@@ -207,67 +219,86 @@ class EtAlienClient:
         2. 密码重登失败（密码错误/网络异常）→ 抛 NeedLoginError（密码错误时回调清除密码）
         3. 重登成功 → 持久化新 token → 重试原请求
         4. 重试后仍 auth error → 抛 NeedLoginError（不再二次重登，防无限重试）
+
+        并发说明：用 _relogin_lock 串行化整个重登流程，避免 service.py 用 Thread 并发
+        调用同一 client 时多个线程同时进入 check-then-act 导致重复重登请求、token
+        持久化两次、session.headers 互相覆盖。RLock 允许同线程内递归（login_by_password
+        走 _post 可能递归进入此函数）。
         """
-        if not self._password:
-            logger.info("[%s] token 过期，未配置密码，无法重登", self.phone)
-            raise NeedLoginError(f"{self.phone}: token expired, no password")
+        with self._relogin_lock:
+            if not self._password:
+                logger.info("[%s] token 过期，未配置密码，无法重登", self.phone)
+                raise NeedLoginError(f"{self.phone}: token expired, no password")
 
-        if self._relogin_attempted:
-            # 触发场景有二，均不再重复重登：
-            #   (1) 之前已重登过（无论成功/失败），后续其他 API 请求又收到 auth error
-            #   (2) 重登请求本身返回 auth error（重登走 _post 递归进入此分支）
-            logger.warning("[%s] token 过期，重登已尝试过（不再重复重登）", self.phone)
-            raise NeedLoginError(f"{self.phone}: relogin already attempted")
+            if self._relogin_attempted:
+                # 触发场景：
+                #   (1) 之前已重登过（无论成功/失败），后续其他 API 请求又收到 auth error
+                #   (2) 重登请求本身返回 auth error（重登走 _post 递归进入此分支）
+                #   (3) 并发场景下其他线程已重登，本线程持锁后读到 _relogin_attempted=True
+                # 修复 Core #2（方案A）：场景 (3) 时使用新 token（session.headers 已被
+                # Thread A 更新）重试一次原请求，避免 Thread B 本次领取被浪费。
+                # 场景 (1)/(2) 重试若仍 auth error 也无害（多一次 HTTP 调用，最终抛
+                # NeedLoginError），不引入无限重试（最多 1 次）。
+                logger.info("[%s] token 过期，重登已尝试过，使用当前 token 重试原请求一次", self.phone)
+                retry_url = self._build_url(method, path, query)
+                retry_status, retry_data = self._request_with_retry(
+                    method, retry_url, data=body, retry_on_500=retry_on_500
+                )
+                retry_result = self._parse_response(retry_status, retry_data)
+                if self._is_auth_error(retry_result):
+                    logger.warning("[%s] 重登后重试请求仍返回 auth error，放弃", self.phone)
+                    raise NeedLoginError(f"{self.phone}: auth error persists after relogin")
+                return retry_result
 
-        self._relogin_attempted = True
-        logger.info("[%s] token 过期，尝试密码重登", self.phone)
+            self._relogin_attempted = True
+            logger.info("[%s] token 过期，尝试密码重登", self.phone)
 
-        # 重登请求走 _post → _request_with_retry，享有 Layer 1 的本地重试兜底（网络异常/超时）
-        # 注意：login_by_password 传 retry_on_500=False，HTTP 500 不重试（密码错误的 500 是业务错误）
-        try:
-            login_result = self.login_by_password(self._password)
-        except requests.RequestException as e:
-            # 重登请求重试后仍网络异常，放弃重登
-            logger.warning("[%s] 密码重登网络异常（已重试 %d 次）: %s", self.phone, self._max_retries, e)
-            raise NeedLoginError(f"{self.phone}: relogin network error")
-
-        if login_result.get("_error"):
-            logger.warning("[%s] 密码重登失败: %s", self.phone, login_result.get("msg"))
-            # 密码错误时清除保存的密码（通过回调）
-            if self._on_relogin and _is_password_incorrect(login_result):
-                try:
-                    self._on_relogin(new_token=None, user_id=None, clear_password=True)
-                    logger.info("[%s] 密码错误，已清除保存的密码", self.phone)
-                except Exception:
-                    # 回调失败时密码未清除，日志需明确说明"未清除"以免误导
-                    logger.exception("[%s] 密码错误，但清除密码回调失败，密码未清除", self.phone)
-            raise NeedLoginError(f"{self.phone}: relogin failed")
-
-        # 重登成功：login_by_password 内部已更新 self.auth_token / self.user_id，
-        # 并同步到 session.headers["Authorization"]
-        # 这里通过回调持久化新 token 到 accounts.db（SQLite，由 service 层 _save_login_result 写入）
-        if self._on_relogin:
+            # 重登请求走 _post → _request_with_retry，享有 Layer 1 的本地重试兜底（网络异常/超时）
+            # 注意：login_by_password 传 retry_on_500=False，HTTP 500 不重试（密码错误的 500 是业务错误）
             try:
-                self._on_relogin(new_token=self.auth_token, user_id=self.user_id)
-            except Exception:
-                # 回调异常（如文件写入失败）不应阻断重登后的重试流程
-                # token 已在 session.headers 中，重试仍可进行
-                logger.exception("[%s] 持久化新 token 回调异常", self.phone)
-        logger.info("[%s] 密码重登成功，重试原请求", self.phone)
+                login_result = self.login_by_password(self._password)
+            except requests.RequestException as e:
+                # 重登请求重试后仍网络异常，放弃重登
+                logger.warning("[%s] 密码重登网络异常（已重试 %d 次）: %s", self.phone, self._max_retries, e)
+                raise NeedLoginError(f"{self.phone}: relogin network error")
 
-        # 重试原请求（新 token 已在 session.headers 中）
-        # 重试请求走 _request_with_retry，即重登后的请求同样享有"本地原因 max_retries 次重试"兜底
-        # 重新构建 URL 刷新 ts/nonce/sig，避免重登耗时较长时服务端校验 ts 有效期失败
-        url = self._build_url(method, path, query)
-        status_code, data = self._request_with_retry(method, url, data=body, retry_on_500=retry_on_500)
-        result = self._parse_response(status_code, data)
+            if login_result.get("_error"):
+                logger.warning("[%s] 密码重登失败: %s", self.phone, login_result.get("msg"))
+                # 密码错误时清除保存的密码（通过回调）
+                if self._on_relogin and _is_password_incorrect(login_result):
+                    try:
+                        self._on_relogin(new_token=None, user_id=None, clear_password=True)
+                        logger.info("[%s] 密码错误，已清除保存的密码", self.phone)
+                    except Exception:
+                        # 回调失败时密码未清除，日志需明确说明"未清除"以免误导
+                        logger.exception("[%s] 密码错误，但清除密码回调失败，密码未清除", self.phone)
+                raise NeedLoginError(f"{self.phone}: relogin failed")
 
-        # 防无限重试：重登后重试的原请求若仍返回 auth error，不再重登，直接抛异常
-        if self._is_auth_error(result):
-            logger.warning("[%s] 重登后重试请求仍返回 auth error，放弃", self.phone)
-            raise NeedLoginError(f"{self.phone}: auth error persists after relogin")
+            # 重登成功：login_by_password 内部已更新 self.auth_token / self.user_id，
+            # 并同步到 session.headers["Authorization"]
+            # 这里通过回调持久化新 token 到 accounts.db（SQLite，由 service 层 _save_login_result 写入）
+            if self._on_relogin:
+                try:
+                    self._on_relogin(new_token=self.auth_token, user_id=self.user_id)
+                except Exception:
+                    # 回调异常（如文件写入失败）不应阻断重登后的重试流程
+                    # token 已在 session.headers 中，重试仍可进行
+                    logger.exception("[%s] 持久化新 token 回调异常", self.phone)
+            logger.info("[%s] 密码重登成功，重试原请求", self.phone)
 
-        return result
+            # 重试原请求（新 token 已在 session.headers 中）
+            # 重试请求走 _request_with_retry，即重登后的请求同样享有"本地原因 max_retries 次重试"兜底
+            # 重新构建 URL 刷新 ts/nonce/sig，避免重登耗时较长时服务端校验 ts 有效期失败
+            url = self._build_url(method, path, query)
+            status_code, data = self._request_with_retry(method, url, data=body, retry_on_500=retry_on_500)
+            result = self._parse_response(status_code, data)
+
+            # 防无限重试：重登后重试的原请求若仍返回 auth error，不再重登，直接抛异常
+            if self._is_auth_error(result):
+                logger.warning("[%s] 重登后重试请求仍返回 auth error，放弃", self.phone)
+                raise NeedLoginError(f"{self.phone}: auth error persists after relogin")
+
+            return result
 
     def _parse_protobuf_error(self, data: bytes) -> dict[str, Any] | None:
         """尝试将响应 bytes 解析为 error.proto 的 Error 消息。
@@ -309,6 +340,9 @@ class EtAlienClient:
         """格式化手机号：不带 + 前缀的国内号码自动添加 +86。"""
         if phone.startswith("+"):
             return phone
+        # 13 位且以 86 开头：视为带国家代码但缺 + 的国内号码
+        if phone.startswith("86") and len(phone) == 13:
+            return f"+{phone}"
         return f"+86{phone}"
 
     def is_logged_in(self) -> bool:
@@ -331,11 +365,10 @@ class EtAlienClient:
         if not result.get("_error"):
             return False
         code = result.get("code")
-        if code in (401, 403):
-            return True
-        if isinstance(code, int) and code == 16:
-            return True
-        return False
+        # protobuf code 字段总是 int，这里统一 isinstance 检查避免类型不一致的隐患
+        if not isinstance(code, int):
+            return False
+        return code in (401, 403, 16)
 
     def get_login_code(self, phone: str | None = None) -> dict[str, Any]:
         """请求发送登录验证码。
@@ -378,9 +411,12 @@ class EtAlienClient:
         # 登录成功后会在下方设置新 token；失败时 finally 恢复旧值
         saved_auth = self.session.headers.pop("Authorization", None)
         try:
+            # 验证码登录接口与密码登录接口同属 /account/v1/ 路径，验证码错误也返回 500，
+            # 不应重试，否则用户要等约 max_retries×retry_delay 秒才看到提示，且可能触发服务端风控
             result = self._post(
                 "/account/v1/login",
                 body=req.SerializeToString(),
+                retry_on_500=False,
             )
         finally:
             if saved_auth is not None and "Authorization" not in self.session.headers:
@@ -397,6 +433,9 @@ class EtAlienClient:
                 result["authorization"] = resp.authorization
             except Exception as e:
                 logger.exception("Failed to parse LoginResponse for %s", phone)
+                # parse 失败视为错误：token 未设置，调用方需走错误分支而非继续用旧 token
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
@@ -442,6 +481,9 @@ class EtAlienClient:
                 result["authorization"] = resp.authorization
             except Exception as e:
                 logger.exception("Failed to parse LoginV2Response for %s", phone)
+                # parse 失败视为错误：token 未设置，调用方需走错误分支而非继续用旧 token
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
@@ -492,6 +534,9 @@ class EtAlienClient:
                         )
             except Exception as e:
                 logger.exception("Failed to parse PcAdConfigResponse")
+                # parse 失败视为错误：调用方只检查 _error，否则会走"已完成"分支误判
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
@@ -520,6 +565,9 @@ class EtAlienClient:
                 })
             except Exception as e:
                 logger.exception("Failed to parse GetUserRemainDurationResponse")
+                # parse 失败视为错误：调用方只检查 _error，否则会误判时长为 0
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
@@ -547,6 +595,9 @@ class EtAlienClient:
                 result["is_verify"] = resp.is_verify
             except Exception as e:
                 logger.exception("Failed to parse PcAdCallbackBackupResponse")
+                # parse 失败视为错误：调用方只检查 _error，否则会走"is_verify=False"分支误判
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
@@ -593,6 +644,9 @@ class EtAlienClient:
                 })
             except Exception as e:
                 logger.exception("Failed to parse AdActivityResponse")
+                # parse 失败视为错误：调用方只检查 _error，否则会走"任务已完成"分支误判
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
@@ -655,6 +709,9 @@ class EtAlienClient:
                 })
             except Exception as e:
                 logger.exception("Failed to parse MyProfileResponse")
+                # parse 失败视为错误：调用方只检查 _error，否则会误判时长为 0
+                result["_error"] = True
+                result["msg"] = f"parse error: {e}"
                 result["parse_error"] = str(e)
 
         return result
