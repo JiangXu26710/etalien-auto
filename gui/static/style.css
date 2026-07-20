@@ -332,16 +332,23 @@ body {
 .action-bar-left-group {
     display: flex;
     align-items: center;
+    /* 占满 action-bar 中间空间（把 action-bar-right 推到右边），让内部 tip-module 的 flex:1 有实际空间可占 */
+    flex: 1;
+    min-width: 0;
 }
 
 .action-bar-left {
     display: flex;
     gap: 10px;
+    /* 按钮组固定宽度，不被压缩 */
+    flex-shrink: 0;
 }
 
 .action-bar-right {
     display: flex;
     gap: 10px;
+    /* 设置按钮固定宽度，不被挤出 */
+    flex-shrink: 0;
 }
 
 .btn-primary, .btn-secondary, .btn-accent {
@@ -385,7 +392,7 @@ body {
 
 .btn-primary:disabled {
     opacity: 0.5;
-    cursor: not-allowed;
+    cursor: default;
     transform: none;
     box-shadow: none;
 }
@@ -1915,7 +1922,13 @@ body {
 
 .stat-card.is-action.is-locked {
     opacity: 0.4;
-    cursor: not-allowed;
+    cursor: default;
+    pointer-events: none;
+}
+
+/* 领取中禁用批量操作卡片时，强制覆盖 .action-state.active 的 pointer-events:auto，
+   否则子元素（图标/文字/按钮）仍可响应点击，绕过卡片的 is-locked 屏蔽 */
+.stat-card.is-action.is-locked .action-state.active {
     pointer-events: none;
 }
 
@@ -2324,10 +2337,10 @@ body {
    批量删除弹窗的 input.shake 由全局规则接管，仍会展示摇晃效果 + 边框变红（border-color 通过 .modal-input-confirm input:focus 继承生效）。
    归档清单提交给主 agent，由 archive-file skill 统一归档到 .trash/。 */
 
-/* 禁用态：降低不透明度 + 禁止光标（保留点击触发抖动） */
+/* 禁用态：降低不透明度（保留点击触发抖动）；cursor 用 default 不显示禁止样式，与项目统一风格一致 */
 .btn-modal:disabled {
     opacity: 0.35;
-    cursor: not-allowed;
+    cursor: default;
     pointer-events: auto;
 }
 
@@ -3490,10 +3503,12 @@ input.shake {
     border-radius: 0;
     font-size: 12.5px;
     margin-left: 90px;
-    /* min-width: 400px（25 汉字 + "tip:" 前缀留余量，25 × 12.5 ≈ 313px + 前缀 40px ≈ 353px） */
-    /* max-width: 500px（上限） */
-    max-width: 500px;
-    min-width: 400px;
+    margin-right: 45px;
+    /* 完全相对宽度：左边距"添加账号"按钮 90px、右边距"设置"按钮 45px，中间区域全部给 tip-module
+       flex:1 让 tip-module 占满 left-group 剩余空间；min-width:0 允许缩到 0（越过默认 min-width:auto=min-content），
+       tip-viewport 的 overflow:hidden + min-width:0 会自动裁剪内容 */
+    flex: 1;
+    min-width: 0;
     cursor: pointer;
     user-select: none;
     overflow: hidden;

@@ -297,6 +297,8 @@ function maskPhone(phone) {
 }
 
 async function windowMinimize() {
+    // 浏览器（非 webview2）中 pywebview 未注入：静默 return，避免 win-minimize-out class 残留导致页面永久透明
+    if (typeof pywebview === 'undefined') return;
     try {
         document.body.classList.add('win-minimize-out');
         await new Promise(r => setTimeout(r, 200));
@@ -306,6 +308,8 @@ async function windowMinimize() {
 }
 
 async function windowMaximize() {
+    // 浏览器中 pywebview 未注入：静默 return（原代码第一行 is_maximized 即抛 ReferenceError，无视觉残留但产生 console 噪音）
+    if (typeof pywebview === 'undefined') return;
     try {
         const wasMax = await pywebview.api.is_maximized();
         const btn = document.querySelector('.title-btn-max');
@@ -332,6 +336,11 @@ async function windowMaximize() {
 }
 
 async function windowClose() {
+    // 浏览器中 pywebview 未注入：尝试 window.close()（脚本打开的窗口可关闭，手动打开的会被浏览器静默拒绝），不加 win-close-out class 避免页面透明残留
+    if (typeof pywebview === 'undefined') {
+        window.close();
+        return;
+    }
     try {
         document.body.classList.add('win-close-out');
         await new Promise(r => setTimeout(r, 200));
@@ -348,6 +357,8 @@ async function windowClose() {
  * 避免全局永久监听 mousemove 造成不必要开销。
  */
 function initDrag() {
+    // 浏览器中 pywebview 未注入：不绑定 mousedown/dblclick，避免 e.preventDefault() 阻止浏览器默认行为（如文字选中），同时避免拖拽逻辑中的 ReferenceError
+    if (typeof pywebview === 'undefined') return;
     const titleBarDrag = document.getElementById('titleBarDrag');
     if (!titleBarDrag) return;
 
@@ -813,10 +824,9 @@ function refreshAll() {
                 startLazyLoadPolling();
             }).catch(e => console.error('refreshAll search fetchAccountsPage error:', e));
         }
-        // 3. 清除 mobileStatusCache 并重置 flippedPhones（所有卡片回到正面）
+        // 3. 清除 mobileStatusCache（翻面态卡片在 renderViewport/rerenderCardByPhone 中会自动走 fetchMobileStatus 重新加载，保留 flippedPhones 不重置翻转态）
         Object.keys(mobileStatusCache).forEach(k => delete mobileStatusCache[k]);
-        flippedPhones.clear();
-        // 4. 停止所有手机端时长自减
+        // 4. 停止所有手机端时长自减（cache 已清，旧自减失效；翻面卡片重新加载完成后由 renderMobileBack 自动重启）
         mobileCountdownPhones.clear();
         if (mobileCountdownTimer) {
             clearInterval(mobileCountdownTimer);
