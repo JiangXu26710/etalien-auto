@@ -273,15 +273,17 @@ function validatePhoneFmt(phone) {
 function validateCodeFmt(code) { return CODE_RE.test(code) ? '' : '验证码格式不正确，请输入6位数字'; }
 function validatePwdFmt(pwd) { return PWD_RE.test(pwd) ? '' : '密码格式不正确，需为6-20位字母、数字、下划线或点号'; }
 
-// UX-012：表单内联错误提示工具函数
-// 在指定输入框下方（id="${fieldId}Error" 的 .field-error 元素）显示错误消息，
-// aria-live="polite" 让屏幕阅读器柔和播报；同时同步 aria-invalid 便于辅助技术识别。
-function showFieldError(fieldId, message) {
+// UX-012：表单错误反馈工具函数
+// 不再渲染 .field-error 内联文字（会导致弹窗高度跳变），改为：
+// - aria-invalid 同步给辅助技术识别
+// - shake=true 时调用全局 triggerShake 晃动输入框（默认开启）
+// - 文字反馈由调用方配合 showToast 提供
+function showFieldError(fieldId, message, shake = true) {
     if (!fieldId) return;
-    const errEl = document.getElementById(fieldId + 'Error');
-    if (errEl) errEl.textContent = message || '';
     const input = document.getElementById(fieldId);
-    if (input) input.setAttribute('aria-invalid', message ? 'true' : 'false');
+    if (!input) return;
+    input.setAttribute('aria-invalid', message ? 'true' : 'false');
+    if (message && shake) triggerShake(input);
 }
 function clearFieldError(fieldId) {
     showFieldError(fieldId, '');
@@ -726,13 +728,17 @@ function openModal(html, wide) {
 function closeModal(e) {
     if (e && e.target !== document.getElementById('modalOverlay')) return;
     if (e && modalMouseDownTarget !== document.getElementById('modalOverlay')) return;
-    // 设置弹窗上下文：高级区打开时点遮罩不关闭任何东西（避免误触丢失高级区修改）
+    // 高级区打开时点遮罩：只关闭高级区（修改暂存到 advancedStaging），不触发主弹窗关闭流程
+    // 高级区是常规配置项的子层，关闭高级区只是"回到常规配置项"，不是"退出整个设置"
+    // 修改不会丢失：advancedStaging 已由 onAdvClose 内部的 syncAdvStaging() 更新，advDirty 也已同步
+    // 用户后续从常规配置项退出时，isDirty = commonDirty || advDirty 会统一检查
     const advPanel = document.getElementById('advPanel');
     if (advPanel && advPanel.classList.contains('active')) {
+        onAdvClose();
         modalMouseDownTarget = null;
         return;
     }
-    // 设置弹窗上下文：有未保存修改时阻止关闭 + toast 提示
+    // 常规配置项：有未保存修改时阻止关闭 + toast 提示
     if (isDirty()) {
         showToast('有未保存的修改，请点取消或保存', 'error');
         modalMouseDownTarget = null;
@@ -1824,7 +1830,6 @@ function showAddAccount() {
         <div class="form-group">
             <label for="addPhone">手机号 *</label>
             <input type="text" id="addPhone" placeholder="请输入手机号" maxlength="11" aria-required="true">
-            <div class="field-error" id="addPhoneError" aria-live="polite"></div>
         </div>
         <div class="form-group">
             <label for="addName">用户名（选填）</label>
@@ -1951,7 +1956,6 @@ async function doAddAccountStep1() {
                 <div class="form-group">
                     <label for="addLoginCode">验证码 *</label>
                     <input type="text" id="addLoginCode" placeholder="请输入收到的验证码" maxlength="6" aria-required="true">
-                    <div class="field-error" id="addLoginCodeError" aria-live="polite"></div>
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn-modal btn-modal-cancel" id="btnResendAdd" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendAdd')">重新获取</button>
@@ -1965,7 +1969,6 @@ async function doAddAccountStep1() {
                 <div class="form-group">
                     <label for="addLoginPwd">密码 *</label>
                     <input type="password" id="addLoginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码" aria-required="true">
-                    <div class="field-error" id="addLoginPwdError" aria-live="polite"></div>
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
@@ -2518,7 +2521,6 @@ function showLogin(phone) {
             <div class="form-group">
                 <label for="loginCode">验证码 *</label>
                 <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6" aria-required="true">
-                <div class="field-error" id="loginCodeError" aria-live="polite"></div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
@@ -2532,7 +2534,6 @@ function showLogin(phone) {
             <div class="form-group">
                 <label for="loginPwd">密码 *</label>
                 <input type="password" id="loginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码" aria-required="true">
-                <div class="field-error" id="loginPwdError" aria-live="polite"></div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
@@ -3622,7 +3623,8 @@ function renderSettingsField(key, schema, value) {
         const nullable = schema.nullable === true;
         // nullable 字段：value 为 null 时输入框留空（placeholder 显示「自动分配」）
         const inputValue = (nullable && (value === null || value === undefined)) ? '' : value;
-        // actual_key 字段：在范围后缀中追加「· 当前:xxx」，配置与实际不符时整个后缀标红
+        // actual_key 字段（如 gui_port）：suffix 只显示「当前:xxx」，范围移到 label 旁显示
+        // 普通 int/float 字段：suffix 显示范围「min - max」
         let suffixText = `${schema.min} - ${schema.max}`;
         let mismatchClass = '';
         if (schema.actual_key) {
@@ -3631,7 +3633,7 @@ function renderSettingsField(key, schema, value) {
             const actualText = (actual === null || actual === undefined) ? '未知' : actual;
             // configured !== null && configured !== actual → 标红（配置未生效）
             const mismatch = value !== null && value !== undefined && value !== actual;
-            suffixText = `${schema.min} - ${schema.max} · 当前:${escapeHtml(String(actualText))}`;
+            suffixText = `当前:${escapeHtml(String(actualText))}`;
             mismatchClass = mismatch ? ' mismatch' : '';
         }
         controlHTML = `
@@ -3689,13 +3691,18 @@ function renderSettingsField(key, schema, value) {
         ? `<span class="info-icon" data-tooltip="${escapeHtml(desc)}">${INFO_ICON_SVG}</span>`
         : '';
 
+    // actual_key 字段（如 gui_port）：范围移到 label 旁显示，suffix 只展示当前值
+    const labelRange = (schema.actual_key && schema.min !== undefined && schema.max !== undefined)
+        ? `<span class="adv-label-range">${schema.min}-${schema.max}</span>`
+        : '';
+
     // UX-005：label 关联到对应 input/checkbox id（enum 类型关联到 wrap id）
     const labelFor = schema.type === 'enum' ? `enum-${key}` : inputId;
     return `
         <div class="form-group adv-field-row" data-row="${escapeHtml(key)}">
             <label for="${labelFor}">
                 <span class="adv-label">
-                    ${escapeHtml(label)}
+                    ${escapeHtml(label)}${labelRange}
                 </span>
                 ${infoIconHTML}
             </label>
@@ -3751,9 +3758,9 @@ function openAdvanced() {
     });
 }
 
-/* 关闭高级区：扫描 .adv-field-row 按 schema.type 取值写回 advancedStaging，
-   比较前后 advancedStaging 设 advDirty，水波收缩到关闭按钮 */
-function onAdvClose() {
+/* 同步高级区表单值到 advancedStaging，并比较前后差异更新 advDirty。
+   幂等：多次调用结果相同（基于当前表单值和 advancedStaging 的差异） */
+function syncAdvStaging() {
     const rows = document.querySelectorAll('#advFields .adv-field-row');
     const schema = window.__settingsSchema || {};
     const before = JSON.stringify(advancedStaging);
@@ -3784,6 +3791,11 @@ function onAdvClose() {
     // 比较前后暂存对象，有差异则标记为脏
     const after = JSON.stringify(advancedStaging);
     if (before !== after) advDirty = true;
+}
+
+/* 关闭高级区：同步表单值到 advancedStaging（更新 advDirty），水波收缩到关闭按钮 */
+function onAdvClose() {
+    syncAdvStaging();
 
     const panel = document.getElementById('advPanel');
     const modal = document.getElementById('modalContent');
@@ -4229,12 +4241,12 @@ document.addEventListener('input', e => {
     }
 });
 
-// ESC 关闭：高级区打开时关闭高级区（不关闭主弹窗）；结果弹窗打开时关闭结果弹窗；主弹窗打开时关闭主弹窗
+// ESC 关闭：高级区打开时只关闭高级区（不触发主弹窗关闭流程）；结果弹窗打开时关闭结果弹窗；主弹窗打开时关闭主弹窗
 document.addEventListener('keydown', e => {
     if (e.key !== 'Escape') return;
     const advPanel = document.getElementById('advPanel');
     if (advPanel && advPanel.classList.contains('active')) {
-        onAdvClose();
+        onAdvClose();  // 只关闭高级区，修改暂存到 advancedStaging，不触发主弹窗 isDirty 检查
         return;
     }
     const resultOverlay = document.getElementById('resultOverlay');
@@ -4420,12 +4432,10 @@ function showSettings() {
             <div class="form-group">
                 <label for="setMaxConcurrent">最大账号并发数</label>
                 <input type="number" id="setMaxConcurrent" data-key="max_concurrent" value="${settings.max_concurrent}" min="1" max="999">
-                <div class="field-error" id="setMaxConcurrentError" aria-live="polite"></div>
             </div>
             <div class="form-group">
                 <label for="setInterval">单账号请求间隔（秒）</label>
                 <input type="number" id="setInterval" data-key="request_interval" value="${settings.request_interval}" min="0.01" max="30" step="0.01">
-                <div class="field-error" id="setIntervalError" aria-live="polite"></div>
             </div>
             <div class="settings-divider"></div>
             <div class="form-group">
@@ -4437,7 +4447,6 @@ function showSettings() {
                         <span class="toggle-rect-slider"></span>
                     </label>
                 </div>
-                <div class="field-error" id="setScheduleTimeError" aria-live="polite"></div>
             </div>
             <!-- Server酱领取情况通知 -->
             <div class="form-group">
@@ -4449,7 +4458,6 @@ function showSettings() {
                         <span class="toggle-rect-slider"></span>
                     </label>
                 </div>
-                <div class="field-error" id="setSchanKeyError" aria-live="polite"></div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
@@ -4465,7 +4473,7 @@ function showSettings() {
             </div>
             <div class="adv-panel" id="advPanel">
                 <div class="adv-panel-header">
-                    <h3>高级设置</h3>
+                    <h3>高级配置项</h3>
                     <span class="schema-count">schema<span class="dot">·</span><span id="advFieldCount">0</span> fields</span>
                 </div>
                 <div class="adv-fields" id="advFields"></div>
@@ -4483,7 +4491,7 @@ function showSettings() {
         initLastValid();
         // 初始化版本号翻转状态机（替代 demo 的 IIFE，防重复绑定）
         initVersionFlip();
-        // 绑定版本号 click 监听（打开高级设置）
+        // 绑定版本号 click 监听（打开高级配置项）
         const versionCodeEl = document.getElementById('versionCode');
         if (versionCodeEl) {
             versionCodeEl.addEventListener('click', openAdvanced);
@@ -4508,16 +4516,16 @@ async function doSaveSettings() {
     const check = validateAll(common);
     if (!check.ok) {
         showToast(check.msg, 'error');
-        // UX-012：在常用区对应字段下方显示内联错误（高级区字段无固定元素 id，跳过内联显示由 toast 反馈）
+        // 设置弹窗字段（6-9）已有失焦 clamp+shake 机制，这里仅同步 aria-invalid，不再触发 shake
         if (check.field) {
             const fieldId = SETTINGS_FIELD_ID_MAP[check.field];
-            if (fieldId) showFieldError(fieldId, check.msg);
+            if (fieldId) showFieldError(fieldId, check.msg, false);
         }
         if (btn) btn.disabled = false;
         // 若是高级区字段错误，提示用户从版本号入口进入修改
         const fieldSchema = (window.__settingsSchema || {})[check.field];
         if (fieldSchema && fieldSchema.advanced) {
-            setTimeout(() => showToast(`请单击版本号进入"高级设置"修改 ${fieldSchema.label || check.field}`, 'error'), 1200);
+            setTimeout(() => showToast(`请单击版本号进入"高级配置项"修改 ${fieldSchema.label || check.field}`, 'error'), 1200);
         }
         return;
     }

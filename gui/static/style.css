@@ -2545,6 +2545,14 @@ body {
     align-items: center;
     gap: 6px;
 }
+/* actual_key 字段的范围提示（如 gui_port 的 1-65535），从 suffix 移到 label 旁 */
+.adv-label-range {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    letter-spacing: 0.5px;
+    margin-left: 2px;
+}
 
 /* ===== 数字输入框 + 范围后缀「n - m」 ===== */
 .adv-input-wrap {
@@ -2581,30 +2589,30 @@ body {
 }
 
 /* ===== Bool 字段（高级配置）：左侧 disabled 占位输入框 + 右侧开关 =====
- * 视觉与 int/float 字段对齐：开关复用 .adv-range-suffix 位置（min-width:100px, 右对齐）
+ * 输入框视觉与普通输入框一致：文字颜色与 placeholder 同色（var(--text-muted)），
+ * cursor 用 default 不显示禁止样式；开关复用 .adv-range-suffix 位置（min-width:100px）居中对齐
  */
 .adv-bool-wrap input:disabled {
-    background: var(--bg-locked);
-    color: var(--text-secondary);
-    cursor: not-allowed;
-    border-color: var(--border);
+    background: var(--bg-card);
+    color: var(--text-muted);
+    cursor: default;
     box-shadow: none;
-    text-align: center;
-    font-family: var(--font-sans);
-    letter-spacing: 1px;
+    opacity: 1;
 }
 .adv-bool-wrap input:disabled::placeholder {
     color: var(--text-muted);
     opacity: 0.6;
 }
-/* 开关在 .adv-range-suffix 内右对齐：让 toggle-rect 与右侧范围提示的右边缘对齐 */
+/* 开关在 .adv-range-suffix 的 100px 空间内居中对齐 */
 .adv-bool-toggle {
-    /* 复用 .adv-range-suffix 的 min-width:100px / justify-content:flex-end，无需覆盖 */
+    justify-content: center;
 }
 
 /* ===== Enum 自定义下拉框（参考 claim-select，去掉图标） ===== */
 .enum-select-wrap {
     position: relative;
+    /* 与 .adv-input-wrap 内 input 宽度对齐：input(flex:1) + suffix(min-width:100px) + gap:10px */
+    width: calc(100% - 110px);
 }
 .enum-select-trigger {
     width: 100%;
@@ -3625,24 +3633,11 @@ input.shake {
 @keyframes splashSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
 
 /* ============================================
-   UX-012 表单内联错误提示
-   - 配合 showFieldError(fieldId, message) / clearFieldError(fieldId) 使用
-   - aria-live="polite" 让屏幕阅读器在错误出现时柔和播报
-   - :not(:empty) 选择器实现"无内容则不占空间"的优雅显隐
+   UX-012 表单错误反馈
+   - 原 .field-error 内联文字提示已移除（会导致弹窗高度跳变）
+   - 现改为：showFieldError 内部调用 triggerShake 晃动输入框 + showToast 浮层提示
+   - 配合 input.shake / @keyframes advShake 实现统一视觉反馈
    ============================================ */
-.field-error {
-    color: var(--error);
-    font-size: 12px;
-    line-height: 1.4;
-    margin-top: 4px;
-    min-height: 0;
-    opacity: 0;
-    transition: opacity 0.2s ease;
-}
-.field-error:not(:empty) {
-    min-height: 16px;
-    opacity: 1;
-}
 
 /* ============================================
    UX-014 键盘聚焦可见样式（:focus-visible）
