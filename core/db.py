@@ -9,6 +9,13 @@
 
 并发模型：模块级 _db_lock 仅串行化写操作，读操作不持锁（依赖 WAL 模式的读不阻塞
 读/写特性）。读 + COUNT 等多次查询间可能被写操作插入导致弱一致，分页统计场景可接受。
+
+CONC-005 线程安全依赖：本模块使用 sqlite3.connect(check_same_thread=False) 共享
+单连接给 Flask threaded=True 与 pywebview 线程，依赖 CPython 标准库 sqlite3 编译时
+的 SQLITE_THREADSAFE=1（serialized 模式）。主流平台（Windows/Linux/macOS）的官方
+CPython 发行版均满足此条件。若使用非标准发行版（自行编译或禁用线程安全），
+并发读可能引发 sqlite3.ProgrammingError。可通过 sqlite3.threadsafety 属性验证
+（3 = serialized 全线程安全，2 = multi-thread 多线程不共享连接，1/0 = 不安全）。
 """
 
 import logging
@@ -32,6 +39,23 @@ SCHEMA_VERSION = 1
 _db_lock = Lock()
 # 连接初始化锁（仅用于 _conn property 的 double-check locking，与 _db_lock 分离避免嵌套死锁）
 _init_lock = Lock()
+
+# CONC-011: 校验 sqlite3.threadsafety 是否支持 check_same_thread=False 的跨线程共享
+# - threadsafety == 0：模块本身非线程安全，禁止跨线程使用（硬错误）
+# - threadsafety == 1：连接非线程安全，依赖 _db_lock 串行化写操作兜底（警告）
+# - threadsafety >= 2：连接可跨线程共享（理想状态）
+# 实测 CPython 3.11+ 默认构建 threadsafety=1，配合 _db_lock 串行化写操作可安全运行。
+if sqlite3.threadsafety < 1:
+    raise RuntimeError(
+        f"sqlite3.threadsafety={sqlite3.threadsafety} 不支持跨线程共享模块，"
+        "本项目依赖 check_same_thread=False 进行多线程访问，请更换 Python 构建"
+    )
+if sqlite3.threadsafety < 2:
+    logger.warning(
+        "sqlite3.threadsafety=%d（连接非线程安全），依赖 _db_lock 串行化写操作兜底；"
+        "读操作不持锁依赖 WAL 模式，高并发写场景可能有性能影响",
+        sqlite3.threadsafety
+    )
 
 
 # accounts 表 schema（单表，自增主键 + phone 业务唯一）
@@ -115,14 +139,17 @@ class DbAccountRepository:
 
     def close(self) -> None:
         """关闭连接（仅供测试用，生产环境靠 OS 回收）。"""
+        # CONC-004: 持 _init_lock 与 _conn property 互斥，避免并发场景下
+        # "线程 A 读取 _conn_impl 但未 execute / 线程 B 关闭并置 None" 的竞态
         # 不触发 _conn property（避免 close 时反向初始化）
-        if self._conn_impl is not None:
-            try:
-                self._conn_impl.close()
-            except Exception:
-                pass
-            # 重置以便后续访问 _conn property 时重新建立连接，而非返回已关闭的连接
-            self._conn_impl = None
+        with _init_lock:
+            if self._conn_impl is not None:
+                try:
+                    self._conn_impl.close()
+                except Exception:
+                    pass
+                # 重置以便后续访问 _conn property 时重新建立连接，而非返回已关闭的连接
+                self._conn_impl = None
 
     def list_all(self) -> list[dict]:
         """全量读取账号列表，按 id DESC 排序（新加用户靠前）。"""
@@ -429,7 +456,8 @@ def is_db_valid(db_path: str = DB_PATH) -> bool:
             return True
         finally:
             conn.close()
-    except sqlite3.Error:
+    except (sqlite3.Error, OSError):
+        # EH-014: sqlite3.connect 在路径非法/权限拒绝时可能抛 OSError（非 sqlite3.Error 子类）
         return False
 
 

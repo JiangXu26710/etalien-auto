@@ -18,8 +18,10 @@ from urllib.parse import urlparse
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 
+from core.client import NeedLoginError
 from core.config import load_settings, save_settings, reload_settings, validate_settings, VERSION, SETTINGS_SCHEMA
 from core.db import DbAccountRepository
+from core.privacy import mask_phone
 from core.service import validate_phone, run_concurrent_claim, send_login_code, verify_login, batch_get_account_status, get_account_mobile_status, query_schedule, create_schedule, delete_schedule, batch_update_accounts, get_enabled_accounts_by_phones, PROBLEM_STATUSES
 
 logger = logging.getLogger(__name__)
@@ -27,14 +29,21 @@ logger = logging.getLogger(__name__)
 # 模块级 Repository 单例（构造时仅记录路径，连接延迟到首次查询时建立）
 repo = DbAccountRepository()
 
-# 敏感字段过滤列表：禁止下发给前端，防止 auth_token / user_id / saved_at / password 泄露。
-SENSITIVE_FIELDS = ("auth_token", "user_id", "saved_at", "password")
+# 敏感字段过滤列表：禁止下发给前端，防止 auth_token / user_id / saved_at 泄露。
+# 注意：password 不在过滤列表中，因为编辑账号弹窗需要回填密码供用户查看/修改。
+# 列表接口 /api/accounts 使用 BASE_FIELDS 白名单，本身不含 password，不会泄露。
+SENSITIVE_FIELDS = ("auth_token", "user_id", "saved_at")
 
 # 基础字段白名单（只返回这些字段给前端，过滤敏感字段与状态字段）
 BASE_FIELDS = ("phone", "name", "remark", "enabled", "claim_target")
 
 # 密码格式校验正则：6-20 位字母/数字/下划线/点号（与前端 PWD_RE 一致）
 PWD_RE = re.compile(r'^[A-Za-z0-9_.]{6,20}$')
+
+# SEC-009: name / remark 字段长度上限校验（与前端 maxlength 一致）
+# 防止超长字符串导致 SQLite 存储膨胀 / 前端渲染错乱 / 日志膨胀
+NAME_MAX_LEN = 32
+REMARK_MAX_LEN = 64
 
 
 def error_response(msg: str, code: int = 400):
@@ -49,6 +58,10 @@ def _translate_login_error(result: dict, scene: str) -> str:
     "InvalidArgument: BINDING: Key: 'XXXRequest.xxx' Error:Field validation
     for 'xxx' failed on the 'len' tag"），直接透传给用户无法理解，需按场景转译。
     其他错误（code=1000/1001/500 等）服务端已返回友好中文，直接透传。
+
+    SEC-006: 真正未知 code（非 1/60/500/1000/1001 等已知业务错误）的 msg 可能含
+    技术栈细节（如 gRPC 字段名、错误码体系），不透传给用户。仅记录到日志便于
+    排查，响应给用户时返回通用提示「操作失败」。
 
     Args:
         result: core.service 的 send_login_code/verify_login 返回的 result dict
@@ -68,7 +81,15 @@ def _translate_login_error(result: dict, scene: str) -> str:
             return "验证码必须是6位数字"
         elif scene == "verify_password":
             return "密码格式不正确，必须是6-20位字母、数字、下划线或点号"
-    return msg or "操作失败"
+        # code=1 + 未知 scene：透传 msg（已是已知业务错误，scene 未覆盖时由调用方提示）
+        return msg or "操作失败"
+    # 已知友好中文 msg 直接透传（服务端 code=60/500/1000/1001 等业务错误）
+    if code in (60, 500, 1000, 1001):
+        return msg or "操作失败"
+    # 真正未知 code：msg 可能含技术栈细节，仅记录日志，不透传给用户
+    if msg:
+        logger.warning("Unknown login error code=%s msg=%s", code, msg)
+    return "操作失败"
 
 if getattr(sys, 'frozen', False):
     STATIC_DIR = os.path.join(sys._MEIPASS, 'gui', 'static')
@@ -80,6 +101,9 @@ app = Flask(__name__, static_folder=STATIC_DIR)
 # 前端高级区按 schema 字段定义顺序渲染（如先 PC 轮数后手机轮数），
 # sort_keys=True 会破坏 SETTINGS_SCHEMA 的业务分组顺序。
 app.json.sort_keys = False
+# SEC-003: 限制请求体大小为 256KB，覆盖最大合法请求（批量操作 1000 个手机号约 64KB）。
+# 超出时 Flask 自动返回 413 Payload Too Large，防止攻击者发送超大 JSON 占用内存。
+app.config['MAX_CONTENT_LENGTH'] = 256 * 1024
 
 
 class ClaimManager:
@@ -133,9 +157,6 @@ class ClaimManager:
 
         Returns:
             dict: 包含 running（布尔）、progress（各账号条目列表的深拷贝）。
-            注：``pc_initial`` / ``pc_total`` / ``mobile_initial`` / ``mobile_total``
-            等字段仍保留在 progress 条目中（由 claim_for_account 写入，死字段但无害），
-            不再聚合为顶层汇总字段（前端已砍掉总进度卡片）。
         """
         with self._lock:
             # R19/P10: 先快照 keys 避免 iterate 期间并发 add 新增 key 触发 RuntimeError
@@ -195,6 +216,18 @@ class ClaimManager:
                 if status == 'network_error':
                     entry['lastReqTs'] = time.time()
 
+    def reset(self) -> None:
+        """重置内部状态（running/progress/last_progress），仅供测试使用。
+
+        TEST-007: 替代测试中白盒赋值 claim_mgr._running = False / _progress = {} /
+        _last_progress = [] 的脆弱模式，避免后续 ClaimManager 内部字段重命名时
+        需同步修改多处测试代码。持锁以与 start/finish 保持一致的并发语义。
+        """
+        with self._lock:
+            self._running = False
+            self._progress = {}
+            self._last_progress = []
+
 
 claim_mgr = ClaimManager()
 
@@ -219,6 +252,11 @@ def _check_origin():
 
     豁免：/api/cli-trigger-claim 路径已有 Bearer Token 强校验（secrets.compare_digest），
     且 CLI 通过 Python requests 库调用（默认不发 Origin 头），故豁免 Origin 校验。
+
+    SEC-004: 兜底校验收紧——主校验失败（netloc 不匹配）但 hostname 为本机时，
+    额外校验 Origin 端口必须等于 GUI 实际监听端口 _actual_gui_port，避免本机任意
+    端口运行的页面绕过 CSRF 校验。_actual_gui_port 在 gui/app.py make_server
+    成功后赋值；若未设置（启动早期 / 异常路径），不放宽兜底校验，直接拒绝。
     """
     if request.method not in ("POST", "PUT", "DELETE", "PATCH"):
         return None
@@ -230,9 +268,26 @@ def _check_origin():
         logger.warning("Rejected write request without Origin header: %s %s", request.method, request.path)
         return error_response("非法请求来源", 403)
     parsed = urlparse(origin)
-    if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+    # GUI-002: 主校验——Origin netloc 必须与 request.host 完全一致（hostname + port）。
+    # request.host 形如 "127.0.0.1:8888"；netloc 包含 hostname:port，比对它可同时
+    # 校验 hostname 与 port，防止本机其他端口的页面跨端口 CSRF。
+    if parsed.netloc == request.host:
         return None
-    logger.warning("Rejected request with origin: %s", origin)
+    # SEC-004: 兜底校验——主校验失败时（netloc 不匹配），再校验 hostname 是否为本机。
+    # 必要性：若攻击者通过非浏览器工具伪造 Host 头使 request.host = "evil.com:8080"，
+    # 主校验会放行同样伪造的 Origin；此时 hostname 白名单仍能拒绝非本机来源。
+    # 注：浏览器不允许 JS 伪造 Host 头，实际 CSRF 场景中此攻击向量不可行。
+    # 收紧：当 _actual_gui_port 已知时（GUI 启动后），额外校验 Origin 端口必须等于
+    # GUI 实际监听端口，避免本机任意端口的页面绕过 CSRF。_actual_gui_port 未设置时
+    # （启动早期 / 测试环境），退回原宽松行为：仅校验 hostname 白名单。
+    if parsed.hostname in ("127.0.0.1", "localhost", "::1"):
+        if _actual_gui_port is None or parsed.port == _actual_gui_port:
+            return None
+        logger.warning(
+            "Rejected local-origin request with mismatched port: origin=%s, actual_gui_port=%s",
+            origin, _actual_gui_port,
+        )
+    logger.warning("Rejected request with origin: %s (host=%s)", origin, request.host)
     return error_response("非法请求来源", 403)
 
 
@@ -253,17 +308,33 @@ def _set_security_headers(resp):
     - X-Frame-Options: DENY：禁止被任何页面 iframe 嵌套
     - X-Content-Type-Options: nosniff：禁止浏览器 MIME 嗅探
 
+    SEC-005: CSP 收紧——当 _actual_gui_port 已知时，将 http://127.0.0.1:* / http://localhost:*
+    通配替换为具体端口 http://127.0.0.1:<port> / http://localhost:<port>，避免本机任意
+    端口的恶意 HTTP 服务向本应用注入脚本。_actual_gui_port 未设置时（启动早期 / 测试环境）
+    退回原宽松行为（通配端口），不破坏启动流程与测试。
+
     已知技术债：script-src 'unsafe-inline' 削弱 XSS 防护。短期内保留以兼容
     index.html 内联 <script>（pywebview 桥接初始化）与内联 onclick 事件属性。
     长期应改为 nonce-based CSP + 移除所有内联事件属性，需前端重构单独立项。
     """
-    resp.headers.setdefault(
-        'Content-Security-Policy',
-        "default-src 'self' http://127.0.0.1:* http://localhost:*; "
-        "script-src 'self' 'unsafe-inline' http://127.0.0.1:* http://localhost:*; "
-        "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' data:;"
-    )
+    # SEC-005: 已知实际端口时收紧 CSP 至具体端口，避免本机任意端口注入
+    if _actual_gui_port is not None:
+        local_src = f"http://127.0.0.1:{_actual_gui_port} http://localhost:{_actual_gui_port}"
+        csp = (
+            f"default-src 'self' {local_src}; "
+            f"script-src 'self' 'unsafe-inline' {local_src}; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:;"
+        )
+    else:
+        # 启动早期 / 测试环境：_actual_gui_port 未设置，保持原宽松行为
+        csp = (
+            "default-src 'self' http://127.0.0.1:* http://localhost:*; "
+            "script-src 'self' 'unsafe-inline' http://127.0.0.1:* http://localhost:*; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data:;"
+        )
+    resp.headers.setdefault('Content-Security-Policy', csp)
     resp.headers.setdefault('X-Frame-Options', 'DENY')
     resp.headers.setdefault('X-Content-Type-Options', 'nosniff')
     return resp
@@ -387,23 +458,26 @@ def add_account():
     if claim_target not in ("all", "pc", "mobile"):
         claim_target = default_ct if default_ct in ("all", "pc", "mobile") else "all"
     default_enabled = settings.get("default_account_enabled", True)
+    # SEC-009: name / remark 长度截断，防止超长字符串导致存储/渲染/日志膨胀
+    name_val = str(data.get("name", "")).strip()[:NAME_MAX_LEN]
+    remark_val = str(data.get("remark", "")).strip()[:REMARK_MAX_LEN]
     # get_or_create 与 update_fields 一并放入 try：若 update_fields 失败，
     # except 中调用 repo.delete(phone) 清理残留空壳账号，避免脏污数据
     try:
         repo.get_or_create(phone)
         repo.update_fields(
             phone,
-            name=data.get("name", "").strip(),
-            remark=data.get("remark", "").strip(),
+            name=name_val,
+            remark=remark_val,
             enabled=str(data.get("enabled", default_enabled)).lower() not in ("false", "0", "", "no"),
             claim_target=claim_target,
         )
-    except Exception as e:
-        logger.error("添加账号失败: %s", e)
+    except Exception:
+        logger.exception("添加账号失败")
         try:
             repo.delete(phone)
         except Exception:
-            logger.exception("清理残留账号失败: %s", phone)
+            logger.exception("清理残留账号失败: %s", mask_phone(phone))
         return error_response("保存账号失败，请检查磁盘空间或文件权限", 500)
     return jsonify({"ok": True})
 
@@ -422,9 +496,11 @@ def update_account(phone):
         return error_response("不允许修改手机号，请删除后重新添加")
 
     if "name" in data:
-        updates["name"] = str(data["name"]).strip()
+        # SEC-009: name 长度截断到 NAME_MAX_LEN
+        updates["name"] = str(data["name"]).strip()[:NAME_MAX_LEN]
     if "remark" in data:
-        updates["remark"] = str(data["remark"]).strip()
+        # SEC-009: remark 长度截断到 REMARK_MAX_LEN
+        updates["remark"] = str(data["remark"]).strip()[:REMARK_MAX_LEN]
     if "enabled" in data:
         updates["enabled"] = str(data["enabled"]).lower() not in ("false", "0", "", "no")
     if "claim_target" in data:
@@ -439,8 +515,8 @@ def update_account(phone):
 
     try:
         repo.update_fields(phone, **updates)
-    except Exception as e:
-        logger.error("更新账号失败: %s", e)
+    except Exception:
+        logger.exception("更新账号失败")
         return error_response("保存账号失败，请检查磁盘空间或文件权限", 500)
     return jsonify({"ok": True})
 
@@ -450,8 +526,8 @@ def delete_account(phone):
     """删除账号。"""
     try:
         repo.delete(phone)
-    except Exception as e:
-        logger.error("删除账号失败: %s", e)
+    except Exception:
+        logger.exception("删除账号失败")
         return error_response("删除账号失败，请检查磁盘空间或文件权限", 500)
     return jsonify({"ok": True})
 
@@ -476,14 +552,19 @@ def batch_accounts():
         return error_response("action 必须是 enable/disable/delete", 400)
     if not isinstance(phones, list):
         return error_response("phones 必须是数组", 400)
+    # GUI-013: batch 上限 1000（写操作，长时间持锁风险高）；
+    # /api/claim 上限 10000（只读查询）；/api/accounts/status clamp 到 50（每条 phone
+    # 触发一次网络请求，50 上限兼顾响应速度与超时风险）。三处上限按操作类型差异化设计。
     if len(phones) > 1000:
         return error_response("phones 数量超过上限 1000", 400)
 
     try:
         result = batch_update_accounts(phones, action)
-    except Exception as e:
-        logger.error("批量操作失败: %s", e)
+    except Exception:
+        logger.exception("批量操作失败")
         return error_response("批量操作失败，请检查磁盘空间或文件权限", 500)
+    if not result.get("ok"):
+        return error_response(result.get("error", "批量操作失败"), 500)
     return jsonify(result)
 
 
@@ -507,16 +588,19 @@ def send_code(phone):
         result = send_login_code(phone)
     except (requests.ConnectionError, requests.Timeout):
         return error_response("网络异常，请检查网络后重试", 503)
+    except NeedLoginError:
+        return error_response("登录态失效，请刷新页面后重试", 401)
     except Exception:
-        logger.exception("Send code unexpected error for %s", phone)
+        logger.exception("Send code unexpected error for %s", mask_phone(phone))
         return error_response("发送验证码失败，请稍后重试", 500)
 
     if result.get("_error"):
         code = result.get("code")
         # 错误码60和1000表示触发验证码请求冷却，验证码可能已发送，仍允许用户输入已收到的验证码
+        # 返回 ok=False + cooldown=True 让前端展示冷却提示而非成功消息（BF-007）
         if code in (60, 1000):
-            return jsonify({"ok": True, "msg": "验证码请求冷却中，请稍后再试"})
-        logger.warning("Send code failed for %s: %s", phone, result.get("msg"))
+            return jsonify({"ok": False, "error": "验证码请求冷却中，请稍后再试", "cooldown": True})
+        logger.warning("Send code failed for %s: %s", mask_phone(phone), result.get("msg"))
         return error_response(_translate_login_error(result, "send_code") or "发送失败")
     return jsonify({"ok": True, "msg": "验证码发送成功"})
 
@@ -534,8 +618,10 @@ def verify_code(phone):
             result = verify_login(phone, password=password)
         except (requests.ConnectionError, requests.Timeout):
             return error_response("网络异常，请检查网络后重试", 503)
+        except NeedLoginError:
+            return error_response("登录态失效，请刷新页面后重试", 401)
         except Exception:
-            logger.exception("Verify login unexpected error for %s", phone)
+            logger.exception("Verify login unexpected error for %s", mask_phone(phone))
             return error_response("登录失败，请稍后重试", 500)
     elif code:
         scene = "verify_code"
@@ -543,14 +629,16 @@ def verify_code(phone):
             result = verify_login(phone, code=code)
         except (requests.ConnectionError, requests.Timeout):
             return error_response("网络异常，请检查网络后重试", 503)
+        except NeedLoginError:
+            return error_response("登录态失效，请刷新页面后重试", 401)
         except Exception:
-            logger.exception("Verify login unexpected error for %s", phone)
+            logger.exception("Verify login unexpected error for %s", mask_phone(phone))
             return error_response("登录失败，请稍后重试", 500)
     else:
         return error_response("请输入验证码或密码")
 
     if result.get("_error"):
-        logger.warning("Login failed for %s: %s", phone, result.get("msg"))
+        logger.warning("Login failed for %s: %s", mask_phone(phone), result.get("msg"))
         return error_response(_translate_login_error(result, scene) or "登录失败")
 
     return jsonify({"ok": True})
@@ -575,8 +663,10 @@ def get_accounts_status():
     # 会导致逐字符处理而非逐手机号处理
     if not isinstance(phones, list):
         return error_response("phones 必须是数组", 400)
-    # clamp 到上限 50
-    if len(phones) > 50:
+    # GUI-009: clamp 到上限 50，响应中携带截断标记与原始数量供前端提示
+    total_count = len(phones)
+    truncated = total_count > 50
+    if truncated:
         phones = phones[:50]
 
     settings = load_settings()
@@ -584,7 +674,15 @@ def get_accounts_status():
         phones,
         max_workers=settings.get("max_concurrent", 10),
     )
-    return jsonify({"statuses": statuses})
+    # XMC-006: tasks 字段已废弃（前端不消费，仅供内部诊断），路由层统一剥离
+    for s in statuses:
+        s.pop("tasks", None)
+    return jsonify({
+        "statuses": statuses,
+        "truncated": truncated,
+        "queried_count": len(phones),
+        "total_count": total_count,
+    })
 
 
 def _start_claim_thread(enabled, settings, tag=""):
@@ -621,32 +719,44 @@ def start_claim():
     - 请求体含 phones（非空数组）：只领这些 phone 中 enabled=True 的账号
     - 请求体无 phones 或为空：走 repo.list_enabled() 全体（非搜索态）
     CLI 触发的 /api/cli-trigger-claim 不走此路径，始终领全体。
+
+    CONC-002: claim_mgr.start() 成功（_running=True）后的所有可能抛异常的
+    操作（reload_settings / get_enabled_accounts_by_phones / repo.list_enabled）
+    用 try/except 兜底，异常时回滚 claim_mgr.finish()，避免 _running 永久
+    True 导致后续 /api/claim 请求永远 409。
     """
     if not claim_mgr.start():
-        return error_response("领取正在进行中")
+        return error_response("领取正在进行中", 409)
 
-    # 领取前显式刷新 settings 缓存，确保使用最新配置（用户可能在领取前刚改过设置）
-    settings = reload_settings()
-    data = request.get_json(silent=True) or {}
-    phones = data.get("phones")
-    if phones is not None:
-        # 显式传了 phones：只领这些 phone 中 enabled 的账号（搜索态）
-        if not isinstance(phones, list) or not phones:
-            claim_mgr.finish()  # 回滚 running 状态
-            return error_response("phones 必须是非空数组", 400)
-        # 上限 10000（高于 /api/accounts/batch 的 1000）：claim 为只读查询操作，无写锁风险，
-        # 仅用于筛选 enabled 账号；batch 是写操作（启用/禁用/删除），长时间持锁风险高故上限 1000
-        if len(phones) > 10000:
-            claim_mgr.finish()
-            return error_response("phones 数量超过上限", 400)
-        enabled = get_enabled_accounts_by_phones(phones)
-    else:
-        # 未传 phones：走全体（非搜索态）
-        enabled = repo.list_enabled()
+    try:
+        # 领取前显式刷新 settings 缓存，确保使用最新配置（用户可能在领取前刚改过设置）
+        settings = reload_settings()
+        data = request.get_json(silent=True) or {}
+        phones = data.get("phones")
+        if phones is not None:
+            # 显式传了 phones：只领这些 phone 中 enabled 的账号（搜索态）
+            if not isinstance(phones, list) or not phones:
+                claim_mgr.finish()  # 回滚 running 状态
+                return error_response("phones 必须是非空数组", 400)
+            # 上限 10000（高于 /api/accounts/batch 的 1000）：claim 为只读查询操作，无写锁风险，
+            # 仅用于筛选 enabled 账号；batch 是写操作（启用/禁用/删除），长时间持锁风险高故上限 1000
+            if len(phones) > 10000:
+                claim_mgr.finish()
+                return error_response("phones 数量超过上限", 400)
+            enabled = get_enabled_accounts_by_phones(phones)
+        else:
+            # 未传 phones：走全体（非搜索态）
+            enabled = repo.list_enabled()
 
-    if not _start_claim_thread(enabled, settings):
+        if not _start_claim_thread(enabled, settings):
+            return error_response("启动领取失败，请重试", 500)
+        return jsonify({"ok": True, "msg": "领取已开始"})
+    except Exception:
+        # CONC-002: 准备阶段异常（reload_settings / DB 查询等）兜底回滚，
+        # 避免 claim_mgr._running 永久 True 阻塞后续领取请求
+        logger.exception("start_claim 准备阶段异常，回滚 claim_mgr")
+        claim_mgr.finish()
         return error_response("启动领取失败，请重试", 500)
-    return jsonify({"ok": True, "msg": "领取已开始"})
 
 
 @app.route("/api/claim/progress", methods=["GET"])
@@ -677,6 +787,9 @@ def cli_trigger_claim():
     - 202 Accepted：已触发领取（GUI 当前空闲，已开始执行）
     - 409 Conflict + {"ok": False, "error": "busy", "running": true}：GUI 正在领取中，跳过本次触发
     - 403 Forbidden：token 缺失或不匹配
+
+    CONC-002: claim_mgr.start() 成功后的 reload_settings / list_enabled
+    异常兜底回滚，避免 _running 永久 True 阻塞后续 CLI/GUI 触发。
     """
     # 校验 token：未配置 token（GUI 未启动）或 token 不匹配均拒绝
     expected = _cli_trigger_token
@@ -688,8 +801,14 @@ def cli_trigger_claim():
     if not claim_mgr.start():
         return jsonify({"ok": False, "error": "busy", "running": True}), 409
 
-    settings = reload_settings()
-    enabled = repo.list_enabled()
+    try:
+        settings = reload_settings()
+        enabled = repo.list_enabled()
+    except Exception:
+        # CONC-002: 准备阶段异常兜底回滚
+        logger.exception("cli_trigger_claim 准备阶段异常，回滚 claim_mgr")
+        claim_mgr.finish()
+        return error_response("启动领取失败，请重试", 500)
 
     if not _start_claim_thread(enabled, settings, tag="CLI"):
         return error_response("启动领取失败，请重试", 500)
@@ -757,21 +876,18 @@ def update_settings():
 
     # 按字段类型转换值：int 类字段（max_concurrent 等）、float 类字段
     # （request_interval 等）、str 类字段（schedule_time/schan_key）、bool 类字段（schan_enabled）
+    # GUI-003: 类型转换失败立即返回 400，避免静默跳过导致用户误以为已保存成功
     for key, value in data.items():
         if key in ("max_concurrent", "max_rounds", "mobile_max_rounds", "max_retries", "batch_delete_reconfirm_threshold"):
             try:
                 settings[key] = int(value)
             except (ValueError, TypeError):
-                # int 转换失败时跳过该字段更新，保留 settings 中的原值，
-                # 避免无效字符串污染 settings 导致后续 ThreadPoolExecutor 抛 TypeError
-                pass
+                return error_response(f"字段 {key} 的值 {value!r} 不是有效整数", 400)
         elif key in ("request_interval", "retry_delay"):
             try:
                 settings[key] = float(value)
             except (ValueError, TypeError):
-                # float 转换失败时跳过该字段更新，与 int 字段行为一致，
-                # 避免无效字符串污染 settings 导致 validate_settings 拦截
-                pass
+                return error_response(f"字段 {key} 的值 {value!r} 不是有效浮点数", 400)
         elif key == "schedule_time":
             settings[key] = str(value)
         elif key in ("schan_enabled", "batch_delete_reconfirm", "default_account_enabled"):
@@ -780,9 +896,9 @@ def update_settings():
             schan_value = str(value)
             if len(schan_value) > 100:
                 return error_response("schan_key 长度超过 100 字符", 400)
-            # Server酱 Turbo 版 SendKey 以 SCT 开头，
-            # notify.py 直接拼接到 URL 不做格式校验。此处保留长度校验，
-            # 不强制正则以兼容历史数据与现有测试用例
+            # Server酱 Turbo 版 SendKey 以 SCT 开头。
+            # 此处仅做长度校验；格式校验由 validate_settings 通过 SENDKEY_PATTERN 执行
+            # （pattern_skip_empty=True：空字符串跳过校验，兼容历史数据与现有测试用例）
             settings[key] = schan_value
         elif key in ("default_claim_target", "default_login_method"):
             # enum 字段存储值为字符串，validate_settings 会校验是否在 options 中
@@ -795,7 +911,7 @@ def update_settings():
                 try:
                     settings[key] = int(value)
                 except (ValueError, TypeError):
-                    pass
+                    return error_response(f"字段 {key} 的值 {value!r} 不是有效整数", 400)
 
     is_valid, error_msg, error_cat = validate_settings(settings)
     if not is_valid:
@@ -803,8 +919,8 @@ def update_settings():
 
     try:
         save_settings(settings)
-    except OSError as e:
-        logger.error("保存设置失败: %s", e)
+    except OSError:
+        logger.exception("保存设置失败")
         return error_response("保存设置失败，请检查磁盘空间或文件权限", 500)
     return jsonify({"ok": True})
 

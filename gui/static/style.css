@@ -316,6 +316,7 @@ body {
 
 .stat-label {
     font-size: 11px;
+    font-weight: 600;
     color: var(--text-muted);
     letter-spacing: 1px;
     text-transform: uppercase;
@@ -777,7 +778,7 @@ body {
     background: linear-gradient(135deg, rgba(34, 34, 40, 0.9), rgba(17, 17, 20, 0.9));
     border: 1px solid var(--border);
     border-radius: 11px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     overflow: hidden;
     box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4);
 }
@@ -791,7 +792,7 @@ body {
     top: 2px;
     background: linear-gradient(135deg, #6a665e, #5a584e);
     border-radius: 50%;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), background 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
 }
 
@@ -805,7 +806,7 @@ body {
     background: radial-gradient(circle at 40% 35%, var(--gold-light), var(--gold));
     border-radius: 50%;
     opacity: 0;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     filter: blur(4px);
 }
 
@@ -863,7 +864,7 @@ body {
     background: linear-gradient(135deg, rgba(34, 34, 40, 0.9), rgba(17, 17, 20, 0.9));
     border: 1px solid var(--border);
     border-radius: 6px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: background 0.3s cubic-bezier(0.4, 0, 0.2, 1), border-color 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     overflow: hidden;
     box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.4);
 }
@@ -877,7 +878,7 @@ body {
     top: 2px;
     background: linear-gradient(135deg, #6a665e, #5a584e);
     border-radius: 5px;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), background 0.3s cubic-bezier(0.4, 0, 0.2, 1), box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
     z-index: 1;
 }
@@ -892,7 +893,7 @@ body {
     background: radial-gradient(circle at 40% 35%, var(--gold-light), var(--gold));
     border-radius: 5px;
     opacity: 0;
-    transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     filter: blur(5px);
 }
 
@@ -3373,6 +3374,38 @@ input.shake {
     height: 12px;
     display: block;
 }
+/* SEC-011：原始报错默认折叠（<details>），用户主动展开避免截图泄露技术细节 */
+.detail-error-details {
+    margin-top: 8px;
+}
+.detail-error-summary {
+    list-style: none;
+    cursor: pointer;
+    color: var(--gold);
+    font-size: 11px;
+    line-height: 1.6;
+    user-select: none;
+    padding: 4px 0;
+    transition: var(--transition);
+}
+.detail-error-summary::-webkit-details-marker {
+    display: none;
+}
+.detail-error-summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 0.2s ease;
+}
+.detail-error-details[open] .detail-error-summary::before {
+    transform: rotate(90deg);
+}
+.detail-error-summary:hover {
+    color: var(--gold-light);
+}
+.detail-error-details .detail-error-text {
+    margin-top: 0;
+}
 
 /* ===== .result-list 金色滚动条 ===== */
 .result-list::-webkit-scrollbar { width: 8px; }
@@ -3579,4 +3612,142 @@ input.shake {
 
 .tip-module.is-ellipsis:hover .tip-tooltip {
     opacity: 1;
+}
+
+/* ===== splash 启动画面（原 index.html 内联 style，GUI-014 迁移至此） ===== */
+#splash{position:fixed;inset:0;z-index:9999;background:#0a0a0c;display:flex;align-items:center;justify-content:center;transition:opacity 0.4s cubic-bezier(0.4,0,0.2,1)}
+#splash.fade-out{opacity:0;pointer-events:none}
+#splash-inner{display:flex;flex-direction:column;align-items:center;gap:16px}
+#splash-logo{width:48px;height:48px;border-radius:12px;animation:splashPulse 1.5s ease-in-out infinite}
+#splash-bar{width:120px;height:3px;background:#2a2a32;border-radius:2px;overflow:hidden}
+#splash-bar::after{content:'';display:block;width:40%;height:100%;background:linear-gradient(90deg,#c9a84c,#e0c878);border-radius:2px;animation:splashSlide 1.2s ease-in-out infinite}
+@keyframes splashPulse{0%,100%{transform:scale(1);opacity:0.8}50%{transform:scale(1.05);opacity:1}}
+@keyframes splashSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
+
+/* ============================================
+   UX-012 表单内联错误提示
+   - 配合 showFieldError(fieldId, message) / clearFieldError(fieldId) 使用
+   - aria-live="polite" 让屏幕阅读器在错误出现时柔和播报
+   - :not(:empty) 选择器实现"无内容则不占空间"的优雅显隐
+   ============================================ */
+.field-error {
+    color: var(--error);
+    font-size: 12px;
+    line-height: 1.4;
+    margin-top: 4px;
+    min-height: 0;
+    opacity: 0;
+    transition: opacity 0.2s ease;
+}
+.field-error:not(:empty) {
+    min-height: 16px;
+    opacity: 1;
+}
+
+/* ============================================
+   UX-014 键盘聚焦可见样式（:focus-visible）
+   - 仅在键盘 Tab 导航时显示金色 outline，鼠标点击不显示
+   - 与现有 :focus（input/trigger 用 border+box-shadow）互补
+   - 提升键盘用户的无障碍体验
+   ============================================ */
+.btn-primary:focus-visible,
+.btn-secondary:focus-visible,
+.btn-accent:focus-visible,
+.btn-modal:focus-visible,
+.title-btn:focus-visible,
+.search-icon-btn:focus-visible,
+.title-context-item:focus-visible,
+.as-idle:focus-visible,
+.action-text:focus-visible,
+.confirm-btn:focus-visible,
+.claim-select-trigger:focus-visible,
+.enum-select-trigger:focus-visible,
+.card-front:focus-visible,
+.card-back:focus-visible,
+.result-row:focus-visible,
+.placeholder-link:focus-visible {
+    outline: 2px solid var(--gold);
+    outline-offset: 2px;
+}
+
+/* result-row 已有 border + hover 高亮，键盘聚焦时再叠加金色 outline 强调 */
+.result-row:focus-visible {
+    outline-offset: -2px;
+}
+
+/* 按钮内 SVG 不抢 outline（避免 outline 套在 svg 上视觉错位） */
+.btn-primary:focus-visible svg,
+.btn-secondary:focus-visible svg,
+.btn-accent:focus-visible svg,
+.btn-modal:focus-visible svg,
+.search-icon-btn:focus-visible svg,
+.title-context-item:focus-visible svg,
+.confirm-btn:focus-visible svg {
+    outline: none;
+}
+
+/* ============================================
+   prefers-reduced-motion 适配（UX-003）
+   - 用户在系统设置中开启"减少动画"时，关闭所有装饰性动画与过渡
+   - 保留必要的 opacity 过渡以确保状态变化可见
+   - JS 侧通过 prefersReducedMotion() 检测同步跳过 rAF 动画
+   ============================================ */
+@media (prefers-reduced-motion: reduce) {
+    /* 全局关闭动画与过渡（保留极短时长避免状态变化完全无反馈） */
+    *, *::before, *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        animation-delay: 0ms !important;
+        transition-duration: 0.01ms !important;
+        transition-delay: 0ms !important;
+        scroll-behavior: auto !important;
+    }
+
+    /* splash 静态显示：取消脉动与滑动循环 */
+    #splash-logo { animation: none !important; }
+    #splash-bar::after { animation: none !important; opacity: 1; transform: translateX(0); }
+
+    /* 卡片入场/移除：直接显示，无位移与淡入 */
+    .account-card { animation: none !important; }
+    .account-card.removing { animation: none !important; opacity: 1; }
+
+    /* 模态框出入：直接显示/隐藏 */
+    .modal, .result-modal { animation: none !important; }
+    .modal.closing { animation: none !important; opacity: 0; }
+
+    /* toast 入场：直接显示 */
+    .toast { animation: none !important; opacity: 1; transform: none; }
+
+    /* 进度条 shimmer/pulse：停止循环 */
+    .progress-bar-glow,
+    .progress-bar-fill.complete,
+    .placeholder-spinner { animation: none !important; }
+
+    /* VIP / 手机端飘字：直接显示数值，不上浮 */
+    .vip-float,
+    .mobile-float { animation: none !important; opacity: 1; transform: none; }
+
+    /* 窗口最大化/还原动画：立即就位 */
+    body.win-maximize-in,
+    body.win-restore-in,
+    body.win-minimize-out,
+    body.win-close-out,
+    body.win-state-out { animation: none !important; transition: none !important; }
+
+    /* 按钮涟漪：立即淡出，不扩散 */
+    .btn-ripple { animation: none !important; opacity: 0; transform: scale(1); }
+
+    /* 翻面动画：用 opacity 切换代替 3D rotateX */
+    .claim-flip-inner { transform: none !important; transition: opacity 0.15s linear !important; }
+    .claim-flip-front,
+    .claim-flip-back { transition: opacity 0.15s linear !important; }
+
+    /* 版本号翻转：直接切换文字 */
+    .version-flip-inner { transform: none !important; transition: none !important; }
+
+    /* 结果列表行闪烁动画：关闭 */
+    .result-row { animation: none !important; }
+
+    /* 高级区水波扩散：直接显示/隐藏 */
+    .adv-panel { transition: none !important; }
 }

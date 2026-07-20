@@ -1,5 +1,8 @@
 let claimPollTimer = null;
 let cliTriggerDetectTimer = null;
+// PERF-010：version flip 的 hover/flip 定时器（initVersionFlip 闭包提升到模块级，便于 cleanupAllTimers 清理）
+let versionFlipHoverTimer = null;
+let versionFlipFlipTimer = null;
 let dragState = null;
 let dragInFlight = false;
 let mouseDownPos = null;
@@ -11,6 +14,19 @@ let vipFloatShown = new Set();
 let prevStats = { total: 0, active: 0 };
 // info-icon 内部 SVG（圆点 + 竖线，currentColor 跟随 .info-icon 的 color）
 const INFO_ICON_SVG = '<svg viewBox="0 0 14 14" fill="none"><circle cx="7" cy="3.5" r="1.2" fill="currentColor"/><rect x="6.25" y="6" width="1.5" height="5" rx="0.75" fill="currentColor"/></svg>';
+
+// 错误消息文案常量（UX-015）：统一兜底文案，避免散落硬编码"未知错误"
+const ERROR_MESSAGES = {
+    UNKNOWN: '操作失败，请稍后重试',
+};
+
+// 检测用户是否开启了"减少动画"系统设置（UX-003）：
+// 用于跳过 JS 驱动的动画（tip rAF、FLIP、animateValue、claim-flip 等），与 CSS @media prefers-reduced-motion 协同
+function prefersReducedMotion() {
+    return typeof window !== 'undefined'
+        && typeof window.matchMedia === 'function'
+        && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
 // 顶部"已启用"卡片数字来自后端 /api/accounts/stats（前端分页缓存无法统计全部账号）
 let statsFromBackend = { enabled: 0 };
 let hasRenderedOnce = false;
@@ -51,6 +67,23 @@ let mobileCountdownTimer = null;
 const pageCache = new Map();
 // 状态缓存：按 phone 缓存状态（懒加载写入）
 const statusCache = new Map();
+// PERF-005：缓存大小上限（FIFO 淘汰，避免长会话 + 万级账号下内存持续增长）
+// Map 保持插入顺序，超限时删除最早条目；pageCache 上限 50 页（24×50=1200 条覆盖绝大部分场景），
+// statusCache 上限 500 个 phone 状态
+const PAGE_CACHE_MAX = 50;
+const STATUS_CACHE_MAX = 500;
+function pageCacheSet(key, value) {
+    pageCache.set(key, value);
+    if (pageCache.size > PAGE_CACHE_MAX) {
+        pageCache.delete(pageCache.keys().next().value);
+    }
+}
+function statusCacheSet(key, value) {
+    statusCache.set(key, value);
+    if (statusCache.size > STATUS_CACHE_MAX) {
+        statusCache.delete(statusCache.keys().next().value);
+    }
+}
 // 已查询标记：phone -> 已尝试加载状态（含成功/失败/超时，乐观标记防轮询重复收集）
 const queriedPhones = new Set();
 // 虚拟滚动总数（来自后端 total）
@@ -148,14 +181,14 @@ function claimSelectHTML(id, selected) {
     const selOpt = opts.find(o => o.value === sel);
     return `
         <div class="claim-select-wrap" id="${id}" data-value="${sel}">
-            <div class="claim-select-trigger" onclick="toggleClaimSelect('${id}')">
+            <div class="claim-select-trigger" tabindex="0" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="领取权益选择" onclick="toggleClaimSelect('${id}')">
                 <span class="trigger-icon" style="color:var(--gold-light)">${selOpt.icon}</span>
                 <span class="claim-select-trigger-text">${selOpt.label}</span>
                 <span class="claim-select-arrow"></span>
             </div>
-            <div class="claim-select-dropdown">
+            <div class="claim-select-dropdown" role="listbox">
                 ${opts.map(o => `
-                    <button type="button" class="claim-select-option${o.value === sel ? ' selected' : ''}" onclick="pickClaimSelect('${id}', '${o.value}', '${o.label}', this)">
+                    <button type="button" class="claim-select-option${o.value === sel ? ' selected' : ''}" role="option" aria-selected="${o.value === sel ? 'true' : 'false'}" onclick="pickClaimSelect('${id}', '${o.value}', '${o.label}', this)">
                         <span>${o.icon}</span>
                         <span style="flex:1">${o.label}</span>
                         <span class="claim-select-check">${o.value === sel ? '\u2713' : ''}</span>
@@ -169,23 +202,33 @@ function claimSelectHTML(id, selected) {
 function toggleClaimSelect(id) {
     const wrap = document.getElementById(id);
     if (!wrap) return;
-    wrap.querySelector('.claim-select-trigger').classList.toggle('open');
-    wrap.querySelector('.claim-select-dropdown').classList.toggle('open');
+    const trigger = wrap.querySelector('.claim-select-trigger');
+    const dropdown = wrap.querySelector('.claim-select-dropdown');
+    trigger.classList.toggle('open');
+    dropdown.classList.toggle('open');
+    // UX-011: 同步 aria-expanded 给屏幕阅读器
+    trigger.setAttribute('aria-expanded', trigger.classList.contains('open') ? 'true' : 'false');
 }
 
 function pickClaimSelect(id, value, label, btn) {
     const wrap = document.getElementById(id);
     if (!wrap) return;
     wrap.dataset.value = value;
-    wrap.querySelectorAll('.claim-select-option').forEach(o => o.classList.remove('selected'));
+    wrap.querySelectorAll('.claim-select-option').forEach(o => {
+        o.classList.remove('selected');
+        o.setAttribute('aria-selected', 'false');
+    });
     btn.classList.add('selected');
+    btn.setAttribute('aria-selected', 'true');
     wrap.querySelector('.trigger-icon').innerHTML = btn.querySelector('svg').outerHTML;
     wrap.querySelector('.claim-select-trigger-text').textContent = label;
     wrap.querySelectorAll('.claim-select-check').forEach(c => { c.textContent = ''; c.style.opacity = '0'; });
     btn.querySelector('.claim-select-check').textContent = '\u2713';
     btn.querySelector('.claim-select-check').style.opacity = '1';
-    wrap.querySelector('.claim-select-trigger').classList.remove('open');
+    const trigger = wrap.querySelector('.claim-select-trigger');
+    trigger.classList.remove('open');
     wrap.querySelector('.claim-select-dropdown').classList.remove('open');
+    trigger.setAttribute('aria-expanded', 'false');
 }
 
 function escapeHtml(str) {
@@ -206,12 +249,43 @@ function jsStr(s) {
 
 // 登录表单格式校验（规则与后端/服务端 protobuf 字段校验对齐，避免不友好请求往返）
 // 返回空串表示通过，否则返回错误提示文案
+// 同步点：修改时需同步 core/service.py PHONE_PATTERN 和 gui/api.py PWD_RE
+// 注意：后端 PHONE_PATTERN 仅匹配纯 11 位数字，前端 normalizePhone 会先剥离 +86/86 前缀和分隔符
 const PHONE_RE = /^1[3-9]\d{9}$/;
 const CODE_RE = /^\d{6}$/;
+// 同步点：修改时需同步 gui/api.py PWD_RE
 const PWD_RE = /^[a-zA-Z0-9_.]{6,20}$/;
-function validatePhoneFmt(phone) { return PHONE_RE.test(phone) ? '' : '手机号格式不正确，请输入11位手机号'; }
-function validateCodeFmt(code) { return CODE_RE.test(code) ? '' : '验证码必须是6位数字'; }
-function validatePwdFmt(pwd) { return PWD_RE.test(pwd) ? '' : '密码必须是6-20位字母、数字、下划线或点号'; }
+// 同步点：修改时需同步 core/config.py SENDKEY_PATTERN
+const SENDKEY_PATTERN = /^SCT[A-Za-z0-9]+$/;
+
+// UX-007：手机号规范化 — 剥离 +86/86 前缀和空格/横线分隔符，返回纯 11 位数字
+// 用户从通讯录/网页/短信复制时常见带前缀或分隔符的格式，规范化后与后端 PHONE_PATTERN 对齐
+function normalizePhone(phone) {
+    return String(phone || '')
+        .trim()
+        .replace(/^\+?86[\s\-]?/, '')   // 去除 +86 / 86 前缀（含可选分隔符）
+        .replace(/[\s\-]/g, '');          // 去除剩余空格和横线
+}
+
+function validatePhoneFmt(phone) {
+    return PHONE_RE.test(normalizePhone(phone)) ? '' : '手机号格式不正确，请输入11位手机号';
+}
+function validateCodeFmt(code) { return CODE_RE.test(code) ? '' : '验证码格式不正确，请输入6位数字'; }
+function validatePwdFmt(pwd) { return PWD_RE.test(pwd) ? '' : '密码格式不正确，需为6-20位字母、数字、下划线或点号'; }
+
+// UX-012：表单内联错误提示工具函数
+// 在指定输入框下方（id="${fieldId}Error" 的 .field-error 元素）显示错误消息，
+// aria-live="polite" 让屏幕阅读器柔和播报；同时同步 aria-invalid 便于辅助技术识别。
+function showFieldError(fieldId, message) {
+    if (!fieldId) return;
+    const errEl = document.getElementById(fieldId + 'Error');
+    if (errEl) errEl.textContent = message || '';
+    const input = document.getElementById(fieldId);
+    if (input) input.setAttribute('aria-invalid', message ? 'true' : 'false');
+}
+function clearFieldError(fieldId) {
+    showFieldError(fieldId, '');
+}
 
 function maskPhone(phone) {
     if (phone.length >= 7) {
@@ -387,6 +461,8 @@ document.addEventListener('visibilitychange', () => {
 });
 
 function formatDuration(seconds) {
+    // CQ-005：与后端 format_duration 一致，负数归零保护
+    if (seconds < 0) seconds = 0;
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
@@ -426,6 +502,12 @@ function showMobileFloat(phone, diffSeconds) {
 }
 
 function animateValue(el, start, end, duration) {
+    // UX-003：reduced-motion 模式下直接设置最终值，跳过 rAF 动画
+    if (prefersReducedMotion()) {
+        if (el._animRaf) { cancelAnimationFrame(el._animRaf); el._animRaf = null; }
+        el.textContent = end;
+        return;
+    }
     // 短时间内多次调用同一 el 时取消旧 RAF，避免并发循环互相覆盖 textContent 导致视觉抖动
     if (el._animRaf) cancelAnimationFrame(el._animRaf);
     const startTime = performance.now();
@@ -446,8 +528,10 @@ function animateValue(el, start, end, duration) {
  * phase='mobile' 时更新手机端面（card-back），否则更新 PC 面（card-front）。
  * 初始进度来自缓存（statusCache 或 mobileStatusCache），叠加本次领取增量。
  */
-function updateCardProgress(phone, current, total, phase) {
-    const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
+function updateCardProgress(phone, current, total, phase, cardRef) {
+    // PERF-08: 调用方（pollClaimProgress）已建立 phone→card Map，传入 cardRef 避免重复 querySelector。
+    // cardRef 缺省时（向后兼容）仍走 querySelector 路径。
+    const card = cardRef || document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
     if (!card) return;
     // phase=mobile 时更新手机端面（card-back），否则更新 PC 面（card-front）
     // 手机端面若未翻过则无进度条 DOM，跳过（翻面时会通过 fetchMobileStatus 获取）
@@ -506,10 +590,16 @@ async function api(path, options = {}) {
         throw new Error('服务器返回了非JSON响应');
     }
     if (!resp.ok && data.error) {
-        throw new Error(data.error);
+        const err = new Error(data.error);
+        if (data.cooldown) err.cooldown = true;
+        throw err;
     }
     if (data.ok === false) {
-        throw new Error(data.error || '请求失败');
+        // BF-007：后端验证码冷却响应（200 + ok=False + cooldown=True）通过此分支抛错，
+        // 附加 cooldown 字段供调用方（sendLoginCode/resendLoginCode）识别并差异化处理
+        const err = new Error(data.error || '请求失败');
+        if (data.cooldown) err.cooldown = true;
+        throw err;
     }
     if (!resp.ok) {
         throw new Error(`请求失败 (${resp.status})`);
@@ -517,11 +607,87 @@ async function api(path, options = {}) {
     return data;
 }
 
+// ===== 模态框焦点陷阱与恢复（UX-004 / UX-008）=====
+// trapFocus：在指定容器内循环 Tab/Shift+Tab 焦点，避免焦点跑出模态框
+// releaseFocus：移除陷阱并恢复焦点到打开模态框前的触发元素
+let _lastFocusedElement = null;
+let _focusTrapHandler = null;
+const _FOCUSABLE_SEL = 'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+function trapFocus(modalEl) {
+    if (!modalEl) return;
+    // 保存触发元素（openModal 调用前 document.activeElement 即触发按钮）
+    // 异步上下文（如 await 后）中 activeElement 可能已变为 body，此时清空避免关闭后恢复焦点到 body
+    const active = document.activeElement;
+    if (active && active !== document.body) {
+        _lastFocusedElement = active;
+    } else {
+        _lastFocusedElement = null;
+    }
+
+    // 移除旧 handler（防止重复绑定）
+    if (_focusTrapHandler) {
+        document.removeEventListener('keydown', _focusTrapHandler);
+        _focusTrapHandler = null;
+    }
+
+    // 聚焦模态框内第一个可聚焦元素（如有），否则聚焦模态框容器本身
+    const focusable = modalEl.querySelectorAll(_FOCUSABLE_SEL);
+    if (focusable.length > 0) {
+        // 不强行 .focus()，让 openModal 调用方手动指定 initialFocusId（如 addLoginCode）
+    } else {
+        modalEl.setAttribute('tabindex', '-1');
+        modalEl.focus();
+    }
+
+    _focusTrapHandler = (e) => {
+        if (e.key !== 'Tab') return;
+        const focusableEls = modalEl.querySelectorAll(_FOCUSABLE_SEL);
+        if (focusableEls.length === 0) {
+            e.preventDefault();
+            return;
+        }
+        const firstEl = focusableEls[0];
+        const lastEl = focusableEls[focusableEls.length - 1];
+        const active = document.activeElement;
+        if (e.shiftKey) {
+            // Shift+Tab：从第一个元素跳到最后一个
+            if (active === firstEl || !modalEl.contains(active)) {
+                e.preventDefault();
+                lastEl.focus();
+            }
+        } else {
+            // Tab：从最后一个元素跳到第一个
+            if (active === lastEl || !modalEl.contains(active)) {
+                e.preventDefault();
+                firstEl.focus();
+            }
+        }
+    };
+    document.addEventListener('keydown', _focusTrapHandler);
+}
+
+function releaseFocus() {
+    if (_focusTrapHandler) {
+        document.removeEventListener('keydown', _focusTrapHandler);
+        _focusTrapHandler = null;
+    }
+    if (_lastFocusedElement && typeof _lastFocusedElement.focus === 'function') {
+        // 恢复焦点到打开模态框前的触发元素
+        _lastFocusedElement.focus();
+        _lastFocusedElement = null;
+    }
+}
+
 function showToast(msg, type = 'info') {
     const container = document.getElementById('toastContainer');
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
     toast.textContent = msg;
+    // error 类型使用 role="alert" 让屏幕阅读器立即播报；其他类型继承容器的 aria-live="polite"
+    if (type === 'error') {
+        toast.setAttribute('role', 'alert');
+    }
     container.appendChild(toast);
     // error 类型延长到 5 秒，让用户有足够时间阅读错误信息；其他保持 3 秒
     const duration = type === 'error' ? 5000 : 3000;
@@ -553,6 +719,8 @@ function openModal(html, wide) {
         modal.classList.add('modal-wide');
     }
     document.getElementById('modalOverlay').classList.add('active');
+    // UX-004：启用焦点陷阱，保存触发元素以便关闭后恢复焦点
+    trapFocus(modal);
 }
 
 function closeModal(e) {
@@ -587,12 +755,24 @@ function _animateCloseModal() {
     const modal = document.getElementById('modalContent');
     if (!overlay.classList.contains('active')) return;
     modal.classList.add('closing');
-    modal.addEventListener('animationend', function handler(e) {
-        if (e.target !== modal) return;
+    let done = false;
+    const finish = () => {
+        if (done) return;
+        done = true;
         modal.classList.remove('closing');
         overlay.classList.remove('active');
         modal.removeEventListener('animationend', handler);
-    });
+        // UX-004 / UX-008：关闭后恢复焦点到触发元素
+        releaseFocus();
+    };
+    const handler = (e) => {
+        if (e.target !== modal) return;
+        finish();
+    };
+    modal.addEventListener('animationend', handler);
+    // UX-003 兜底：reduced-motion 模式下 animation 被禁用，animationend 不触发，用 setTimeout 兜底
+    // 正常模式 modalOut 0.18s，600ms 兜底足够
+    setTimeout(finish, 600);
 }
 
 // 全量刷新流程：清除懒加载相关缓存与翻转态，由懒加载机制重新加载可见账号状态。
@@ -693,7 +873,7 @@ async function fetchAccountsPage(offset, limit, keyword) {
     const url = `/api/accounts?offset=${offset}&limit=${limit}` + (q ? `&q=${encodeURIComponent(q)}` : '');
     const data = await api(url);
     const accounts = data.accounts || [];
-    pageCache.set(getEffectivePageCacheKey(offset), accounts);
+    pageCacheSet(getEffectivePageCacheKey(offset), accounts);
     pageCacheVersion++;
     if (typeof data.total === 'number') {
         if (q) {
@@ -990,12 +1170,14 @@ function initVirtualScrollOnce() {
 }
 
 // 统一清理所有模块级定时器/rAF（beforeunload 时调用）
-// 注意：hoverTimer/flipTimer 在 initCardHoverFlip 闭包内，无法外部访问，
-// 随窗口关闭 GC 回收；此处只清理模块级可达的定时器。
+// PERF-010：version flip 的 hover/flip 定时器已提升到模块级（versionFlipHoverTimer/versionFlipFlipTimer），
+// 此处统一清理。
 function cleanupAllTimers() {
     stopLazyLoadPolling();
     if (cliTriggerDetectTimer) { clearTimeout(cliTriggerDetectTimer); cliTriggerDetectTimer = null; }
     if (claimPollTimer) { clearTimeout(claimPollTimer); claimPollTimer = null; }
+    if (versionFlipHoverTimer) { clearTimeout(versionFlipHoverTimer); versionFlipHoverTimer = null; }
+    if (versionFlipFlipTimer) { clearTimeout(versionFlipFlipTimer); versionFlipFlipTimer = null; }
     if (mobileCountdownTimer) { clearInterval(mobileCountdownTimer); mobileCountdownTimer = null; }
     if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null; }
     if (refreshAllTimer) { clearTimeout(refreshAllTimer); refreshAllTimer = null; }
@@ -1207,7 +1389,7 @@ function buildCardHTML(s, idx) {
         if (s.phone_not_found) {
             placeholderContent = '<div class="placeholder-text">账号不存在</div>';
         } else if (s.query_timeout) {
-            placeholderContent = '<div class="placeholder-text">查询超时</div><div class="placeholder-text placeholder-link" onclick="refreshAll()">重试</div>';
+            placeholderContent = '<div class="placeholder-text">查询超时</div><div class="placeholder-text placeholder-link" tabindex="0" role="button" aria-label="重试刷新" onclick="refreshAll()">重试</div>';
         } else {
             placeholderContent = '<div class="placeholder-spinner"></div><div class="placeholder-text">加载中</div>';
         }
@@ -1244,6 +1426,14 @@ function buildCardHTML(s, idx) {
     // not_queried 时不加 account-disabled（状态未查回不代表账号禁用，避免卡片变暗误导）
     if (!s.enabled || (!s.token_valid && !s.not_queried)) cardClass += ' account-disabled';
 
+    // aria-label：声明卡片状态变化（token_expired/启用-禁用），供屏幕阅读器感知
+    const cardAriaParts = [];
+    if (s.token_expired) cardAriaParts.push('登录状态已过期');
+    cardAriaParts.push(s.enabled ? '已启用' : '已禁用');
+    if (s.name) cardAriaParts.push('用户名 ' + s.name);
+    cardAriaParts.push('手机号 ' + maskPhone(s.phone));
+    const cardAriaLabel = cardAriaParts.join('，');
+
     let cardStyle = '';
     if (!hasRenderedOnce) {
         const staggerDelay = Math.min(idx * 0.05, 0.4);
@@ -1255,29 +1445,30 @@ function buildCardHTML(s, idx) {
     let actionsHtml = '';
     // not_queried 时不显示登录按钮（状态未查回，还不知道 token 是否过期，避免状态查回后按钮消失闪烁）
     if ((!s.logged_in || s.token_expired) && !s.not_queried) {
-        actionsHtml = `<button type="button" class="btn-small" onclick="showLogin(${jsStr(s.phone)})">登录</button>`;
+        actionsHtml = `<button type="button" class="btn-small" onclick="showLogin(${jsStr(s.phone)})" aria-label="登录账号 ${escapeHtml(maskPhone(s.phone))}">登录</button>`;
     }
     actionsHtml += `
     <div class="action-menu-wrap" data-phone="${escapeHtml(s.phone)}">
-        <button type="button" class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this, event)">⋯</button>
-        <div class="action-menu">
-            <button type="button" class="action-menu-item action-menu-toggle" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
-            <button type="button" class="action-menu-item" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
-            <button type="button" class="action-menu-item action-menu-danger" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
+        <button type="button" class="btn-small btn-menu-trigger" onclick="toggleActionMenu(this, event)" aria-label="账号操作菜单">⋯</button>
+        <div class="action-menu" role="menu">
+            <button type="button" class="action-menu-item action-menu-toggle" role="menuitem" onclick="toggleAccountMenu(${jsStr(s.phone)}, ${!s.enabled})">${s.enabled ? '禁用' : '启用'}</button>
+            <button type="button" class="action-menu-item" role="menuitem" onclick="showEditAccount(${jsStr(s.phone)})">编辑</button>
+            <button type="button" class="action-menu-item action-menu-danger" role="menuitem" onclick="deleteAccount(${jsStr(s.phone)})">删除</button>
         </div>
     </div>`;
 
     const progressParts = s.progress ? s.progress.split('/') : [0, 0];
     const progressPct = progressParts[1] > 0 ? (progressParts[0] / progressParts[1] * 100) : 0;
     // 进度条区域：token_valid 或 not_queried 时渲染；not_queried 时进度条 0% + 文字 -/-
+    // progress-label 添加 aria-live="polite" 让屏幕阅读器感知进度变化（如领取中 3/10 → 4/10）
     const progressWrapHtml = (s.token_valid || s.not_queried) ? `
                     <div class="account-progress-wrap">
                         <div class="progress-bar"><div class="progress-bar-fill${progressPct >= 100 ? ' complete' : ''}" style="width:${progressPct}%"></div><div class="progress-bar-glow" style="width:${progressPct}%"></div></div>
-                        <span class="account-progress-label">${progressStr}</span>
+                        <span class="account-progress-label" aria-live="polite">${progressStr}</span>
                     </div>` : '';
 
     return `
-    <div class="${cardClass}" data-phone="${escapeHtml(s.phone)}" ${cardStyle ? `style="${cardStyle}"` : ''} onanimationend="this.style.animation='none'">
+    <div class="${cardClass}" data-phone="${escapeHtml(s.phone)}" ${cardStyle ? `style="${cardStyle}"` : ''} aria-label="${escapeHtml(cardAriaLabel)}" onanimationend="this.style.animation='none'">
         <div class="card-inner">
             <div class="card-sizer">
                 <div class="account-avatar">${initial}</div>
@@ -1290,7 +1481,7 @@ function buildCardHTML(s, idx) {
                     ${progressWrapHtml}
                 </div>
             </div>
-            <div class="card-front" onclick="flipCard(this, event)">
+            <div class="card-front" tabindex="0" role="button" aria-label="账号 ${escapeHtml(displayName)}，回车或空格翻转到手机端权益" onclick="flipCard(this, event)">
                 <div class="account-avatar">${initial}</div>
                 <div class="account-info">
                     <div class="account-name-row">
@@ -1302,7 +1493,7 @@ function buildCardHTML(s, idx) {
                 </div>
                 <div class="account-actions">${actionsHtml}</div>
             </div>
-            <div class="card-back" onclick="flipCard(this, event)">
+            <div class="card-back" tabindex="-1" role="button" aria-label="手机端权益，回车或空格返回PC端权益" onclick="flipCard(this, event)">
                 <div class="card-back-content">
                     <div class="account-avatar">${initial}</div>
                     <div class="card-back-info" data-phone="${escapeHtml(s.phone)}">
@@ -1378,7 +1569,7 @@ async function refreshAccountsLight() {
         startLazyLoadPolling();
     } catch (e) {
         console.error('refreshAccountsLight error:', e);
-        showToast('刷新账号失败：' + (e.message || '未知错误'), 'error');
+        showToast('刷新账号失败：' + (e.message || ERROR_MESSAGES.UNKNOWN), 'error');
     }
 }
 
@@ -1467,7 +1658,7 @@ async function queryPhonesBatched(phones) {
             if (!resp.ok) {
                 // HTTP 错误：整批走查询超时占位
                 batch.forEach(p => {
-                    statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
+                    statusCacheSet(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
                     inFlightPhones.delete(p);
                     rerenderCardByPhone(p);
                 });
@@ -1485,10 +1676,10 @@ async function queryPhonesBatched(phones) {
             batch.forEach(p => {
                 const s = statusMap.get(p);
                 if (s) {
-                    statusCache.set(p, s);
+                    statusCacheSet(p, s);
                 } else {
                     // 后端未返回该 phone（异常）：走查询超时占位
-                    statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
+                    statusCacheSet(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
                 }
                 inFlightPhones.delete(p);
                 rerenderCardByPhone(p);
@@ -1502,7 +1693,7 @@ async function queryPhonesBatched(phones) {
             // 其他异常（含真实 100s 超时 abort）：整批走查询超时占位
             batch.forEach(p => {
                 inFlightPhones.delete(p);
-                statusCache.set(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
+                statusCacheSet(p, { ...buildDefaultPlaceholder(p), not_queried: false, query_timeout: true });
                 rerenderCardByPhone(p);
             });
         } finally {
@@ -1529,7 +1720,7 @@ async function initAccountsView() {
         startLazyLoadPolling();
     } catch (e) {
         console.error('initAccountsView error:', e);
-        showToast('加载账号列表失败：' + (e.message || '未知错误'), 'error');
+        showToast('加载账号列表失败：' + (e.message || ERROR_MESSAGES.UNKNOWN), 'error');
     }
 }
 
@@ -1631,20 +1822,21 @@ function showAddAccount() {
     openModal(`
         <h3>添加账号</h3>
         <div class="form-group">
-            <label>手机号 *</label>
-            <input type="text" id="addPhone" placeholder="请输入手机号" maxlength="11">
+            <label for="addPhone">手机号 *</label>
+            <input type="text" id="addPhone" placeholder="请输入手机号" maxlength="11" aria-required="true">
+            <div class="field-error" id="addPhoneError" aria-live="polite"></div>
         </div>
         <div class="form-group">
-            <label>用户名（选填）</label>
+            <label for="addName">用户名（选填）</label>
             <input type="text" id="addName" placeholder="给账号起个名字">
         </div>
         <div class="form-group">
-            <label>备注（选填）</label>
+            <label for="addRemark">备注（选填）</label>
             <input type="text" id="addRemark" placeholder="备注信息">
         </div>
         <div class="settings-divider"></div>
         <div class="form-group">
-            <label>领取权益</label>
+            <label for="addClaimSelect">领取权益</label>
             ${claimSelectHTML('addClaimSelect', defaultClaimTarget)}
         </div>
         <div class="modal-actions">
@@ -1667,6 +1859,19 @@ async function sendLoginCode(phone, btnGetId, btnLoginId, btnResendId) {
         if (btnLoginId) document.getElementById(btnLoginId).style.display = '';
         if (btnResendId) document.getElementById(btnResendId).style.display = '';
     } catch (e) {
+        if (e.cooldown) {
+            // BF-007：后端验证码冷却中，保持按钮禁用 5 秒防止用户狂点触发更多冷却
+            // 不显示"验证码已发送"，仅显示 e.message（"验证码请求冷却中，请稍后再试"）
+            btnGet.textContent = '冷却中…';
+            showToast(e.message || '验证码请求冷却中，请稍后再试', 'error');
+            setTimeout(() => {
+                if (btnGet) {
+                    btnGet.disabled = false;
+                    btnGet.textContent = '获取';
+                }
+            }, 5000);
+            return;
+        }
         btnGet.disabled = false;
         btnGet.textContent = '获取';
         showToast(e.message || '发送验证码失败', 'error');
@@ -1684,6 +1889,18 @@ async function resendLoginCode(phone, btnId) {
         btn.textContent = '重新获取';
         btn.disabled = false;
     } catch (e) {
+        if (e.cooldown) {
+            // BF-007：后端验证码冷却中，保持按钮禁用 5 秒防止用户狂点触发更多冷却
+            btn.textContent = '冷却中…';
+            showToast(e.message || '验证码请求冷却中，请稍后再试', 'error');
+            setTimeout(() => {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.textContent = '重新获取';
+                }
+            }, 5000);
+            return;
+        }
         btn.textContent = '重新获取';
         btn.disabled = false;
         showToast(e.message || '重新发送失败', 'error');
@@ -1691,19 +1908,24 @@ async function resendLoginCode(phone, btnId) {
 }
 
 async function doAddAccountStep1() {
-    const phone = document.getElementById('addPhone').value.trim();
+    const rawPhone = document.getElementById('addPhone').value.trim();
+    const phone = normalizePhone(rawPhone);  // UX-007：规范化后提交，与后端 PHONE_PATTERN 对齐
     const name = document.getElementById('addName').value.trim();
     const remark = document.getElementById('addRemark').value.trim();
 
     if (!phone) {
-        showToast('请输入手机号', 'error');
+        const msg = '请输入手机号';
+        showFieldError('addPhone', msg);
+        showToast(msg, 'error');
         return;
     }
     const phoneErr = validatePhoneFmt(phone);
     if (phoneErr) {
+        showFieldError('addPhone', phoneErr);
         showToast(phoneErr, 'error');
         return;
     }
+    clearFieldError('addPhone');
 
     try {
         const claimTarget = document.getElementById('addClaimSelect')?.dataset.value || 'all';
@@ -1727,8 +1949,9 @@ async function doAddAccountStep1() {
             <div class="login-form-panel ${smsActive}" id="add-sms-panel">
                 <p class="login-hint">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
                 <div class="form-group">
-                    <label>验证码 *</label>
-                    <input type="text" id="addLoginCode" placeholder="请输入收到的验证码" maxlength="6">
+                    <label for="addLoginCode">验证码 *</label>
+                    <input type="text" id="addLoginCode" placeholder="请输入收到的验证码" maxlength="6" aria-required="true">
+                    <div class="field-error" id="addLoginCodeError" aria-live="polite"></div>
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn-modal btn-modal-cancel" id="btnResendAdd" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendAdd')">重新获取</button>
@@ -1740,8 +1963,9 @@ async function doAddAccountStep1() {
             <div class="login-form-panel ${pwdActive}" id="add-pwd-panel">
                 <p class="login-hint">使用外星仔加速器 App 的登录密码直接登录。</p>
                 <div class="form-group">
-                    <label>密码 *</label>
-                    <input type="password" id="addLoginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码">
+                    <label for="addLoginPwd">密码 *</label>
+                    <input type="password" id="addLoginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码" aria-required="true">
+                    <div class="field-error" id="addLoginPwdError" aria-live="polite"></div>
                 </div>
                 <div class="modal-actions">
                     <button type="button" class="btn-modal btn-modal-cancel" onclick="cancelAddAccount(${jsStr(phone)})">取消</button>
@@ -1756,14 +1980,18 @@ async function doAddAccountStep1() {
 async function doAddAccountStep2(phone) {
     const code = document.getElementById('addLoginCode').value.trim();
     if (!code) {
-        showToast('请输入验证码', 'error');
+        const msg = '请输入验证码';
+        showFieldError('addLoginCode', msg);
+        showToast(msg, 'error');
         return;
     }
     const codeErr = validateCodeFmt(code);
     if (codeErr) {
+        showFieldError('addLoginCode', codeErr);
         showToast(codeErr, 'error');
         return;
     }
+    clearFieldError('addLoginCode');
     try {
         await api(`/api/login/${encodeURIComponent(phone)}/verify`, {
             method: 'POST',
@@ -1786,14 +2014,18 @@ async function cancelAddAccount(phone) {
 async function doAddAccountStep2Pwd(phone) {
     const password = document.getElementById('addLoginPwd').value.trim();
     if (!password) {
-        showToast('请输入密码', 'error');
+        const msg = '请输入密码';
+        showFieldError('addLoginPwd', msg);
+        showToast(msg, 'error');
         return;
     }
     const pwdErr = validatePwdFmt(password);
     if (pwdErr) {
+        showFieldError('addLoginPwd', pwdErr);
         showToast(pwdErr, 'error');
         return;
     }
+    clearFieldError('addLoginPwd');
     try {
         await api(`/api/login/${encodeURIComponent(phone)}/verify`, {
             method: 'POST',
@@ -1865,12 +2097,23 @@ function flipCard(el, e) {
     const card = el.closest('.account-card');
     const phone = card.dataset.phone;
     card.classList.toggle('flipped');
+    const front = card.querySelector('.card-front');
+    const back = card.querySelector('.card-back');
     if (card.classList.contains('flipped')) {
         flippedPhones.add(phone);
         fetchMobileStatus(card);
+        // UX-006: 翻到背面时，正面退出 tab 序列、背面进入
+        if (front) front.setAttribute('tabindex', '-1');
+        if (back) back.setAttribute('tabindex', '0');
+        // 键盘触发翻面时，焦点跟随到背面
+        if (e && e.type === 'keydown' && back) back.focus();
     } else {
         flippedPhones.delete(phone);
         stopMobileCountdown(phone);
+        // UX-006: 翻回正面时，背面退出 tab 序列、正面进入
+        if (back) back.setAttribute('tabindex', '-1');
+        if (front) front.setAttribute('tabindex', '0');
+        if (e && e.type === 'keydown' && front) front.focus();
     }
 }
 
@@ -1925,9 +2168,12 @@ function renderMobileBack(backInfo, status) {
         ? Math.max(0, status.mobile_expire_ts - Math.floor(Date.now() / 1000))
         : (status.mobile_duration || 0);
     const duration = formatDuration(remain);
-    const progress = status.mobile_progress ? escapeHtml(status.mobile_progress) : '-/-';
-    const progressParts = progress.split('/');
-    const pct = progressParts[1] > 0 ? (progressParts[0] / progressParts[1] * 100) : 0;
+    // 进度格式校验：原始字符串 "已用/总进度"，split 前先校验格式
+    const rawProgress = status.mobile_progress || '-/-';
+    const progressParts = rawProgress.split('/');
+    const pct = (progressParts.length === 2 && +progressParts[1] > 0)
+        ? (+progressParts[0] / +progressParts[1] * 100) : 0;
+    const progress = escapeHtml(rawProgress);  // 用于显示
 
     backInfo.innerHTML = `
         <div class="card-back-row">
@@ -2071,33 +2317,33 @@ function showEditAccount(phone) {
         openModal(`
             <h3>编辑账号</h3>
             <div class="form-group">
-                <label>手机号 *</label>
+                <label for="editPhone">手机号 *</label>
                 <div class="input-lock-wrap">
                     <input type="text" id="editPhone" class="input-locked" value="${escapeHtml(account.phone)}" maxlength="11" readonly>
                     <span class="lock-tip" data-tooltip="手机号不允许修改，请删除后重新添加"></span>
                 </div>
             </div>
             <div class="form-group">
-                <label>用户名（选填）</label>
+                <label for="editName">用户名（选填）</label>
                 <input type="text" id="editName" value="${escapeHtml(account.name || '')}" placeholder="给账号起个名字">
             </div>
             <div class="form-group">
-                <label>备注（选填）</label>
+                <label for="editRemark">备注（选填）</label>
                 <input type="text" id="editRemark" value="${escapeHtml(account.remark || '')}" placeholder="备注信息">
             </div>
             <div class="settings-divider"></div>
             <div class="form-group">
-                <label>领取权益</label>
+                <label for="editClaimSelect">领取权益</label>
                 ${claimSelectHTML('editClaimSelect', account.claim_target || 'all')}
             </div>
             <div class="settings-divider"></div>
             <div class="form-group">
-                <label>密码（选填）</label>
+                <label for="editPwd">密码（选填）</label>
                 <input type="password" id="editPwd" value="${escapeHtml(account.password || '')}" onfocus="this.type='text'" onblur="this.type='password'" placeholder="未设置">
             </div>
             <div class="settings-divider"></div>
             <div class="form-group">
-                <label>启用状态</label>
+                <label for="editEnabled">启用状态</label>
                 <div class="schedule-row">
                     <label class="toggle-switch">
                         <input type="checkbox" id="editEnabled" ${account.enabled ? 'checked' : ''}>
@@ -2167,41 +2413,47 @@ async function doDeleteAccount(phone) {
         const card = document.querySelector(`.account-card[data-phone="${CSS.escape(phone)}"]`);
         if (card) {
             const list = document.getElementById('accountsList');
-            // FLIP 补位动画：删除卡片后让剩余卡片平滑滑入新位置
-            // First（记录旧位置）→ 卡片淡出 display:none 触发重排 → Last（新位置）
-            // → Invert（transform 移回旧位置）→ Play（transition 过渡到新位置）
-            const siblings = [...list.querySelectorAll('.account-card:not(.removing)')];
-            const firstRects = new Map();
-            siblings.forEach(s => firstRects.set(s, s.getBoundingClientRect()));
-
-            card.style.animation = '';  // 清除内联残留（onanimationend 设的 'none'），让 .removing 的 cardRemove 能生效
-            card.classList.add('removing');
-            card.addEventListener('animationend', (e) => {
-                if (e.target !== card) return;
+            // UX-003：reduced-motion 模式下跳过 FLIP 补位动画，直接 display:none 后移除
+            if (prefersReducedMotion()) {
                 card.style.display = 'none';
+                setTimeout(() => card.remove(), 0);
+            } else {
+                // FLIP 补位动画：删除卡片后让剩余卡片平滑滑入新位置
+                // First（记录旧位置）→ 卡片淡出 display:none 触发重排 → Last（新位置）
+                // → Invert（transform 移回旧位置）→ Play（transition 过渡到新位置）
+                const siblings = [...list.querySelectorAll('.account-card:not(.removing)')];
+                const firstRects = new Map();
+                siblings.forEach(s => firstRects.set(s, s.getBoundingClientRect()));
 
-                const remaining = [...list.querySelectorAll('.account-card:not(.removing)')];
-                remaining.forEach(el => {
-                    const first = firstRects.get(el);
-                    if (!first) return;
-                    const last = el.getBoundingClientRect();
-                    const dx = first.left - last.left;
-                    const dy = first.top - last.top;
-                    if (dx === 0 && dy === 0) return;
-                    el.style.transition = 'none';
-                    el.style.transform = `translate(${dx}px, ${dy}px)`;
-                    el.offsetHeight;  // 强制 reflow，确保 Invert 的 transform 生效后再启动 Play 过渡
-                    el.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
-                    el.style.transform = '';
-                    el.addEventListener('transitionend', function handler(e) {
-                        if (e.propertyName !== 'transform') return;
-                        el.style.transition = '';
-                        el.removeEventListener('transitionend', handler);
+                card.style.animation = '';  // 清除内联残留（onanimationend 设的 'none'），让 .removing 的 cardRemove 能生效
+                card.classList.add('removing');
+                card.addEventListener('animationend', (e) => {
+                    if (e.target !== card) return;
+                    card.style.display = 'none';
+
+                    const remaining = [...list.querySelectorAll('.account-card:not(.removing)')];
+                    remaining.forEach(el => {
+                        const first = firstRects.get(el);
+                        if (!first) return;
+                        const last = el.getBoundingClientRect();
+                        const dx = first.left - last.left;
+                        const dy = first.top - last.top;
+                        if (dx === 0 && dy === 0) return;
+                        el.style.transition = 'none';
+                        el.style.transform = `translate(${dx}px, ${dy}px)`;
+                        el.offsetHeight;  // 强制 reflow，确保 Invert 的 transform 生效后再启动 Play 过渡
+                        el.style.transition = 'transform 0.35s cubic-bezier(0.4, 0, 0.2, 1)';
+                        el.style.transform = '';
+                        el.addEventListener('transitionend', function handler(e) {
+                            if (e.propertyName !== 'transform') return;
+                            el.style.transition = '';
+                            el.removeEventListener('transitionend', handler);
+                        });
                     });
-                });
 
-                setTimeout(() => card.remove(), 400);
-            });
+                    setTimeout(() => card.remove(), 400);
+                });
+            }
         }
 
         showToast('账号已删除', 'success');
@@ -2264,8 +2516,9 @@ function showLogin(phone) {
         <div class="login-form-panel ${smsActive}" id="login-sms-panel">
             <p class="login-hint" style="margin-top:12px">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
             <div class="form-group">
-                <label>验证码 *</label>
-                <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6">
+                <label for="loginCode">验证码 *</label>
+                <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6" aria-required="true">
+                <div class="field-error" id="loginCodeError" aria-live="polite"></div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
@@ -2277,8 +2530,9 @@ function showLogin(phone) {
         <div class="login-form-panel ${pwdActive}" id="login-pwd-panel">
             <p class="login-hint" style="margin-top:12px">使用外星仔加速器 App 的登录密码直接登录。</p>
             <div class="form-group">
-                <label>密码 *</label>
-                <input type="password" id="loginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码">
+                <label for="loginPwd">密码 *</label>
+                <input type="password" id="loginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码" aria-required="true">
+                <div class="field-error" id="loginPwdError" aria-live="polite"></div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
@@ -2292,14 +2546,18 @@ function showLogin(phone) {
 async function doVerify(phone) {
     const code = document.getElementById('loginCode').value.trim();
     if (!code) {
-        showToast('请输入验证码', 'error');
+        const msg = '请输入验证码';
+        showFieldError('loginCode', msg);
+        showToast(msg, 'error');
         return;
     }
     const codeErr = validateCodeFmt(code);
     if (codeErr) {
+        showFieldError('loginCode', codeErr);
         showToast(codeErr, 'error');
         return;
     }
+    clearFieldError('loginCode');
     try {
         await api(`/api/login/${encodeURIComponent(phone)}/verify`, {
             method: 'POST',
@@ -2319,14 +2577,18 @@ async function doVerify(phone) {
 async function doVerifyPwd(phone) {
     const password = document.getElementById('loginPwd').value.trim();
     if (!password) {
-        showToast('请输入密码', 'error');
+        const msg = '请输入密码';
+        showFieldError('loginPwd', msg);
+        showToast(msg, 'error');
         return;
     }
     const pwdErr = validatePwdFmt(password);
     if (pwdErr) {
+        showFieldError('loginPwd', pwdErr);
         showToast(pwdErr, 'error');
         return;
     }
+    clearFieldError('loginPwd');
     try {
         await api(`/api/login/${encodeURIComponent(phone)}/verify`, {
             method: 'POST',
@@ -2387,6 +2649,17 @@ function animateFlipTo(targetAngle) {
     }
 
     const flippingToBack = targetAngle === 180;
+
+    // UX-003：reduced-motion 模式下直接设置最终态，跳过 WAAPI 动画与 rAF opacity 同步
+    if (prefersReducedMotion()) {
+        inner.style.transform = `rotateX(${targetAngle}deg)`;
+        const showFront = !flippingToBack;
+        front.style.opacity = showFront ? '1' : '0';
+        front.style.pointerEvents = showFront ? 'auto' : 'none';
+        back.style.opacity = showFront ? '0' : '1';
+        back.style.pointerEvents = showFront ? 'none' : 'auto';
+        return;
+    }
 
     rotationAnim = inner.animate([
         { transform: `rotateX(${fromAngle}deg)` },
@@ -2484,13 +2757,17 @@ function buildDetailHTML(item) {
     if (item.status === 'error') {
         const errText = item.error || '';
         const errEncoded = encodeURIComponent(errText);
+        // SEC-011：原始报错默认折叠，避免截图分享时意外泄露技术细节（文件路径/异常类名等）
         return `<div class="detail-block"><span class="detail-block-label">原始报错</span></div>` +
+               `<details class="detail-error-details">` +
+               `<summary class="detail-error-summary">点击展开查看错误详情</summary>` +
                `<div class="detail-error-text">` +
                `<button type="button" class="copy-btn" data-text="${errEncoded}" aria-label="复制错误文本">` +
                `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">` +
                `<rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>` +
                `<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>` +
-               `</svg></button>${escapeHtml(errText)}</div>`;
+               `</svg></button>${escapeHtml(errText)}</div>` +
+               `</details>`;
     }
     if (item.status === 'partial') {
         const total = item.total || 0;
@@ -2549,7 +2826,11 @@ function buildResultRowHTML(item, expanded) {
     const cls = computeRowClass(item, expanded);
     const styleAttr = computeRowStyleAttr(item);
     const styleStr = styleAttr ? ` style="${styleAttr}"` : '';
-    return `<div class="${cls}" data-phone="${escapeHtml(item.phone)}"${styleStr}>${buildRowInnerHTML(item)}</div>`;
+    // UX-011: role=button + tabindex + aria-expanded 让屏幕阅读器和键盘用户可操作行展开
+    const label = escapeHtml(item.label || item.phone);
+    const statusText = escapeHtml(getStatusText(item));
+    const ariaLabel = `${label}，状态：${statusText}，回车或空格展开详情`;
+    return `<div class="${cls}" data-phone="${escapeHtml(item.phone)}"${styleStr} tabindex="0" role="button" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="${ariaLabel}">${buildRowInnerHTML(item)}</div>`;
 }
 
 // ----- 4.3.3 虚拟列表 -----
@@ -2652,6 +2933,8 @@ function renderResultViewport(useFLIP = false) {
             row.className = computeRowClass(item, expanded);
             row.setAttribute('style', computeRowStyleAttr(item));
             row.innerHTML = buildRowInnerHTML(item);
+            // UX-011: 同步 aria-expanded 状态
+            row.setAttribute('aria-expanded', expanded ? 'true' : 'false');
         } else {
             // 新行：创建并插入
             const tmp = document.createElement('div');
@@ -2914,7 +3197,7 @@ function updateSummary(counts) {
         // 注意：dataset 只能存字符串，存 Animation 对象会被 toString 为 "[object Animation]"，
         // 导致取消逻辑失效。改用普通 JS 属性 _bumpAnim 存储 Animation 引用。
         if (chip._bumpAnim) {
-            try { chip._bumpAnim.cancel(); } catch (e) {}
+            try { chip._bumpAnim.cancel(); } catch (e) { /* 动画已结束或对象已销毁，忽略 */ }
             chip._bumpAnim = null;
         }
         const anim = chip.animate(
@@ -2994,6 +3277,9 @@ async function showResultModal() {
     const overlay = document.getElementById('resultOverlay');
     if (!overlay) return;
     overlay.classList.add('active');
+    // UX-004 / UX-008：启用焦点陷阱（在第一个 await 之前调用，确保触发按钮被正确保存）
+    const modal = document.getElementById('resultModalContent');
+    if (modal && typeof trapFocus === 'function') trapFocus(modal);
     const list = document.getElementById('resultList');
     if (list) list.scrollTop = 0;
     updateChipActiveState();
@@ -3017,6 +3303,8 @@ async function showResultModal() {
 function closeResultModal() {
     const overlay = document.getElementById('resultOverlay');
     if (overlay) overlay.classList.remove('active');
+    // UX-004 / UX-008：关闭后恢复焦点到触发元素（ESC 触发同样走此路径）
+    if (typeof releaseFocus === 'function') releaseFocus();
     userClosedResult = true;
     cancelResultRafs();
     recentlyExpandedMap.clear();
@@ -3040,7 +3328,7 @@ function cancelResultRafs() {
     }
     document.querySelectorAll('.summary-chip').forEach(chip => {
         if (chip._bumpAnim) {
-            try { chip._bumpAnim.cancel(); } catch (e) {}
+            try { chip._bumpAnim.cancel(); } catch (e) { /* 动画已结束或对象已销毁，忽略 */ }
             chip._bumpAnim = null;
         }
     });
@@ -3053,7 +3341,7 @@ function cancelResultRafs() {
         if (innerEl) {
             innerEl.style.transform = `rotateX(${currentFlipAngle}deg)`;
         }
-        try { rotationAnim.cancel(); } catch (e) {}
+        try { rotationAnim.cancel(); } catch (e) { /* 动画已结束或对象已销毁，忽略 */ }
         rotationAnim = null;
     }
 }
@@ -3072,7 +3360,10 @@ function resetClaimState() {
 }
 
 // ----- 4.5.1a 调试接口（暴露只读 getter）-----
+// CQ-012：仅在调试模式（window.__ETA_DEBUG=true）下暴露 window.__claimDebug，
+// 避免生产环境泄漏内部状态。开发者可在控制台执行 window.__ETA_DEBUG=true 后重载页面启用。
 function bindClaimDebug() {
+    if (!window.__ETA_DEBUG) return;
     if (window.__claimDebug) return;
     window.__claimDebug = {
         get rotationAnim() { return rotationAnim; },
@@ -3085,6 +3376,7 @@ function bindClaimDebug() {
         get expandedSet() { return expandedSet; },
         get isClaiming() { return isClaiming; },
     };
+    console.info('[ETA] 调试模式已启用，window.__claimDebug 可用');
 }
 
 // 启动异步领取流程：调用后端 /api/claim，按钮翻到反面（CLAIMING_BACK），开始轮询进度。
@@ -3179,7 +3471,8 @@ function pollClaimProgress() {
 
             // 卡片进度与 VIP 时长更新（保留原行为）
             data.progress.forEach(item => {
-                updateCardProgress(item.phone, item.current || 0, item.total || 0, item.phase);
+                // PERF-08: 复用 cardByPhone Map 缓存，避免 updateCardProgress 内部重复 querySelector
+                updateCardProgress(item.phone, item.current || 0, item.total || 0, item.phase, cardByPhone.get(item.phone));
                 if (['done', 'partial', 'already_done'].includes(item.status) && item.vip_after > 0) {
                     const claimCard = cardByPhone.get(item.phone);
                     if (claimCard) {
@@ -3321,6 +3614,8 @@ function renderSettingsField(key, schema, value) {
     const label = schema.label || key;
     const desc = schema.description || '';
     let controlHTML = '';
+    // UX-005：每个字段生成 inputId 供 label for 关联（key 唯一，避免重复）
+    const inputId = `adv-field-${key}`;
 
     if (schema.type === 'int' || schema.type === 'float') {
         const step = schema.type === 'float' ? '0.01' : '1';
@@ -3341,7 +3636,7 @@ function renderSettingsField(key, schema, value) {
         }
         controlHTML = `
             <div class="adv-input-wrap">
-                <input type="number" data-key="${escapeHtml(key)}" value="${inputValue}" min="${schema.min}" max="${schema.max}" step="${step}"${nullable ? ' placeholder="自动分配" data-nullable="true"' : ''}>
+                <input type="number" id="${inputId}" data-key="${escapeHtml(key)}" value="${escapeHtml(String(inputValue))}" min="${schema.min}" max="${schema.max}" step="${step}"${nullable ? ' placeholder="自动分配" data-nullable="true"' : ''}>
                 <span class="adv-range-suffix${mismatchClass}">「${suffixText}」</span>
             </div>`;
     } else if (schema.type === 'bool') {
@@ -3360,7 +3655,7 @@ function renderSettingsField(key, schema, value) {
                 <input type="text" disabled ${displayAttr} aria-label="${escapeHtml(label)} 状态">
                 <span class="adv-range-suffix adv-bool-toggle">
                     <label class="toggle-rect">
-                        <input type="checkbox" data-key="${escapeHtml(key)}" ${value ? 'checked' : ''}${changeAttr}>
+                        <input type="checkbox" id="${inputId}" data-key="${escapeHtml(key)}" ${value ? 'checked' : ''}${changeAttr}>
                         <span class="toggle-rect-slider"></span>
                     </label>
                 </span>
@@ -3372,13 +3667,13 @@ function renderSettingsField(key, schema, value) {
         // onclick 传参用 jsStr()：输出含双引号的合法 JS 字符串字面量，避免引号注入
         controlHTML = `
             <div class="enum-select-wrap" id="${id}" data-key="${escapeHtml(key)}" data-value="${escapeHtml(String(selOpt[0]))}">
-                <div class="enum-select-trigger" tabindex="0" onclick="toggleEnumSelect(${jsStr(id)})">
+                <div class="enum-select-trigger" tabindex="0" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-label="${escapeHtml(label)}" onclick="toggleEnumSelect(${jsStr(id)})">
                     <span class="enum-select-trigger-text">${escapeHtml(String(selOpt[1]))}</span>
                     <span class="enum-select-arrow"></span>
                 </div>
-                <div class="enum-select-dropdown">
+                <div class="enum-select-dropdown" role="listbox">
                     ${opts.map(([v, lbl]) => `
-                        <button type="button" class="enum-select-option${v === selOpt[0] ? ' selected' : ''}" onclick="pickEnumSelect(${jsStr(id)}, ${jsStr(v)}, ${jsStr(String(lbl))}, this)">
+                        <button type="button" class="enum-select-option${v === selOpt[0] ? ' selected' : ''}" role="option" aria-selected="${v === selOpt[0] ? 'true' : 'false'}" onclick="pickEnumSelect(${jsStr(id)}, ${jsStr(v)}, ${jsStr(String(lbl))}, this)">
                             <span class="enum-select-option-text">${escapeHtml(String(lbl))}</span>
                             <span class="enum-select-check">${v === selOpt[0] ? '\u2713' : ''}</span>
                         </button>
@@ -3387,16 +3682,18 @@ function renderSettingsField(key, schema, value) {
             </div>`;
     } else {
         // str
-        controlHTML = `<input type="text" data-key="${escapeHtml(key)}" value="${escapeHtml(String(value))}">`;
+        controlHTML = `<input type="text" id="${inputId}" data-key="${escapeHtml(key)}" value="${escapeHtml(String(value))}">`;
     }
 
     const infoIconHTML = desc
         ? `<span class="info-icon" data-tooltip="${escapeHtml(desc)}">${INFO_ICON_SVG}</span>`
         : '';
 
+    // UX-005：label 关联到对应 input/checkbox id（enum 类型关联到 wrap id）
+    const labelFor = schema.type === 'enum' ? `enum-${key}` : inputId;
     return `
         <div class="form-group adv-field-row" data-row="${escapeHtml(key)}">
-            <label>
+            <label for="${labelFor}">
                 <span class="adv-label">
                     ${escapeHtml(label)}
                 </span>
@@ -3530,6 +3827,7 @@ function toggleEnumSelect(id) {
     document.querySelectorAll('.enum-select-trigger.open').forEach(t => {
         if (t !== trigger) {
             t.classList.remove('open');
+            t.setAttribute('aria-expanded', 'false');  // UX-011
             const d = t.nextElementSibling;
             if (d) {
                 d.classList.remove('open');
@@ -3540,6 +3838,7 @@ function toggleEnumSelect(id) {
 
     if (isOpen) {
         trigger.classList.remove('open');
+        trigger.setAttribute('aria-expanded', 'false');  // UX-011
         dropdown.classList.remove('open');
         dropdown.classList.remove('drop-up');
         return;
@@ -3571,6 +3870,7 @@ function toggleEnumSelect(id) {
     }
 
     trigger.classList.add('open');
+    trigger.setAttribute('aria-expanded', 'true');  // UX-011
     dropdown.classList.add('open');
 }
 
@@ -3581,11 +3881,13 @@ function pickEnumSelect(id, value, label, btn) {
     wrap.dataset.value = value;
     wrap.querySelectorAll('.enum-select-option').forEach(o => {
         o.classList.remove('selected');
+        o.setAttribute('aria-selected', 'false');  // UX-011
         const check = o.querySelector('.enum-select-check');
         if (check) check.textContent = '';
     });
     if (btn) {
         btn.classList.add('selected');
+        btn.setAttribute('aria-selected', 'true');  // UX-011
         const check = btn.querySelector('.enum-select-check');
         if (check) check.textContent = '\u2713';
     }
@@ -3593,7 +3895,10 @@ function pickEnumSelect(id, value, label, btn) {
     if (triggerText) triggerText.textContent = label;
     const trigger = wrap.querySelector('.enum-select-trigger');
     const dropdown = wrap.querySelector('.enum-select-dropdown');
-    if (trigger) trigger.classList.remove('open');
+    if (trigger) {
+        trigger.classList.remove('open');
+        trigger.setAttribute('aria-expanded', 'false');  // UX-011
+    }
     if (dropdown) {
         dropdown.classList.remove('open');
         dropdown.classList.remove('drop-up');
@@ -3615,6 +3920,7 @@ function closeAllEnumDropdowns(e) {
     }
     document.querySelectorAll('.enum-select-trigger.open').forEach(t => {
         t.classList.remove('open');
+        t.setAttribute('aria-expanded', 'false');  // UX-011
         const d = t.nextElementSibling;
         if (d) {
             d.classList.remove('open');
@@ -3634,6 +3940,15 @@ function collectCommonValues() {
     };
 }
 
+// UX-012：settings 字段 key → 输入元素 id 映射，供 showFieldError 在对应字段下方显示内联错误
+// 高级区字段由 renderSettingsField 动态生成 id（key 本身），不在此映射中（由 toast 反馈）
+const SETTINGS_FIELD_ID_MAP = {
+    max_concurrent: 'setMaxConcurrent',
+    request_interval: 'setInterval',
+    schedule_time: 'setScheduleTime',
+    schan_key: 'setSchanKey',
+};
+
 /* 复检所有 int/float 字段范围（常用区 + 高级区），范围由 schema 驱动 */
 function validateAll(common) {
     const settingsSchema = window.__settingsSchema || {};
@@ -3649,6 +3964,13 @@ function validateAll(common) {
     if (Number.isNaN(common.request_interval) || common.request_interval < riMin || common.request_interval > riMax) {
         return { ok: false, field: 'request_interval', msg: `${riSchema.label || '单账号请求间隔'} 超出范围（${riMin}-${riMax}）` };
     }
+    // XMC-007：schan_key 正则校验（空值跳过，与后端 pattern_skip_empty=True 一致）
+    // 注意：SETTINGS_SCHEMA.pattern 未序列化到前端（_serialize_schema 未输出 pattern 字段），
+    // 前端用本地 SENDKEY_PATTERN 常量校验，修改时需同步 core/config.py
+    if (common.schan_key && !SENDKEY_PATTERN.test(common.schan_key)) {
+        const schanSchema = settingsSchema.schan_key || {};
+        return { ok: false, field: 'schan_key', msg: `${schanSchema.label || 'Server 酱 SendKey'} 格式不正确，需以 SCT 开头` };
+    }
     const advEntries = getAdvancedSchemaEntries();
     for (const [key, schema] of advEntries) {
         const v = advancedStaging[key];
@@ -3661,6 +3983,12 @@ function validateAll(common) {
             // forbidden 黑名单校验（如 gui_port 命中 Chromium 不安全端口）
             if (schema.forbidden && schema.forbidden.includes(v)) {
                 return { ok: false, field: key, msg: `${schema.label || key} 的值 ${v} 不被允许（WebView2 不安全端口）` };
+            }
+        } else if (schema.type === 'enum') {
+            // XMC-007：enum 字段校验值是否在 schema.options 的 keys 中
+            // 防御 default_claim_target / default_login_method 等枚举值被异常修改
+            if (schema.options && !(String(v) in schema.options)) {
+                return { ok: false, field: key, msg: `${schema.label || key} 的值 "${v}" 不在允许选项中` };
             }
         }
     }
@@ -3770,14 +4098,12 @@ function initVersionFlip() {
     const FLIP_DURATION = 550;  // 与 CSS transition: transform 0.55s 一致
 
     let state = 'IDLE_FRONT';
-    let hoverTimer = null;
-    let flipTimer = null;
 
     function clearHoverTimer() {
-        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+        if (versionFlipHoverTimer) { clearTimeout(versionFlipHoverTimer); versionFlipHoverTimer = null; }
     }
     function clearFlipTimer() {
-        if (flipTimer) { clearTimeout(flipTimer); flipTimer = null; }
+        if (versionFlipFlipTimer) { clearTimeout(versionFlipFlipTimer); versionFlipFlipTimer = null; }
     }
     function setFlipped(on) {
         versionCode.classList.toggle('flipped', on);
@@ -3786,8 +4112,8 @@ function initVersionFlip() {
         clearFlipTimer();
         state = toBack ? 'FLIPPING_TO_BACK' : 'FLIPPING_TO_FRONT';
         setFlipped(toBack);
-        flipTimer = setTimeout(() => {
-            flipTimer = null;
+        versionFlipFlipTimer = setTimeout(() => {
+            versionFlipFlipTimer = null;
             state = toBack ? 'IDLE_BACK' : 'IDLE_FRONT';
         }, FLIP_DURATION);
     }
@@ -3795,8 +4121,8 @@ function initVersionFlip() {
     versionCode.addEventListener('mouseenter', () => {
         clearHoverTimer();
         if (state === 'IDLE_FRONT') {
-            hoverTimer = setTimeout(() => {
-                hoverTimer = null;
+            versionFlipHoverTimer = setTimeout(() => {
+                versionFlipHoverTimer = null;
                 startFlip(true);
             }, 500);
         } else if (state === 'FLIPPING_TO_FRONT') {
@@ -3807,8 +4133,8 @@ function initVersionFlip() {
     versionCode.addEventListener('mouseleave', () => {
         clearHoverTimer();
         if (state === 'IDLE_BACK') {
-            hoverTimer = setTimeout(() => {
-                hoverTimer = null;
+            versionFlipHoverTimer = setTimeout(() => {
+                versionFlipHoverTimer = null;
                 startFlip(false);
             }, 500);
         } else if (state === 'FLIPPING_TO_BACK') {
@@ -3890,7 +4216,20 @@ document.addEventListener('focusout', e => {
     }
 });
 
-// ESC 关闭：高级区打开时关闭高级区（不关闭主弹窗）；结果弹窗打开时关闭结果弹窗
+// UX-012：用户开始编辑有内联错误的字段时立即清除错误（aria-live 区域同步清空）
+// 监听 input 事件（每次输入触发），仅对存在 ${id}Error 元素的字段生效
+document.addEventListener('input', e => {
+    const t = e.target;
+    if (!(t instanceof Element)) return;
+    if (!t.id) return;
+    const errEl = document.getElementById(t.id + 'Error');
+    if (errEl && errEl.textContent) {
+        errEl.textContent = '';
+        t.setAttribute('aria-invalid', 'false');
+    }
+});
+
+// ESC 关闭：高级区打开时关闭高级区（不关闭主弹窗）；结果弹窗打开时关闭结果弹窗；主弹窗打开时关闭主弹窗
 document.addEventListener('keydown', e => {
     if (e.key !== 'Escape') return;
     const advPanel = document.getElementById('advPanel');
@@ -3901,7 +4240,45 @@ document.addEventListener('keydown', e => {
     const resultOverlay = document.getElementById('resultOverlay');
     if (resultOverlay && resultOverlay.classList.contains('active')) {
         closeResultModal();
+        return;
     }
+    // UX-004：主弹窗 ESC 关闭（closeModal(null) 跳过 e.target 检查，但仍走 isDirty 阻止逻辑）
+    const modalOverlay = document.getElementById('modalOverlay');
+    if (modalOverlay && modalOverlay.classList.contains('active')) {
+        closeModal(null);
+        return;
+    }
+    // UX-006：卡片背面 ESC 翻回正面（与 click 翻面行为一致）
+    if (e.target.classList && e.target.classList.contains('card-back')) {
+        e.preventDefault();
+        flipCard(e.target, e);
+    }
+});
+
+// UX-006：卡片翻面键盘支持 — Enter/Space 在 .card-front/.card-back 自身上时触发翻面
+// 仅当 face 自身被聚焦时触发（子元素如按钮聚焦时由按钮自行处理，不触发翻面）
+document.addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const t = e.target;
+    if (!t || !t.classList) return;
+    if (!t.classList.contains('card-front') && !t.classList.contains('card-back')) return;
+    e.preventDefault();
+    flipCard(t, e);
+});
+
+// UX-006：通用键盘支持 — div/span[role=button/combobox] 聚焦时 Enter/Space 触发 click
+// 覆盖 .action-text、.as-idle、.placeholder-link、.claim-select-trigger、.enum-select-trigger 等
+// button 元素已有默认行为，跳过；已被先前处理器处理（defaultPrevented）的也跳过
+document.addEventListener('keydown', e => {
+    if (e.defaultPrevented) return;
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    const t = e.target;
+    if (!t || !t.getAttribute) return;
+    if (t.tagName === 'BUTTON' || t.tagName === 'A' || t.tagName === 'INPUT') return;
+    const role = t.getAttribute('role');
+    if (role !== 'button' && role !== 'combobox') return;
+    e.preventDefault();
+    t.click();
 });
 
 // F5 / Ctrl+R：重载前端（仅重载 WebView，保留 Flask 后端进程）
@@ -3909,6 +4286,16 @@ document.addEventListener('keydown', e => {
     if (e.key === 'F5' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'r')) {
         e.preventDefault();
         location.reload();
+    }
+});
+
+// UX-010：Alt+T 切换 tip 模块可见性（右键的键盘替代方案）
+document.addEventListener('keydown', e => {
+    if (e.altKey && !e.ctrlKey && !e.metaKey && (e.key === 't' || e.key === 'T')) {
+        e.preventDefault();
+        if (typeof window.toggleTipVisibility === 'function') {
+            window.toggleTipVisibility();
+        }
     }
 });
 
@@ -4031,16 +4418,18 @@ function showSettings() {
         openModal(`
             <h3>设置</h3>
             <div class="form-group">
-                <label>最大账号并发数</label>
+                <label for="setMaxConcurrent">最大账号并发数</label>
                 <input type="number" id="setMaxConcurrent" data-key="max_concurrent" value="${settings.max_concurrent}" min="1" max="999">
+                <div class="field-error" id="setMaxConcurrentError" aria-live="polite"></div>
             </div>
             <div class="form-group">
-                <label>单账号请求间隔（秒）</label>
+                <label for="setInterval">单账号请求间隔（秒）</label>
                 <input type="number" id="setInterval" data-key="request_interval" value="${settings.request_interval}" min="0.01" max="30" step="0.01">
+                <div class="field-error" id="setIntervalError" aria-live="polite"></div>
             </div>
             <div class="settings-divider"></div>
             <div class="form-group">
-                <label>定时自动领取</label>
+                <label for="setScheduleTime">定时自动领取</label>
                 <div class="schedule-row">
                     <input type="time" id="setScheduleTime" value="${schedTime}" class="schedule-time-input">
                     <label class="toggle-rect">
@@ -4048,10 +4437,11 @@ function showSettings() {
                         <span class="toggle-rect-slider"></span>
                     </label>
                 </div>
+                <div class="field-error" id="setScheduleTimeError" aria-live="polite"></div>
             </div>
             <!-- Server酱领取情况通知 -->
             <div class="form-group">
-                <label>领取情况通知（<a href="https://sct.ftqq.com/login" target="_blank" class="label-link">Server酱</a>）<span class="info-icon" data-tooltip="只有通过计划任务领取权益时，才会进行一次通知">${INFO_ICON_SVG}</span></label>
+                <label for="setSchanKey">领取情况通知（<a href="https://sct.ftqq.com/login" target="_blank" rel="noopener noreferrer" class="label-link">Server酱</a>）<span class="info-icon" data-tooltip="只有通过计划任务领取权益时，才会进行一次通知">${INFO_ICON_SVG}</span></label>
                 <div class="schedule-row">
                     <input type="password" id="setSchanKey" value="${escapeHtml(schanKey)}" placeholder="SendKey" class="schan-key-input" onfocus="this.type='text'" onblur="if(this.value)this.type='password'">
                     <label class="toggle-rect">
@@ -4059,6 +4449,7 @@ function showSettings() {
                         <span class="toggle-rect-slider"></span>
                     </label>
                 </div>
+                <div class="field-error" id="setSchanKeyError" aria-live="polite"></div>
             </div>
             <div class="modal-actions">
                 <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
@@ -4067,7 +4458,7 @@ function showSettings() {
             <div class="modal-footer-info">
                 <span class="footer-version">etalien-auto <code id="versionCode"><span class="version-flip-inner"><span class="version-flip-face version-flip-front">v${escapeHtml(ver)}</span><span class="version-flip-face version-flip-back">高级配置</span></span></code></span>
                 <span class="footer-separator"></span>
-                <a href="https://github.com/JiangXu26710/etalien-auto" target="_blank" class="footer-icon-link">
+                <a href="https://github.com/JiangXu26710/etalien-auto" target="_blank" rel="noopener noreferrer" class="footer-icon-link">
                     <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
                     GitHub
                 </a>
@@ -4117,6 +4508,11 @@ async function doSaveSettings() {
     const check = validateAll(common);
     if (!check.ok) {
         showToast(check.msg, 'error');
+        // UX-012：在常用区对应字段下方显示内联错误（高级区字段无固定元素 id，跳过内联显示由 toast 反馈）
+        if (check.field) {
+            const fieldId = SETTINGS_FIELD_ID_MAP[check.field];
+            if (fieldId) showFieldError(fieldId, check.msg);
+        }
         if (btn) btn.disabled = false;
         // 若是高级区字段错误，提示用户从版本号入口进入修改
         const fieldSchema = (window.__settingsSchema || {})[check.field];
@@ -4125,6 +4521,8 @@ async function doSaveSettings() {
         }
         return;
     }
+    // 校验通过：清除所有常用区内联错误
+    Object.values(SETTINGS_FIELD_ID_MAP).forEach(clearFieldError);
 
     // 风控预警（与原项目一致：> 50 次/秒时弹二次确认）
     if (common.request_interval > 0) {
@@ -4189,7 +4587,7 @@ function showConfirmDialog(title, message, confirmText, cancelText) {
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay active';
         overlay.innerHTML = `
-            <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal" role="dialog" aria-modal="true" aria-label="${escapeHtml(title)}" onclick="event.stopPropagation()">
                 <h3>${escapeHtml(title)}</h3>
                 <p style="color:var(--text-secondary);font-size:13px;margin-bottom:4px;line-height:1.6">${escapeHtml(message)}</p>
                 <div class="modal-actions">
@@ -4199,14 +4597,33 @@ function showConfirmDialog(title, message, confirmText, cancelText) {
             </div>
         `;
         document.body.appendChild(overlay);
-        overlay.querySelector('#confirmCancel').onclick = () => {
+        const modal = overlay.querySelector('.modal');
+        // UX-004: 焦点陷阱 + 焦点恢复
+        if (typeof trapFocus === 'function') trapFocus(modal);
+        const cleanup = () => {
+            if (typeof releaseFocus === 'function') releaseFocus();
             overlay.remove();
+            document.removeEventListener('keydown', escHandler);
+        };
+        overlay.querySelector('#confirmCancel').onclick = () => {
+            cleanup();
             resolve(false);
         };
         overlay.querySelector('#confirmOk').onclick = () => {
-            overlay.remove();
+            cleanup();
             resolve(true);
         };
+        // UX-004: ESC 关闭（resolve false）
+        const escHandler = (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                cleanup();
+                resolve(false);
+            }
+        };
+        document.addEventListener('keydown', escHandler);
+        // 自动聚焦确认按钮（让键盘用户可直接 Enter 确认）
+        setTimeout(() => overlay.querySelector('#confirmOk')?.focus(), 0);
     });
 }
 
@@ -4264,7 +4681,7 @@ async function doSearch() {
         startLazyLoadPolling();
     } catch (e) {
         console.error('doSearch fetchAccountsPage error:', e);
-        showToast('搜索失败：' + (e.message || '未知错误'), 'error');
+        showToast('搜索失败：' + (e.message || ERROR_MESSAGES.UNKNOWN), 'error');
     }
 }
 
@@ -4357,6 +4774,15 @@ function showBatchState(state) {
     const target = card.querySelector('.as-' + state);
     if (target) target.classList.add('active');
     batchActionState = state;
+    // UX-006: roving tabindex — 仅当前可见态的可聚焦元素在 tab 序列中
+    const idle = card.querySelector('.as-idle');
+    if (idle) idle.setAttribute('tabindex', state === 'idle' ? '0' : '-1');
+    card.querySelectorAll('.as-select .action-text').forEach(el => {
+        el.setAttribute('tabindex', state === 'select' ? '0' : '-1');
+    });
+    card.querySelectorAll('.as-confirm .confirm-btn').forEach(el => {
+        el.setAttribute('tabindex', state === 'confirm' ? '0' : '-1');
+    });
 }
 
 // 回到 idle 态：清空待执行操作 + 切态
@@ -4426,7 +4852,7 @@ async function executeBatchAction() {
         try {
             phones = await fetchAllSearchResultPhones();
         } catch (e) {
-            showToast('获取搜索结果失败：' + (e.message || '未知错误'), 'error');
+            showToast('获取搜索结果失败：' + (e.message || ERROR_MESSAGES.UNKNOWN), 'error');
             backToIdle();
             return;
         }
@@ -4446,7 +4872,7 @@ async function executeBatchAction() {
                 return;
             }
         } catch (e) {
-            showToast('获取账号列表失败：' + (e.message || '未知错误'), 'error');
+            showToast('获取账号列表失败：' + (e.message || ERROR_MESSAGES.UNKNOWN), 'error');
             backToIdle();
             return;
         }
@@ -4476,7 +4902,7 @@ async function executeBatchAction() {
         pageCacheVersion++;
         refreshAll();
     } catch (e) {
-        showToast('批量操作失败：' + (e.message || '未知错误'), 'error');
+        showToast('批量操作失败：' + (e.message || ERROR_MESSAGES.UNKNOWN), 'error');
         backToIdle();
     }
 }
@@ -4523,7 +4949,7 @@ function showDeleteReconfirm(count) {
         const overlay = document.createElement('div');
         overlay.className = 'modal-overlay active';
         overlay.innerHTML = `
-            <div class="modal" onclick="event.stopPropagation()">
+            <div class="modal" role="dialog" aria-modal="true" aria-label="批量删除确认" onclick="event.stopPropagation()">
                 <h3>批量删除确认</h3>
                 <p>即将删除 <strong style="color:var(--error)">${count}</strong> 个账号，此操作不可撤销。</p>
                 <p style="margin-top:8px">请输入 <strong style="color:var(--error)">${DELETE_RECONFIRM_TEXT}</strong> 以确认：</p>
@@ -4542,7 +4968,23 @@ function showDeleteReconfirm(count) {
         const okBtn = overlay.querySelector('[data-act="ok"]');
         const modalEl = overlay.querySelector('.modal');
 
+        // UX-004 / UX-008：焦点陷阱 + 关闭后恢复焦点
+        if (typeof trapFocus === 'function') trapFocus(modalEl);
+
+        // UX-004：ESC 关闭（resolve false）
+        let closed = false;
+        const escHandler = (e) => {
+            if (e.key !== 'Escape' || closed) return;
+            e.preventDefault();
+            close(false);
+        };
+        document.addEventListener('keydown', escHandler);
+
         function close(result) {
+            if (closed) return;
+            closed = true;
+            document.removeEventListener('keydown', escHandler);
+            if (typeof releaseFocus === 'function') releaseFocus();
             if (modalEl) modalEl.classList.add('closing');
             setTimeout(() => { overlay.remove(); resolve(result); }, 180);
         }
@@ -4585,11 +5027,50 @@ function bindBatchActionEvents() {
         }
     });
 
+    // UX-006: idle 态键盘 Enter/Space → 进 select 态并聚焦首个操作项
+    const idleEl = card.querySelector('.as-idle');
+    if (idleEl) {
+        idleEl.addEventListener('keydown', (e) => {
+            if (batchActionState !== 'idle') return;
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                e.stopPropagation();
+                showBatchState('select');
+                const firstAction = card.querySelector('.as-select .action-text');
+                if (firstAction) firstAction.focus();
+            }
+        });
+    }
+
     // select 态：操作项点击
     card.querySelectorAll('.as-select .action-text').forEach(el => {
         el.addEventListener('click', (e) => {
             e.stopPropagation();
             onBatchActionSelect(el.dataset.action);
+        });
+        // UX-006: 键盘 Enter/Space 触发同等操作
+        el.addEventListener('keydown', (e) => {
+            if (batchActionState !== 'select') return;
+            if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                e.stopPropagation();
+                onBatchActionSelect(el.dataset.action);
+                const okBtn = card.querySelector('.as-confirm [data-act="ok"]');
+                if (okBtn) okBtn.focus();
+            } else if (e.key === 'Escape') {
+                e.preventDefault();
+                backToIdle();
+                if (idleEl) idleEl.focus();
+            } else if (e.key === 'ArrowRight' || e.key === 'ArrowLeft') {
+                // UX-006: 左右方向键在三个操作项间循环
+                e.preventDefault();
+                const items = Array.from(card.querySelectorAll('.as-select .action-text'));
+                const idx = items.indexOf(el);
+                const next = e.key === 'ArrowRight'
+                    ? items[(idx + 1) % items.length]
+                    : items[(idx - 1 + items.length) % items.length];
+                if (next) next.focus();
+            }
         });
     });
 
@@ -4603,6 +5084,18 @@ function bindBatchActionEvents() {
     if (cancelBtn) cancelBtn.addEventListener('click', (e) => {
         e.stopPropagation();
         onBatchActionCancel();
+        if (idleEl) idleEl.focus();
+    });
+    // UX-006: confirm 态 Escape 取消并回到 idle
+    card.querySelectorAll('.as-confirm .confirm-btn').forEach(el => {
+        el.addEventListener('keydown', (e) => {
+            if (batchActionState !== 'confirm') return;
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                onBatchActionCancel();
+                if (idleEl) idleEl.focus();
+            }
+        });
     });
 
     // 外部点击：select/confirm 态回到 idle（避免点空白处后卡片卡在中间态）
@@ -4623,22 +5116,30 @@ function bindBatchActionEvents() {
 
 // 全局禁用浏览器原生 title 悬停提示（不保留内容，未来动态新增的 title 也会被自动清除）
 function disableTitleGlobally() {
+    // 清除指定节点子树中所有 title 属性（包括节点自身）
+    const stripTitles = (root) => {
+        if (root.nodeType !== 1) return;
+        if (root.hasAttribute && root.hasAttribute('title')) root.removeAttribute('title');
+        root.querySelectorAll?.('[title]').forEach(el => el.removeAttribute('title'));
+    };
     // 初始扫描：清除现有 DOM 中所有 title 属性
     document.querySelectorAll('[title]').forEach(el => el.removeAttribute('title'));
-    // 监听未来动态插入的节点 + title 属性变化（覆盖 JS 动态设置的 title）
-    new MutationObserver((mutations) => {
-        for (const m of mutations) {
-            if (m.type === 'attributes' && m.attributeName === 'title') {
-                m.target.removeAttribute('title');
-            } else if (m.type === 'childList') {
-                m.addedNodes.forEach(n => {
-                    if (n.nodeType !== 1) return;
-                    if (n.hasAttribute('title')) n.removeAttribute('title');
-                    n.querySelectorAll?.('[title]').forEach(el => el.removeAttribute('title'));
-                });
-            }
-        }
-    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['title'] });
+    // PERF-06: 仅监听 title 属性变化，移除 childList/subtree 监听以减少大规模 DOM
+    // 插入/移除（如批量渲染账号卡片）时的 observer 触发达开。childList+subtree 会在
+    // 每次 DOM 变化（无论是否涉及 title）都触发 observer 进入防抖，造成无谓开销。
+    // 仅监听 attributes+attributeFilter=['title'] 后，observer 只在 title 属性被设置/修改
+    // 时触发，配合初始扫描可覆盖所有场景：现有 title 由初始扫描清除；未来 JS 动态设置
+    // title 由 attribute observer 捕获；动态插入带 title 的节点时浏览器会触发 attributes
+    // 事件（attributes 事件对动态插入节点同样有效）。
+    let debounceTimer = null;
+    new MutationObserver(() => {
+        if (debounceTimer) return;
+        debounceTimer = setTimeout(() => {
+            debounceTimer = null;
+            // 重新扫描整个文档子树，确保所有 title 属性最终被移除（不会因防抖遗漏）
+            stripTitles(document.documentElement);
+        }, 50);
+    }).observe(document.documentElement, { attributes: true, subtree: true, attributeFilter: ['title'] });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -4660,13 +5161,32 @@ document.addEventListener('DOMContentLoaded', () => {
     bindClaimDebug();
     // 4.1.3 初始化翻面状态：fromAngle === targetAngle，跳过动画直接设置最终态
     setClaimFlipState(FLIP_STATE.IDLE_FRONT);
-    setTimeout(() => {
+    // UX-013：splash 隐藏添加超时 fallback + load 事件兜底，避免 transitionend 未触发时 splash 卡死
+    const hideSplash = () => {
         const splash = document.getElementById('splash');
-        if (splash) {
-            splash.classList.add('fade-out');
-            splash.addEventListener('transitionend', () => splash.remove());
-        }
-    }, 300);
+        if (!splash) return;
+        if (splash.dataset.removed) return;
+        splash.dataset.removed = '1';
+        splash.classList.add('fade-out');
+        // transitionend 监听 + setTimeout 兜底（reduced-motion 模式下 transition 被禁用，必须靠兜底移除）
+        let removed = false;
+        const remove = () => {
+            if (removed) return;
+            removed = true;
+            splash.remove();
+        };
+        splash.addEventListener('transitionend', remove);
+        setTimeout(remove, 1000);  // 1s 兜底（含 reduced-motion 0.01ms + 网络兜底）
+    };
+    // 最短 300ms 显示，避免启动过快 splash 一闪而过；window.load 后再兜底调用一次
+    setTimeout(hideSplash, 300);
+    if (document.readyState === 'complete') {
+        // 已 load 完成时直接走 300ms 兜底
+    } else {
+        window.addEventListener('load', () => setTimeout(hideSplash, 500));
+    }
+    // 极端情况兜底：5s 后强制移除（避免卡死）
+    setTimeout(hideSplash, 5000);
 });
 
 // 初始化按钮涟漪按压反馈：mousedown 时从鼠标位置生成金色渐变涟漪圆，0.5s 扩散淡出。
@@ -4841,6 +5361,16 @@ function initRipple() {
         // 准备初始 1 个新下标（单次切换）
         const newIndices = [getNextIndex()];
 
+        // UX-003：reduced-motion 模式下直接切换到新 tip，跳过 rAF 滑动动画
+        if (typeof prefersReducedMotion === 'function' && prefersReducedMotion()) {
+            currentIndex = newIndices[newIndices.length - 1];
+            buildTrack();
+            applyTransform(true);
+            updateTooltip();
+            updateState();
+            return;
+        }
+
         // 重建 track：当前 tip + 1 个新 tip
         tipTrack.innerHTML = '';
         const cur = document.createElement('div');
@@ -4955,6 +5485,10 @@ function initRipple() {
 
     // 单段动画结束处理
     function finishAnimationStep() {
+        // PERF-09: 早期返回，避免 setTimeout 兜底在 rAF 已完成后冗余触发
+        // （rAF 末尾会调用 finishAnimationStep 并将 isSwitching 置 false，
+        // setTimeout 兜底若再触发可直接跳过清理与状态推进）
+        if (!isSwitching) return;
         // 清理 rAF 和 setTimeout
         if (rafId) {
             cancelAnimationFrame(rafId);
@@ -5024,7 +5558,7 @@ function initRipple() {
     }
 
     // 持久化 tip 可见性到 /api/settings，成功后刷新前端缓存
-    // 失败处理：仅 console.warn，不回滚 UI（用户已看到的交互结果优先）
+    // 失败处理：console.warn + showToast 给用户可见反馈（UI 不回滚，用户已看到的交互结果优先）
     async function persistTipVisibility(visible) {
         try {
             const res = await fetch('/api/settings', {
@@ -5034,6 +5568,10 @@ function initRipple() {
             });
             if (!res.ok) {
                 console.warn('tip 可见性持久化失败', res.status);
+                // EH-09: 给用户可见反馈，告知本次切换未持久化，下次启动会回退
+                if (typeof showToast === 'function') {
+                    showToast('tip 可见性保存失败，下次启动将回退到上次保存的值', 'error');
+                }
             } else {
                 // 复用主项目已有的缓存刷新函数，避免下次 getSettingValue 读到旧值
                 if (typeof refreshSettingsCache === 'function') {
@@ -5042,6 +5580,10 @@ function initRipple() {
             }
         } catch (err) {
             console.warn('tip 可见性持久化请求异常', err);
+            // EH-09: 网络异常同样给出可见反馈
+            if (typeof showToast === 'function') {
+                showToast('tip 可见性保存失败，下次启动将回退到上次保存的值', 'error');
+            }
         }
     }
 
@@ -5078,42 +5620,7 @@ function initRipple() {
         // 右击切换可见性
         tipModule.addEventListener('contextmenu', (e) => {
             e.preventDefault();
-            hidden = !hidden;
-            tipModule.classList.toggle('is-hidden', hidden);
-            if (hidden) {
-                paused = true;
-                clearInterval(timer);
-                // 动画进行中右击隐藏：立即终止动画并归位，避免隐藏态下动画结束后继续消费
-                if (animState) {
-                    // 取消 rAF 动画
-                    if (rafId) {
-                        cancelAnimationFrame(rafId);
-                        rafId = null;
-                    }
-                    if (animState.timeoutId) {
-                        clearTimeout(animState.timeoutId);
-                    }
-                    // 更新 currentIndex 到当前动画应到达的最终 tip
-                    animState.slidCount += animState.slidingCount;
-                    currentIndex = animState.newIndices[animState.slidCount - 1];
-                    buildTrack();
-                    applyTransform(true);
-                    isSwitching = false;
-                    animState = null;
-                    // 重置 JS 动画状态变量，避免残留
-                    currentY = 0;
-                    animTargetY = 0;
-                    lastFrameMs = 0;
-                }
-            } else {
-                paused = false;
-                applyTransform(true);
-                updateTooltip();
-                startTimer();
-            }
-            updateState();
-            // 立即持久化到 settings.json
-            persistTipVisibility(!hidden);
+            window.toggleTipVisibility();
         });
 
         // 窗口失焦时暂停（避免后台轮播）
@@ -5128,6 +5635,51 @@ function initRipple() {
             }
         });
     }
+
+    // UX-010：暴露键盘可触发的切换函数（Alt+T 快捷键调用，与右击走同一套逻辑）
+    window.toggleTipVisibility = function() {
+        const tipModule = getTipModule();
+        if (!tipModule) return;
+        hidden = !hidden;
+        tipModule.classList.toggle('is-hidden', hidden);
+        if (hidden) {
+            paused = true;
+            clearInterval(timer);
+            // 动画进行中隐藏：立即终止动画并归位，避免隐藏态下动画结束后继续消费
+            if (animState) {
+                // 取消 rAF 动画
+                if (rafId) {
+                    cancelAnimationFrame(rafId);
+                    rafId = null;
+                }
+                if (animState.timeoutId) {
+                    clearTimeout(animState.timeoutId);
+                }
+                // 更新 currentIndex 到当前动画应到达的最终 tip
+                animState.slidCount += animState.slidingCount;
+                currentIndex = animState.newIndices[animState.slidCount - 1];
+                buildTrack();
+                applyTransform(true);
+                isSwitching = false;
+                animState = null;
+                // 重置 JS 动画状态变量，避免残留
+                currentY = 0;
+                animTargetY = 0;
+                lastFrameMs = 0;
+            }
+        } else {
+            paused = false;
+            applyTransform(true);
+            updateTooltip();
+            startTimer();
+        }
+        updateState();
+        // 立即持久化到 settings.json
+        persistTipVisibility(!hidden);
+        if (typeof showToast === 'function') {
+            showToast(hidden ? '提示轮播已隐藏（Alt+T 显示）' : '提示轮播已显示', 'info');
+        }
+    };
 
     // 暴露给外部：页面加载后调用，读取 show_tip 并启动轮播
     window.initTipModule = function() {

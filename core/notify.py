@@ -14,7 +14,8 @@ import time
 
 import requests
 
-from core.config import load_settings
+from core.config import load_settings, SENDKEY_PATTERN
+from core.privacy import mask_label
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +23,13 @@ logger = logging.getLogger(__name__)
 SCHAN_API_BASE = "https://sctapi.ftqq.com"
 TIMEOUT = 10  # 请求超时（秒）
 
-# Server酱 SendKey 格式：SCT<数字><字母>（如 SCT123456abcdef...）
-# 限制为字母数字以避免误填含 / ? # 等字符构造异常 URL
-SENDKEY_PATTERN = re.compile(r'^SCT[A-Za-z0-9]+$')
+# Markdown 特殊字符（用于 label 转义，避免 name/remark 中含 * _ # [ ] 时破坏格式）
+_MARKDOWN_SPECIAL_RE = re.compile(r'([*_#\[\]])')
+
+
+def _escape_markdown(s: str) -> str:
+    """转义 Markdown 特殊字符，避免 name/remark 输入破坏通知正文格式。"""
+    return _MARKDOWN_SPECIAL_RE.sub(r'\\\1', s)
 
 
 def send_schan(sendkey: str, title: str, desp: str) -> bool:
@@ -46,8 +51,9 @@ def send_schan(sendkey: str, title: str, desp: str) -> bool:
     try:
         resp = requests.post(url, data=payload, timeout=TIMEOUT)
         data = resp.json()
-    except (requests.RequestException, ValueError) as e:
-        logger.error("Server酱请求异常: %s", e)
+    except (requests.RequestException, ValueError):
+        # EH-002: 用 logger.exception 保留 stack trace，便于定位是网络异常还是 JSON 解析失败
+        logger.exception("Server酱请求异常")
         return False
 
     code = data.get("code")
@@ -62,9 +68,18 @@ def send_schan(sendkey: str, title: str, desp: str) -> bool:
 
 
 def _build_problem_line(r: dict) -> str:
-    """构造问题账号列表的一行描述（不含前导 -）。"""
+    """构造问题账号列表的一行描述（不含前导 -）。
+
+    label 中的手机号会被脱敏（CORE-004），name/remark 中的 Markdown 特殊字符
+    会被转义（CORE-015），避免破坏通知正文格式。
+
+    顺序说明：先 _escape_markdown 再 mask_label。若颠倒顺序，mask_label 引入的
+    `*` 会被 _escape_markdown 错误转义为 `\*`，破坏脱敏格式的可读性。
+    """
     status = r["status"]
-    label = r["label"]
+    # 先转义原始 label 中的 Markdown 特殊字符（手机号仅含数字，不受 _escape_markdown 影响）
+    # 再对转义后的字符串做手机号脱敏（脱敏引入的 * 不应被转义）
+    label = mask_label(_escape_markdown(r["label"]))
     if status == "need_login":
         return f"{label}: 登录状态过期"
     if status == "network_error":

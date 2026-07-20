@@ -4,6 +4,9 @@ package error;
 
 // 用于解析 4xx/5xx 错误响应（core/client.py 的 _parse_protobuf_error 使用）
 message Error {
-    int32 code = 1;    // 业务错误码（如 401/403/16 表示认证失败）
+    // 业务错误码（401/403/16 表示认证失败，由 _is_auth_error 判定）
+    // - 401/403：标准 HTTP 语义，token 失效或权限不足
+    // - 16：业务自定义码，逆向自 APK 抓包（疑似 token 过期或账号冻结，待确认）
+    int32 code = 1;
     string msg = 2;    // 错误消息
 }

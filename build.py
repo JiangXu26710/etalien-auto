@@ -35,12 +35,13 @@ def main():
     # 返回码：0=OK，1=版本过低，2=未安装
     check_result = subprocess.run(
         [VENV_PYTHON, "-c",
-         "import sys\n"
+         "import sys, re\n"
          "try:\n"
          "    import PyInstaller\n"
          "except ImportError:\n"
          "    sys.exit(2)\n"
-         "v = int(PyInstaller.__version__.split('.')[0])\n"
+         "m = re.match(r'(\\d+)', PyInstaller.__version__)\n"
+         "v = int(m.group(1)) if m else 0\n"
          "print(PyInstaller.__version__)\n"
          "sys.exit(0 if v >= 6 else 1)"],
         capture_output=True, text=True,
@@ -62,7 +63,8 @@ def main():
         sys.exit(result.returncode)
 
     # 验证打包产物存在（PyInstaller 静默失败时 dist 可能未生成）
-    dist_exe = os.path.join(os.path.dirname(__file__), "dist", "etalien-auto", "etalien-auto.exe")
+    exe_suffix = ".exe" if sys.platform == "win32" else ""
+    dist_exe = os.path.join(os.path.dirname(__file__), "dist", "etalien-auto", f"etalien-auto{exe_suffix}")
     if not os.path.exists(dist_exe):
         print(f"[ERROR] 打包产物不存在: {dist_exe}（PyInstaller 可能静默失败）")
         sys.exit(1)

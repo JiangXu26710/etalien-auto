@@ -5,16 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>外星仔加速器 - 免广告自动领时长 F</title>
 <link rel="stylesheet" href="style.css">
-<style>
-#splash{position:fixed;inset:0;z-index:9999;background:#0a0a0c;display:flex;align-items:center;justify-content:center;transition:opacity 0.4s cubic-bezier(0.4,0,0.2,1)}
-#splash.fade-out{opacity:0;pointer-events:none}
-#splash-inner{display:flex;flex-direction:column;align-items:center;gap:16px}
-#splash-logo{width:48px;height:48px;border-radius:12px;animation:splashPulse 1.5s ease-in-out infinite}
-#splash-bar{width:120px;height:3px;background:#2a2a32;border-radius:2px;overflow:hidden}
-#splash-bar::after{content:'';display:block;width:40%;height:100%;background:linear-gradient(90deg,#c9a84c,#e0c878);border-radius:2px;animation:splashSlide 1.2s ease-in-out infinite}
-@keyframes splashPulse{0%,100%{transform:scale(1);opacity:0.8}50%{transform:scale(1.05);opacity:1}}
-@keyframes splashSlide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
-</style>
 </head>
 <body>
 <div id="splash"><div id="splash-inner"><img id="splash-logo" src="logo.png" alt="外星仔加速器"><div id="splash-bar"></div></div></div>
@@ -36,7 +26,7 @@
       <!-- 第一张：启用 / 总数 合并卡片 -->
       <div class="stat-card" id="statCount">
         <div class="stat-content">
-          <div class="stat-count">
+          <div class="stat-count" aria-live="polite" aria-atomic="true">
             <span id="enabledCount">0</span><span class="sep">/</span><span class="total" id="totalCount">0</span>
           </div>
           <div class="stat-label">启用 / 总数</div>
@@ -46,24 +36,24 @@
       <!-- 第二张：批量操作卡片（三态变形 idle→select→confirm） -->
       <div class="stat-card is-action" id="batchAction">
         <div class="action-morph">
-          <!-- 态0 idle：默认 -->
-          <div class="action-state as-idle active">
+          <!-- 态0 idle：默认（UX-006: tabindex 由 showBatchState 动态管理） -->
+          <div class="action-state as-idle active" tabindex="0" role="button" aria-label="批量操作（回车/空格展开选项）">
             <svg class="idle-icon" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1"></rect><rect x="14" y="3" width="7" height="7" rx="1"></rect><rect x="3" y="14" width="7" height="7" rx="1"></rect><rect x="14" y="14" width="7" height="7" rx="1"></rect></svg>
             <span class="idle-text">批量操作</span>
           </div>
           <!-- 态1 select：启用·禁用·删除 -->
           <div class="action-state as-select">
-            <span class="action-text" data-action="enable">启用</span>
+            <span class="action-text" data-action="enable" tabindex="-1" role="button" aria-label="批量启用">启用</span>
             <span class="action-sep">·</span>
-            <span class="action-text" data-action="disable">禁用</span>
+            <span class="action-text" data-action="disable" tabindex="-1" role="button" aria-label="批量禁用">禁用</span>
             <span class="action-sep">·</span>
-            <span class="action-text is-danger" data-action="delete">删除</span>
+            <span class="action-text is-danger" data-action="delete" tabindex="-1" role="button" aria-label="批量删除">删除</span>
           </div>
           <!-- 态2 confirm：确认文字 + ✓/✗ -->
           <div class="action-state as-confirm">
-            <span class="confirm-text" id="confirmText">确认？</span>
-            <button type="button" class="confirm-btn ok" data-act="ok"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></button>
-            <button type="button" class="confirm-btn cancel" data-act="cancel"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
+            <span class="confirm-text" id="confirmText" aria-live="polite">确认？</span>
+            <button type="button" class="confirm-btn ok" data-act="ok" tabindex="-1" aria-label="确认执行批量操作"><svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg></button>
+            <button type="button" class="confirm-btn cancel" data-act="cancel" tabindex="-1" aria-label="取消批量操作"><svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></button>
           </div>
         </div>
       </div>
@@ -71,7 +61,7 @@
       <!-- 第三张：搜索卡片（折叠态占 1 格，展开态覆盖整行） -->
       <div class="search-card" id="searchCard">
         <div class="search-field">
-          <input type="text" class="search-input" id="searchInput" placeholder="搜索用户名 / 手机号 / 备注..." autocomplete="off" />
+          <input type="text" class="search-input" id="searchInput" placeholder="搜索用户名 / 手机号 / 备注..." autocomplete="off" aria-label="搜索账号" />
           <div class="search-underline"></div>
         </div>
       </div>
@@ -99,7 +89,7 @@
           添加账号
         </button>
       </div>
-      <div class="tip-module" id="tipModule" title="右击切换可见性 · 鼠标悬停暂停">
+      <div class="tip-module" id="tipModule" role="status" aria-label="提示信息轮播（Alt+T 切换可见性，鼠标悬停暂停）" title="右击切换可见性 · 鼠标悬停暂停">
           <span class="tip-prefix">tip:</span>
           <div class="tip-viewport">
               <div class="tip-track" id="tipTrack"></div>
@@ -126,14 +116,14 @@
 </div>
 
 <div class="modal-overlay" id="modalOverlay" onmousedown="modalMouseDownTarget=event.target" onclick="closeModal(event)">
-  <div class="modal" id="modalContent" onclick="event.stopPropagation()">
+  <div class="modal" id="modalContent" role="dialog" aria-modal="true" onclick="event.stopPropagation()">
   </div>
 </div>
 
 <div class="modal-overlay" id="resultOverlay" onclick="closeResultModal(event)">
-  <div class="result-modal" id="resultModalContent" onclick="event.stopPropagation()">
+  <div class="result-modal" id="resultModalContent" role="dialog" aria-modal="true" aria-labelledby="resultModalTitle" onclick="event.stopPropagation()">
     <div class="result-modal-header">
-      <h2>领取结果</h2>
+      <h2 id="resultModalTitle">领取结果</h2>
       <button class="result-modal-close" onclick="closeResultModal()" aria-label="关闭">×</button>
     </div>
     <div class="result-summary" id="resultSummary">
@@ -152,7 +142,7 @@
   </div>
 </div>
 
-<div class="toast-container" id="toastContainer"></div>
+<div class="toast-container" id="toastContainer" aria-live="polite" aria-atomic="true"></div>
 
 <!-- 标题栏右键菜单（用于"重载前端"等不常用功能入口） -->
 <div class="title-context-menu" id="titleContextMenu" hidden>

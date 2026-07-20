@@ -5,6 +5,7 @@ import sys
 import threading
 import logging
 import socket
+import stat
 import time
 import ctypes
 import winreg
@@ -255,6 +256,12 @@ class WindowApi:
         self._is_maximized = False
         self._server = server
         self._shutdown_called = False
+        # CONC-001: 保护 _shutdown_called 的 check-then-act 原子性。
+        # close() 启动后台线程后立即返回，JS 端可在 _shutdown 完成前再次调用 close()，
+        # 多个 _shutdown 线程可能都通过 _shutdown_called 检查后置 True，导致
+        # window.destroy() 被多次调用而崩溃。锁内仅做 check-then-act，锁外执行
+        # 长耗时清理（_server.shutdown / 等待领取完成），避免阻塞其他线程。
+        self._shutdown_lock = threading.Lock()
 
     def minimize(self):
         """最小化窗口。"""
@@ -315,8 +322,8 @@ class WindowApi:
             if not isinstance(hwnd, int):
                 return  # mock 环境（MagicMock 返回非 int）
             self._is_maximized = bool(ctypes.windll.user32.IsZoomed(hwnd))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("sync_maximized_state failed: %s", e, exc_info=True)
 
     def get_position(self):
         """获取窗口当前位置。
@@ -351,15 +358,22 @@ class WindowApi:
 
         由 close() 启动，避免阻塞 pywebview JS→Python 桥接线程。
         _shutdown_called 保证幂等性：多次调用只执行一次关闭逻辑。
+
+        CONC-001: _shutdown_called 的 check-then-act 由 _shutdown_lock 保护。
+        锁内仅做检查与置位，锁外执行长耗时清理（等待领取 / shutdown 服务器 /
+        destroy 窗口），避免长时间持锁阻塞 close() 的快速返回。
         """
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
+        # 加锁保护 check-then-act：确保多次并发调用只通过一次
+        with self._shutdown_lock:
+            if self._shutdown_called:
+                return
+            self._shutdown_called = True
         logger.info("正在关闭...")
 
-        # 轮询等待领取任务完成（最长 30 秒超时），避免在任务运行中关闭导致状态不一致。
+        # 轮询等待领取任务完成（最长 10 秒超时），避免在任务运行中关闭导致状态不一致。
         # 通过 gui_api.claim_mgr.running 动态访问，避免布尔值导入时被拷贝导致读取到旧值。
-        max_wait = 30
+        # PERF-008: 由 30s 缩短为 10s 减少用户等待；超时时记录进度快照便于事后排查。
+        max_wait = 10
         waited = 0
         while waited < max_wait:
             if not gui_api.claim_mgr.running:
@@ -368,6 +382,20 @@ class WindowApi:
                 logger.warning("有领取任务正在运行，等待任务完成...")
             time.sleep(1)
             waited += 1
+
+        # GUI-012 / PERF-008: 超时强制关闭时转储当前进度到日志，便于用户事后排查
+        if waited == max_wait:
+            try:
+                progress_snapshot = gui_api.claim_mgr.get_progress()
+                running_count = len(progress_snapshot.get("progress", []))
+                logger.warning(
+                    "等待领取任务完成超时（%ds），强制关闭。当前仍有 %d 个账号进度未完成，"
+                    "详情见 /api/claim/last-result 或日志",
+                    max_wait, running_count,
+                )
+            except Exception as e:
+                logger.warning("等待领取任务完成超时（%ds），强制关闭，可能丢失进度（转储进度失败: %s）",
+                               max_wait, e)
 
         # 删除端口文件（CLI 通知 GUI 的依据，退出时清理）
         _delete_gui_port()
@@ -543,12 +571,17 @@ def _write_gui_port(port: int, token: str):
     文件格式为 JSON：{"port": <int>, "token": <hex str>}。
     token 用于 CLI 请求 /api/cli-trigger-claim 时的 Bearer 认证。
 
+    GUI-011: 写入后立即 chmod 0600 加固文件权限，防止本机其他用户读取 token。
+    Windows 上 os.chmod 行为有限，但 S_IRUSR | S_IWUSR 会移除其他用户的访问权限。
+
     写入失败仅记日志，不影响 GUI 启动（CLI 通知失败时 CLI 自身会退出）。
     """
     port_file = os.path.join(CONFIG_DIR, ".gui_port")
     try:
         with open(port_file, "w", encoding="utf-8") as f:
             json.dump({"port": port, "token": token}, f)
+        # 加固权限为 0600（仅当前用户可读写），防止其他用户读取 token
+        os.chmod(port_file, stat.S_IRUSR | stat.S_IWUSR)
     except OSError as e:
         logger.warning("写入端口文件 %s 失败: %s", port_file, e)
 
@@ -576,6 +609,12 @@ def main():
         # 已有实例在运行（GUI 或 CLI），直接退出（不弹窗、不区分实例类型）
         logger.info("已有实例在运行，GUI 退出")
         sys.exit(0)
+
+    # PERF-009: 注册 atexit 关闭 repo 单例的 SQLite 连接，触发 WAL checkpoint，
+    # 避免进程异常退出时 accounts.db-wal 文件未 checkpoint 影响下次启动耗时。
+    # repo.close() 内部已 try/except Exception 包裹，不会抛出影响退出流程。
+    import atexit
+    atexit.register(gui_api.repo.close)
 
     # 迁移旧版 settings.json（补全缺失字段，幂等；在初始化缓存前执行，确保缓存含完整字段）
     migrate_settings()
@@ -680,8 +719,8 @@ def main():
             try:
                 api._server.shutdown()
                 logger.info("服务器已关闭")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("关闭服务器时出错（退出清理）: %s", e)
 
     # 关闭 devnull 文件对象，避免文件描述符泄漏
     for f in _devnull_files:

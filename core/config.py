@@ -25,6 +25,11 @@ VERSION = "1.0.1"
 # 定时执行时间格式校验正则（HH:MM）
 SCHEDULE_TIME_PATTERN = re.compile(r'^\d{2}:\d{2}$')
 
+# Server酱 SendKey 格式校验正则（SCT 开头 + 字母数字）
+# 与 core/notify.py 共享：notify.py 在发送前再次校验，避免运行时被改动
+# 限制为字母数字以避免误填含 / ? # 等字符构造异常 URL
+SENDKEY_PATTERN = re.compile(r'^SCT[A-Za-z0-9]+$')
+
 # Chromium/WebView2 不安全端口黑名单（来源：Chromium 源码 net/base/port_util.cc 的 kRestrictedPorts）
 # pywebview 在 Windows 上使用 WebView2（Chromium 内核）渲染，访问这些端口的 URL 会被拦截（ERR_UNSAFE_PORT）。
 # gui_port 命中此黑名单时，Flask 服务器能正常监听，但 WebView2 无法加载页面 → 白屏。
@@ -76,7 +81,7 @@ SETTINGS_SCHEMA = {
     "mobile_max_rounds": {"type": int,   "min": 1,    "max": 200,  "advanced": True,  "label": "手机权益领取最大轮数", "description": ""},
     "schedule_time":     {"type": str,                            "advanced": False, "label": "定时自动领取", "description": "定时自动领取的触发时间"},
     "schan_enabled":     {"type": bool,                            "advanced": False, "label": "领取情况通知", "description": "是否开启 Server 酱通知"},
-    "schan_key":         {"type": str,                            "advanced": False, "label": "Server 酱 SendKey", "description": "Server 酱 SendKey"},
+    "schan_key":         {"type": str,                            "advanced": False, "label": "Server 酱 SendKey", "description": "Server 酱 SendKey", "pattern": SENDKEY_PATTERN, "pattern_skip_empty": True},
     "max_retries":       {"type": int,   "min": 0,    "max": 10,   "advanced": True,  "label": "本地原因导致请求失败后的重试次数", "description": ""},
     "retry_delay":       {"type": float, "min": 0.01, "max": 30.0, "advanced": True,  "label": "本地原因导致请求失败后的每轮重试间隔", "description": ""},
     "gui_port":          {"type": int,   "min": 1,    "max": 65535, "advanced": True,  "nullable": True, "actual_key": "actual_gui_port", "forbidden": UNSAFE_PORTS, "label": "GUI 监听端口", "description": "留空时由系统自动分配；填入端口则优先尝试，失败回退到自动分配"},
@@ -88,10 +93,42 @@ SETTINGS_SCHEMA = {
     "show_tip":              {"type": bool,                            "advanced": True, "label": "显示 tip 提示", "description": "", "display_on": "显示TIP", "display_off": "隐藏TIP"},
 }
 
+# advanced=True 的字段集合（由 SETTINGS_SCHEMA 推导，避免在多处硬编码导致不同步）
+ADVANCED_KEYS = frozenset(k for k, m in SETTINGS_SCHEMA.items() if m["advanced"])
+
 
 # settings.json 内存缓存：业务触发读取（reload_settings/save_settings），不在轮询路径上读磁盘
 _settings_cache: dict | None = None
 _settings_lock = Lock()
+
+# PERF-006: 残留 .settings.tmp 清理标志，进程生命周期内只清理一次
+_temp_cleanup_done = False
+_temp_cleanup_lock = Lock()
+
+
+def _cleanup_temp_files_once() -> None:
+    """模块加载后首次调用时清理同目录残留 .settings.tmp 文件（幂等，只执行一次）。
+
+    PERF-006: 原 _atomic_write 每次写入都遍历目录清理残留临时文件，但残留只在
+    进程崩溃时产生。改为启动后首次写入时清理一次即可，运行期间不再遍历目录。
+    """
+    global _temp_cleanup_done
+    if _temp_cleanup_done:
+        return
+    with _temp_cleanup_lock:
+        if _temp_cleanup_done:
+            return
+        tmp_dir = os.path.dirname(SETTINGS_FILE)
+        try:
+            for f in os.listdir(tmp_dir):
+                if f.endswith(".settings.tmp"):
+                    try:
+                        os.unlink(os.path.join(tmp_dir, f))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        _temp_cleanup_done = True
 
 
 def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
@@ -136,6 +173,13 @@ def validate_settings(settings: dict) -> tuple[bool, str | None, str | None]:
         # enum 校验：value 必须在 options 的 key 集合中
         if "options" in schema and value not in schema["options"]:
             return False, f"设置 {key} 的值 {value!r} 不在允许的选项中", "validation"
+        # pattern 正则校验（如 schan_key 的 SendKey 格式）
+        # pattern_skip_empty=True 时空字符串跳过校验（允许未配置时为空）
+        if "pattern" in schema:
+            if schema.get("pattern_skip_empty", False) and value == "":
+                pass
+            elif not schema["pattern"].match(str(value)):
+                return False, f"设置 {key} 的值格式错误", "validation"
     if "schedule_time" in settings:
         if not SCHEDULE_TIME_PATTERN.match(settings["schedule_time"]):
             return False, "时间格式错误，应为 HH:MM", "validation"
@@ -161,27 +205,21 @@ def _load_accounts_json(json_path: str = ACCOUNTS_FILE) -> list[dict]:
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to load accounts from %s: %s", json_path, e)
+        except (json.JSONDecodeError, OSError):
+            # EH-002: 用 logger.exception 保留 stack trace，便于定位是 json 解析失败还是 IO 错误
+            logger.exception("Failed to load accounts from %s", json_path)
             return []
     return []
 
 
 def _atomic_write(filepath: str, data: str) -> None:
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    # 清理同目录下残留的 .settings.tmp 文件（前次写入被 Ctrl+C/进程崩溃中断时遗留）
+    # PERF-006: 残留 .settings.tmp 清理由 _cleanup_temp_files_once 在首次写入时执行
+    # （进程生命周期内只清理一次），运行期间不再每次写入都遍历目录。
     # 注意：必须用专属后缀 .settings.tmp，不能用通用的 .tmp，否则会误删
     # core/db.py migrate_from_json 正在使用的 accounts.db.tmp
+    _cleanup_temp_files_once()
     tmp_dir = os.path.dirname(filepath)
-    try:
-        for f in os.listdir(tmp_dir):
-            if f.endswith(".settings.tmp"):
-                try:
-                    os.unlink(os.path.join(tmp_dir, f))
-                except OSError:
-                    pass
-    except OSError:
-        pass
     fd, tmp = tempfile.mkstemp(dir=tmp_dir, suffix=".settings.tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -222,8 +260,9 @@ def _read_settings_from_disk() -> dict:
             merged = dict(DEFAULT_SETTINGS)
             merged.update(data)
             return merged
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error("Failed to load settings: %s", e)
+        except (json.JSONDecodeError, OSError):
+            # EH-002: 用 logger.exception 保留 stack trace，便于定位 _read_settings_from_disk 失败原因
+            logger.exception("Failed to load settings")
             return dict(DEFAULT_SETTINGS)
     return dict(DEFAULT_SETTINGS)
 
@@ -266,19 +305,34 @@ def save_settings(settings: dict) -> None:
     新值但磁盘仍是旧值，后续 load_settings 走缓存读到未持久化的"幽灵配置"，重启后丢失）。
     调用方需捕获 OSError 以感知失败。
 
-    并发说明：写盘与缓存更新都在 _settings_lock 内执行，确保"磁盘值"与"缓存值"
-    来自同一次 save_settings 调用，避免并发 save 时的幽灵缓存（A 写盘 → B 写盘覆盖
-    → A 更新缓存 → B 更新缓存，中间状态缓存为 A 值但磁盘已是 B 值）。
-    代价：写盘期间阻塞 load_settings/reload_settings，但 save_settings 是低频操作
-    （用户改设置），可接受。
+    并发说明（PERF-007）：采用"先写盘再更新缓存"策略，写盘不持锁，仅在缓存更新时持锁。
+    - 写盘不持锁：避免杀毒扫描/磁盘繁忙时阻塞 load_settings/reload_settings（热路径
+      包括 get_account_status/claim_for_account 等并发只读场景）
+    - 缓存更新持锁：保证 _settings_cache 引用的原子切换，避免半更新状态被读出
+    - 风险权衡：并发 save 时，A 写盘 → B 写盘覆盖 → A 更新缓存 → B 更新缓存，
+      可能出现"中间状态缓存为 A 值但磁盘已是 B 值"的幽灵缓存。但 save_settings 是低频
+      操作（用户改设置），并发 save 概率极低；最终状态（所有 save 都完成后）缓存与磁盘
+      一致。监控 _atomic_write 耗时已保留（CONC-001）。
     """
     global _settings_cache
+    # CONC-001: 监控 _atomic_write 耗时，超过 1s 记 warning（杀毒扫描/磁盘繁忙时
+    # 可能阻塞数百毫秒）
+    _write_start = time.monotonic()
+    try:
+        _atomic_write(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=4))
+    except OSError:
+        # EH-002: 用 logger.exception 保留 stack trace，便于定位 _atomic_write 失败位置
+        logger.exception("Failed to save settings")
+        raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
+    finally:
+        elapsed = time.monotonic() - _write_start
+        if elapsed > 1.0:
+            logger.warning(
+                "save_settings _atomic_write took %.3fs (>1s threshold)",
+                elapsed,
+            )
+    # 写盘成功后再更新缓存（持锁，仅缓存更新需要锁）
     with _settings_lock:
-        try:
-            _atomic_write(SETTINGS_FILE, json.dumps(settings, ensure_ascii=False, indent=4))
-        except OSError as e:
-            logger.error("Failed to save settings: %s", e)
-            raise  # 写盘失败，保留旧缓存（与磁盘一致），向上传播让调用方感知
         _settings_cache = copy.deepcopy(settings)  # 缓存写入的深拷贝副本
 
 

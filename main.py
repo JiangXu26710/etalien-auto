@@ -1,5 +1,6 @@
 """CLI 入口：并发执行账号领取任务并输出结果。"""
 
+import atexit
 import ctypes
 import json
 import logging
@@ -13,7 +14,12 @@ import requests
 from core.config import reload_settings, migrate_settings, CONFIG_DIR, load_settings
 from core.db import DbAccountRepository, DB_PATH, is_db_valid
 from core.notify import send_claim_notification, send_schan
+from core.privacy import mask_label as _mask_label
 from core.service import run_concurrent_claim, format_duration
+
+# 跨平台守卫：本项目仅支持 Windows（依赖 Named Mutex / pywebview / WebView2 等 Win32 机制）
+if sys.platform != "win32":
+    raise RuntimeError("仅支持 Windows")
 
 # CLI 退出码定义
 EXIT_OK = 0              # 全部成功
@@ -22,9 +28,10 @@ EXIT_ERROR = 2           # 全部失败
 EXIT_NEED_LOGIN = 3      # 有账号需要登录
 EXIT_NO_ACCOUNTS = 4     # 无启用账号
 EXIT_NETWORK_ERROR = 5   # 网络/服务端错误（有账号因网络或服务端错误未能领取）
-EXIT_ALREADY_RUNNING = 6  # 已有实例在运行（统一 Mutex 已存在）/ 端口文件残留但 GUI 已退出
+EXIT_ALREADY_RUNNING = 6  # GUI 端口文件异常或已有实例在运行（统一 Mutex 已存在 / 端口文件缺失/无效/残留但 GUI 已退出）
 EXIT_NO_DB = 7           # 无 db，需用户介入迁移（仅 GUI 能创建 db）
-EXIT_NOTIFIED_GUI = 8    # CLI 通知 GUI 触发领取后退出
+EXIT_NOTIFIED_GUI = 8    # CLI 通知 GUI 触发领取后退出（202/409：GUI 已收到通知）
+EXIT_NOTIFY_FAILED = 9   # CLI 通知 GUI 触发领取失败（403/500/其他：GUI 响应异常）
 
 # 标志位：_setup_logging 完成后置 True，_send_no_db_notification 据此判断是否可用 logger
 # 在 _setup_logging 失败/未调用时，_send_no_db_notification 的 logger.error 无法写入 cli.log
@@ -58,18 +65,6 @@ def _setup_logging(log_file: str | None = None):
         handlers=handlers,
     )
     _logging_ready = True
-
-
-# 手机号脱敏正则（1 开头的 11 位数字，覆盖中国大陆号段）
-_PHONE_RE = re.compile(r'1[3-9]\d{9}')
-
-
-def _mask_label(label: str) -> str:
-    """对 label 中的 11 位手机号脱敏，保留前 3 后 4 位（如 138****1234）。
-
-    用于日志输出，避免 cli.log 长期轮转保留导致手机号泄露。
-    """
-    return _PHONE_RE.sub(lambda m: m.group(0)[:3] + '****' + m.group(0)[-4:], label)
 
 
 def main(auto_close: bool = False):
@@ -167,7 +162,9 @@ def main(auto_close: bool = False):
         try:
             send_claim_notification(results)
         except Exception:
-            logger.exception("Server酱通知发送异常（不影响退出码）")
+            # EH-10: 通知失败时记录完整栈到日志（auto_close 模式无控制台，仅日志可查）。
+            # 不影响退出码（计划任务模式下通知是辅助功能，领取结果已写入 cli.log）。
+            logger.exception("Server酱通知发送异常（不影响退出码，领取结果详见 cli.log）")
 
     # 退出码优先级：NEED_LOGIN > NETWORK_ERROR > ERROR > PARTIAL > OK
     # need_login/network_errors 优先返回，确保登录过期/网络问题不被其他状态掩盖
@@ -210,7 +207,7 @@ def _cli_exit(code: int, auto_close: bool):
     if not auto_close:
         try:
             input("按回车键退出...")
-        except Exception:
+        except (EOFError, OSError):
             pass
     sys.exit(code)
 
@@ -221,7 +218,8 @@ def _notify_gui_trigger_claim() -> int:
     读 .gui_port 文件（JSON 格式：{"port": <int>, "token": <hex str>}）→
     HTTP POST /api/cli-trigger-claim，携带 Authorization: Bearer <token>。
     - 文件不存在/空/无效 → EXIT_ALREADY_RUNNING（已运行的是 CLI）
-    - 收到 HTTP 响应（202/409/其他状态码）→ EXIT_NOTIFIED_GUI
+    - 收到 HTTP 202/409 → EXIT_NOTIFIED_GUI（GUI 已收到通知）
+    - 收到 HTTP 403/500/其他 → EXIT_NOTIFY_FAILED（GUI 响应异常，未触发领取）
     - 连接失败/超时 → EXIT_ALREADY_RUNNING（端口文件残留但 GUI 已退出）
     """
     logger = logging.getLogger(__name__)
@@ -262,7 +260,8 @@ def _notify_gui_trigger_claim() -> int:
     try:
         resp = requests.post(url, timeout=5, headers=headers)
     except (requests.ConnectionError, requests.Timeout) as e:
-        print(f"无法连接 GUI，可能已退出（端口文件残留，下次 GUI 启动会自动覆盖）: {e}")
+        # print 给简短提示，logger 给详细原因（MAIN-003：双输出差异化）
+        print("无法连接 GUI，可能已退出（端口文件残留）")
         logger.warning("GUI 连接失败（端口文件残留，GUI 可能已退出）: %s", e)
         return EXIT_ALREADY_RUNNING
 
@@ -281,11 +280,11 @@ def _notify_gui_trigger_claim() -> int:
         # 403 通常由 GUI 端 _check_origin 拦截（CSRF/Origin 校验失败）
         print(f"GUI 响应异常: HTTP {resp.status_code}")
         logger.warning("GUI 触发被拒绝（可能被 CSRF/Origin 拦截）: HTTP 403, body=%s", body_preview)
-        return EXIT_NOTIFIED_GUI
+        return EXIT_NOTIFY_FAILED
     else:
         print(f"GUI 响应异常: HTTP {resp.status_code}")
         logger.warning("GUI 响应异常: HTTP %s, body=%s", resp.status_code, body_preview)
-        return EXIT_NOTIFIED_GUI
+        return EXIT_NOTIFY_FAILED
 
 
 def _send_no_db_notification():
@@ -323,8 +322,7 @@ def cli_entry(auto_close: bool = False):
     """CLI 入口封装：统一 Mutex → 通知 GUI 或独立运行 → 无 db 发 Server酱 → 调用 main()。
 
     本函数不捕获 main() 抛出的 SystemExit，让其自然传播至 gui/app.py 外层处理
-    （保留退出码 0-5 的原 if not auto_close: input() 逻辑）。
-    仅对退出码 6/7/8 自行处理 print + input 等待回车。
+    （保留退出码 0-9 的语义：0-5 由 main() 抛 SystemExit，6/7/8/9 由 _cli_exit 直接退出）。
     非 SystemExit 的未捕获异常记录完整栈到 cli.log 后以 EXIT_ERROR 退出。
     """
     log_file = os.path.join(CONFIG_DIR, "cli.log")
@@ -340,6 +338,9 @@ def cli_entry(auto_close: bool = False):
         print("程序启动失败：无法创建进程锁")
         _cli_exit(EXIT_ALREADY_RUNNING, auto_close)
 
+    # 注册 atexit 显式释放 Mutex HANDLE（避免依赖 OS 自动回收，便于排查 HANDLE 泄漏）
+    atexit.register(lambda h=handle: ctypes.windll.kernel32.CloseHandle(h) if h else None)
+
     if already_exists:
         # 已有实例在运行，进入"通知 GUI"分支
         code = _notify_gui_trigger_claim()
@@ -351,7 +352,7 @@ def cli_entry(auto_close: bool = False):
         _cli_exit(EXIT_NO_DB, auto_close)
 
     # 3. db 健康，调用 main() 执行原 CLI 领取流程
-    # SystemExit 自然传播（保留 0-8 退出码语义）；其他异常记录栈后以 EXIT_ERROR 退出
+    # SystemExit 自然传播（保留 0-9 退出码语义）；其他异常记录栈后以 EXIT_ERROR 退出
     try:
         main(auto_close=auto_close)
     except SystemExit:
