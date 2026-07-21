@@ -241,6 +241,11 @@ _cli_trigger_token: str | None = None
 # 进程生命周期内不变；settings.gui_port 修改后需重启 GUI 才生效。
 _actual_gui_port: int | None = None
 
+# GUI 主窗口 hwnd（由 gui/app.py 在 window.events.shown 回调中赋值）。
+# /api/bring-to-front 接口据此调用 Win32 API 前置窗口。
+# 启动早期为 None；窗口 shown 后赋值，进程生命周期内不变。
+_main_window_hwnd: int | None = None
+
 
 @app.before_request
 def _check_origin():
@@ -250,8 +255,9 @@ def _check_origin():
     缺失或非本机来源一律拒绝（403），防止本机其他进程绕过 CSRF 防护。
     GET/HEAD 等安全请求不校验。
 
-    豁免：/api/cli-trigger-claim 路径已有 Bearer Token 强校验（secrets.compare_digest），
-    且 CLI 通过 Python requests 库调用（默认不发 Origin 头），故豁免 Origin 校验。
+    豁免：/api/cli-trigger-claim 与 /api/bring-to-front 路径已有 Bearer Token 强校验
+    （secrets.compare_digest），且新启动的 GUI/CLI 通过 Python requests 库调用
+    （默认不发 Origin 头），故豁免 Origin 校验。
 
     SEC-004: 兜底校验收紧——主校验失败（netloc 不匹配）但 hostname 为本机时，
     额外校验 Origin 端口必须等于 GUI 实际监听端口 _actual_gui_port，避免本机任意
@@ -260,8 +266,8 @@ def _check_origin():
     """
     if request.method not in ("POST", "PUT", "DELETE", "PATCH"):
         return None
-    # CLI 触发领取：Bearer Token 已强校验，requests 库默认不发 Origin 头
-    if request.path == "/api/cli-trigger-claim":
+    # CLI/GUI 二次启动触发：Bearer Token 已强校验，requests 库默认不发 Origin 头
+    if request.path in ("/api/cli-trigger-claim", "/api/bring-to-front"):
         return None
     origin = request.headers.get("Origin")
     if not origin:
@@ -813,6 +819,44 @@ def cli_trigger_claim():
     if not _start_claim_thread(enabled, settings, tag="CLI"):
         return error_response("启动领取失败，请重试", 500)
     return jsonify({"ok": True, "msg": "已触发领取"}), 202
+
+
+@app.route("/api/bring-to-front", methods=["POST"])
+def bring_to_front():
+    """二次启动 GUI 时，由新进程通知当前 GUI 进程前置其窗口。
+
+    校验 Authorization: Bearer <token>（与 /api/cli-trigger-claim 同源同 token），
+    防止本机其他进程未授权触发前置。
+
+    响应：
+    - 200 OK + {"ok": True}：已调用 Win32 API 前置窗口
+    - 503 Service Unavailable + {"ok": False, "error": "no_hwnd"}：hwnd 尚未就绪
+      （窗口未 shown，新 GUI 进程会走兜底 FindWindowW）
+    - 403 Forbidden：token 缺失或不匹配
+    """
+    expected = _cli_trigger_token
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    if not expected or not secrets.compare_digest(token, expected):
+        return error_response("非法请求", 403)
+
+    hwnd = _main_window_hwnd
+    if not hwnd:
+        return jsonify({"ok": False, "error": "no_hwnd"}), 503
+
+    # 同进程调用 Win32 API，不受跨进程前台锁限制
+    try:
+        import ctypes as _ctypes
+        SW_RESTORE = 9
+        if _ctypes.windll.user32.IsIconic(hwnd):
+            _ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        if not _ctypes.windll.user32.SetForegroundWindow(hwnd):
+            _ctypes.windll.user32.BringWindowToTop(hwnd)
+    except Exception as e:
+        logger.warning("bring-to-front 前置窗口 hwnd=%s 失败: %s", hwnd, e)
+        return error_response("前置窗口失败", 500)
+
+    return jsonify({"ok": True}), 200
 
 
 def _serialize_schema(schema):

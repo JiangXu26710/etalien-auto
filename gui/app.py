@@ -32,6 +32,12 @@ SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_FRAMECHANGED = 0x0020
 
+# ShowWindow 状态常量（用于前置原 GUI 窗口时解除最小化）
+SW_RESTORE = 9
+
+# 窗口标题（与 webview.create_window 一致，用于兜底 FindWindowW 查找）
+_WINDOW_TITLE = "「etalien-auto」- 免广告自动领外星仔时长 F"
+
 
 def _check_dotnet_framework() -> tuple[bool, str]:
     """检查 .NET Framework 4.6.2+ 是否已安装。
@@ -123,7 +129,7 @@ def _check_runtime_env() -> bool:
             "https://dotnet.microsoft.com/download/dotnet-framework\n\n"
             "安装完成后重新启动本程序。"
         )
-        ctypes.windll.user32.MessageBoxW(0, msg, "免广告自动领时长 F - 缺少依赖", MB_OK | MB_ICONERROR)
+        ctypes.windll.user32.MessageBoxW(0, msg, "「etalien-auto」 - 缺少依赖", MB_OK | MB_ICONERROR)
         return False
 
     if not webview2_ok:
@@ -134,7 +140,7 @@ def _check_runtime_env() -> bool:
             "下载地址：https://developer.microsoft.com/microsoft-edge/webview2/"
         )
         result = ctypes.windll.user32.MessageBoxW(
-            0, msg, "免广告自动领时长 F - 缺少依赖", MB_OKCANCEL | MB_ICONWARNING,
+            0, msg, "「etalien-auto」 - 缺少依赖", MB_OKCANCEL | MB_ICONWARNING,
         )
         if result == IDOK:
             import webbrowser
@@ -577,6 +583,72 @@ def _delete_gui_port():
         logger.warning("删除端口文件 %s 失败: %s", port_file, e)
 
 
+def _bring_window_to_front(hwnd: int):
+    """将指定 hwnd 的窗口前置（同进程调用，不受前台锁限制）。
+
+    流程：IsIconic → SW_RESTORE 解除最小化 → SetForegroundWindow 前置；
+    前置失败时兜底 BringWindowToTop。任一步异常均忽略，前置失败不影响主流程。
+    """
+    try:
+        if ctypes.windll.user32.IsIconic(hwnd):
+            ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
+        if not ctypes.windll.user32.SetForegroundWindow(hwnd):
+            ctypes.windll.user32.BringWindowToTop(hwnd)
+    except Exception as e:
+        logger.warning("前置窗口 hwnd=%s 失败: %s", hwnd, e)
+
+
+def _find_window_by_title(title: str) -> int:
+    """按窗口标题查找顶层窗口 hwnd，未找到返回 0。"""
+    try:
+        return ctypes.windll.user32.FindWindowW(None, title)
+    except Exception:
+        return 0
+
+
+def _trigger_existing_gui_front():
+    """通知已运行的 GUI 实例前置其窗口；HTTP 失败时兜底用窗口标题查找。
+
+    流程：
+    1. 读 .gui_port → POST /api/bring-to-front（Bearer token，timeout=2s）
+       - 200 → 前置成功
+       - 其他/连接失败 → 走兜底
+    2. 兜底：FindWindowW 按标题查找原窗口 hwnd → _bring_window_to_front
+    3. 兜底也失败 → 仅记日志（不影响原 sys.exit(0) 行为）
+    """
+    import requests as _requests
+    port_file = os.path.join(CONFIG_DIR, ".gui_port")
+    port = None
+    token = ""
+    try:
+        with open(port_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            port = int(data.get("port", 0))
+            token = data.get("token", "")
+    except (OSError, ValueError, TypeError) as e:
+        logger.info("读取 .gui_port 失败（可能持有者为 CLI）: %s", e)
+
+    if port:
+        url = f"http://127.0.0.1:{port}/api/bring-to-front"
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            resp = _requests.post(url, timeout=2, headers=headers)
+            if resp.status_code == 200:
+                logger.info("已通知原 GUI 前置窗口")
+                return
+            logger.warning("原 GUI 前置请求返回 HTTP %s", resp.status_code)
+        except (_requests.ConnectionError, _requests.Timeout) as e:
+            logger.info("连接原 GUI 失败（可能为 CLI 持有 Mutex）: %s", e)
+
+    # 兜底：按窗口标题查找原 GUI 窗口
+    hwnd = _find_window_by_title(_WINDOW_TITLE)
+    if hwnd:
+        logger.info("兜底找到原窗口 hwnd=%s，尝试前置", hwnd)
+        _bring_window_to_front(hwnd)
+    else:
+        logger.info("兜底未找到原窗口（Mutex 持有者可能是 CLI，无可前置窗口）")
+
+
 def main():
     """GUI 主流程：检查实例锁、迁移数据、启动本地服务并创建 WebView 窗口。"""
 
@@ -584,8 +656,9 @@ def main():
     from main import _create_mutex
     mutex_handle, already_exists = _create_mutex()
     if mutex_handle == 0 or already_exists:
-        # 已有实例在运行（GUI 或 CLI），直接退出（不弹窗、不区分实例类型）
-        logger.info("已有实例在运行，GUI 退出")
+        # 已有实例在运行（GUI 或 CLI）：尝试前置原 GUI 窗口后退出
+        logger.info("已有实例在运行，尝试前置原 GUI 窗口")
+        _trigger_existing_gui_front()
         sys.exit(0)
 
     # PERF-009: 注册 atexit 关闭 repo 单例的 SQLite 连接，触发 WAL checkpoint，
@@ -646,7 +719,7 @@ def main():
     y = (screen_h - win_h) // 2
 
     window = webview.create_window(
-        title="外星仔加速器 - 免广告自动领时长 F",
+        title="「etalien-auto」- 免广告自动领外星仔时长 F",
         url=f"http://127.0.0.1:{port}",
         width=win_w,
         height=win_h,
@@ -681,6 +754,8 @@ def main():
                 hwnd, 0, 0, 0, 0, 0,
                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
             )
+            # 暴露 hwnd 给 api 层，供 /api/bring-to-front 接口前置窗口使用
+            gui_api._main_window_hwnd = hwnd
             logger.info("已添加 WS_MINIMIZEBOX 样式")
         except Exception as e:
             logger.warning("添加 WS_MINIMIZEBOX 样式失败: %s", e)
