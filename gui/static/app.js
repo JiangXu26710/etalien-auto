@@ -341,6 +341,16 @@ async function windowClose() {
         window.close();
         return;
     }
+    // close_window_confirm 开关：开启后退出前弹窗确认
+    // 领取中（isClaiming=true）始终弹确认，不受开关影响（独立逻辑：防止误关中止领取）
+    const needConfirm = getSettingValue('close_window_confirm', false) || isClaiming;
+    if (needConfirm) {
+        const msg = isClaiming
+            ? '领取正在进行中，关闭窗口将中止领取。确认关闭？'
+            : '确认关闭窗口？';
+        const ok = await showConfirmDialog('关闭确认', msg, '关闭', '取消');
+        if (!ok) return;
+    }
     try {
         document.body.classList.add('win-close-out');
         await new Promise(r => setTimeout(r, 200));
@@ -2405,6 +2415,11 @@ async function doEditAccount(originalPhone) {
 
 async function deleteAccount(phone) {
     closeAllActionMenus();
+    // delete_account_confirm 开关：关闭后直接执行删除（保留 toast 反馈与 FLIP 动画）
+    if (!getSettingValue('delete_account_confirm', true)) {
+        doDeleteAccount(phone);
+        return;
+    }
     openModal(`
         <h3>确认删除</h3>
         <p style="color:var(--text-secondary);font-size:13px;margin-bottom:4px">确定删除账号 <strong style="color:var(--gold-light)">${escapeHtml(phone)}</strong> ？</p>
@@ -2516,42 +2531,47 @@ async function doDeleteAccount(phone) {
 }
 
 function showLogin(phone) {
-    const defaultMethod = getSettingValue('default_login_method', 'sms');
-    const smsActive = defaultMethod !== 'password' ? 'active' : '';
-    const pwdActive = defaultMethod === 'password' ? 'active' : '';
-    const initialFocusId = defaultMethod === 'password' ? 'loginPwd' : 'loginCode';
-    openModal(`
-        <h3>登录 ${escapeHtml(phone)}</h3>
-        <div class="login-method-tabs" style="margin-top:4px">
-            <button type="button" class="login-method-tab ${smsActive}" onclick="switchLoginTab(this, 'login-sms-panel')">短信验证码</button>
-            <button type="button" class="login-method-tab ${pwdActive}" onclick="switchLoginTab(this, 'login-pwd-panel')">账号密码</button>
-        </div>
-        <div class="login-form-panel ${smsActive}" id="login-sms-panel">
-            <p class="login-hint" style="margin-top:12px">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
-            <div class="form-group">
-                <label for="loginCode">验证码 *</label>
-                <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6" aria-required="true">
+    api(`/api/accounts/${encodeURIComponent(phone)}`).then(data => {
+        const savedPwd = (data.account && data.account.password) || '';
+        const defaultMethod = getSettingValue('default_login_method', 'sms');
+        const smsActive = defaultMethod !== 'password' ? 'active' : '';
+        const pwdActive = defaultMethod === 'password' ? 'active' : '';
+        const initialFocusId = defaultMethod === 'password' ? 'loginPwd' : 'loginCode';
+        openModal(`
+            <h3>登录 ${escapeHtml(phone)}</h3>
+            <div class="login-method-tabs" style="margin-top:4px">
+                <button type="button" class="login-method-tab ${smsActive}" onclick="switchLoginTab(this, 'login-sms-panel')">短信验证码</button>
+                <button type="button" class="login-method-tab ${pwdActive}" onclick="switchLoginTab(this, 'login-pwd-panel')">账号密码</button>
             </div>
-            <div class="modal-actions">
-                <button type="button" class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
-                <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button type="button" class="btn-modal btn-modal-primary" id="btnGetCodeLogin" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeLogin', 'btnLoginVerify', 'btnResendLogin')">获取</button>
-                <button type="button" class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify(${jsStr(phone)})">登录</button>
+            <div class="login-form-panel ${smsActive}" id="login-sms-panel">
+                <p class="login-hint" style="margin-top:12px">验证码将发送到 ${escapeHtml(phone)}，请查收短信。</p>
+                <div class="form-group">
+                    <label for="loginCode">验证码 *</label>
+                    <input type="text" id="loginCode" placeholder="请输入收到的验证码" maxlength="6" aria-required="true">
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn-modal btn-modal-cancel" id="btnResendLogin" style="display:none" onclick="resendLoginCode(${jsStr(phone)}, 'btnResendLogin')">重新获取</button>
+                    <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+                    <button type="button" class="btn-modal btn-modal-primary" id="btnGetCodeLogin" onclick="sendLoginCode(${jsStr(phone)}, 'btnGetCodeLogin', 'btnLoginVerify', 'btnResendLogin')">获取</button>
+                    <button type="button" class="btn-modal btn-modal-primary" id="btnLoginVerify" style="display:none" onclick="doVerify(${jsStr(phone)})">登录</button>
+                </div>
             </div>
-        </div>
-        <div class="login-form-panel ${pwdActive}" id="login-pwd-panel">
-            <p class="login-hint" style="margin-top:12px">使用外星仔加速器 App 的登录密码直接登录。</p>
-            <div class="form-group">
-                <label for="loginPwd">密码 *</label>
-                <input type="password" id="loginPwd" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码" aria-required="true">
+            <div class="login-form-panel ${pwdActive}" id="login-pwd-panel">
+                <p class="login-hint" style="margin-top:12px">使用外星仔加速器 App 的登录密码直接登录。</p>
+                <div class="form-group">
+                    <label for="loginPwd">密码 *</label>
+                    <input type="password" id="loginPwd" value="${escapeHtml(savedPwd)}" onfocus="this.type='text'" onblur="this.type='password'" placeholder="请输入账号密码" aria-required="true">
+                </div>
+                <div class="modal-actions">
+                    <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
+                    <button type="button" class="btn-modal btn-modal-primary" onclick="doVerifyPwd(${jsStr(phone)})">登录</button>
+                </div>
             </div>
-            <div class="modal-actions">
-                <button type="button" class="btn-modal btn-modal-cancel" onclick="closeModalForce()">取消</button>
-                <button type="button" class="btn-modal btn-modal-primary" onclick="doVerifyPwd(${jsStr(phone)})">登录</button>
-            </div>
-        </div>
-    `);
-    document.getElementById(initialFocusId)?.focus();
+        `);
+        document.getElementById(initialFocusId)?.focus();
+    }).catch(e => {
+        showToast(e.message || '加载账号信息失败', 'error');
+    });
 }
 
 async function doVerify(phone) {
@@ -3468,11 +3488,11 @@ function pollClaimProgress() {
                 lastResultSnapshot = Array.from(problemMap.values());
             }
 
-            // 自动弹出条件：遇问题账号且用户未关闭弹窗时才自动弹出
+            // 自动弹出条件：遇问题账号 + 用户未关闭弹窗 + auto_show_result_modal 开关开启
             // 注：完成态下后端 finish() 已清空 _progress，data.progress 为 []，
             // 故 hasProblem 基于 problemMap 判断（problemMap 在两种状态下都保留正确数据：
             // 领取中由 rebuildProblemList 实时更新；完成时跳过 rebuild 保留完成态）。
-            if (!userClosedResult) {
+            if (!userClosedResult && getSettingValue('auto_show_result_modal', true)) {
                 const overlay = document.getElementById('resultOverlay');
                 const hasProblem = Array.from(problemMap.values()).some(p => PROBLEM_STATUSES.has(p.status));
                 if (hasProblem && overlay && !overlay.classList.contains('active')) {

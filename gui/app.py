@@ -354,14 +354,19 @@ class WindowApi:
         return True
 
     def _shutdown(self):
-        """后台线程执行：等待领取任务完成 → 关闭服务器 → 销毁窗口。
+        """后台线程执行：关闭服务器 → 销毁窗口。
 
         由 close() 启动，避免阻塞 pywebview JS→Python 桥接线程。
         _shutdown_called 保证幂等性：多次调用只执行一次关闭逻辑。
 
         CONC-001: _shutdown_called 的 check-then-act 由 _shutdown_lock 保护。
-        锁内仅做检查与置位，锁外执行长耗时清理（等待领取 / shutdown 服务器 /
-        destroy 窗口），避免长时间持锁阻塞 close() 的快速返回。
+        锁内仅做检查与置位，锁外执行清理（shutdown 服务器 / destroy 窗口），
+        避免长时间持锁阻塞 close() 的快速返回。
+
+        2026-07-20 改造：移除原 10s 等待领取任务完成的逻辑。用户主动关闭已通过
+        前端 windowClose() 弹窗二次确认（isClaiming=true 时强制弹确认），无需后端
+        再延迟等待。领取任务线程作为 daemon 会被强终止，但 db 的 atomic write 保证
+        已写入的进度不丢失。
         """
         # 加锁保护 check-then-act：确保多次并发调用只通过一次
         with self._shutdown_lock:
@@ -369,33 +374,6 @@ class WindowApi:
                 return
             self._shutdown_called = True
         logger.info("正在关闭...")
-
-        # 轮询等待领取任务完成（最长 10 秒超时），避免在任务运行中关闭导致状态不一致。
-        # 通过 gui_api.claim_mgr.running 动态访问，避免布尔值导入时被拷贝导致读取到旧值。
-        # PERF-008: 由 30s 缩短为 10s 减少用户等待；超时时记录进度快照便于事后排查。
-        max_wait = 10
-        waited = 0
-        while waited < max_wait:
-            if not gui_api.claim_mgr.running:
-                break
-            if waited == 0:
-                logger.warning("有领取任务正在运行，等待任务完成...")
-            time.sleep(1)
-            waited += 1
-
-        # GUI-012 / PERF-008: 超时强制关闭时转储当前进度到日志，便于用户事后排查
-        if waited == max_wait:
-            try:
-                progress_snapshot = gui_api.claim_mgr.get_progress()
-                running_count = len(progress_snapshot.get("progress", []))
-                logger.warning(
-                    "等待领取任务完成超时（%ds），强制关闭。当前仍有 %d 个账号进度未完成，"
-                    "详情见 /api/claim/last-result 或日志",
-                    max_wait, running_count,
-                )
-            except Exception as e:
-                logger.warning("等待领取任务完成超时（%ds），强制关闭，可能丢失进度（转储进度失败: %s）",
-                               max_wait, e)
 
         # 删除端口文件（CLI 通知 GUI 的依据，退出时清理）
         _delete_gui_port()

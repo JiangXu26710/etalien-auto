@@ -890,7 +890,9 @@ def update_settings():
                 return error_response(f"字段 {key} 的值 {value!r} 不是有效浮点数", 400)
         elif key == "schedule_time":
             settings[key] = str(value)
-        elif key in ("schan_enabled", "batch_delete_reconfirm", "default_account_enabled"):
+        elif key in ("schan_enabled", "batch_delete_reconfirm", "default_account_enabled",
+                     "show_tip", "delete_account_confirm", "auto_show_result_modal",
+                     "auto_relogin", "close_window_confirm"):
             settings[key] = bool(value)
         elif key == "schan_key":
             schan_value = str(value)

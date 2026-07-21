@@ -72,6 +72,10 @@ DEFAULT_SETTINGS = {
     "default_account_enabled": True,           # 新增账号默认启用状态
     "default_login_method": "sms",             # 登录弹窗默认登录方式（sms/password），仅影响手动登录弹窗
     "show_tip": True,                          # 是否显示 action-bar 中的 tip 轮播模块
+    "delete_account_confirm": True,            # 删除单个账号时是否弹窗二次确认（False=直接执行）
+    "auto_show_result_modal": True,            # 领取过程中遇非成功状态账号时是否自动弹出结果弹窗（False=只更新 chip 计数）
+    "auto_relogin": True,                      # token 过期时是否用账号密码自动重登（False=只标记 token_expired）
+    "close_window_confirm": False,             # 关闭窗口时是否弹窗二次确认（领取中退出确认不受此开关影响，始终弹）
 }
 
 SETTINGS_SCHEMA = {
@@ -90,7 +94,11 @@ SETTINGS_SCHEMA = {
     "default_claim_target":  {"type": str, "options": {"all": "全部领取", "pc": "电脑端加速时长", "mobile": "手机端加速时长"}, "advanced": True, "label": "新增账号默认领取目标", "description": ""},
     "default_account_enabled": {"type": bool,                            "advanced": True, "label": "新账号默认启用", "description": "", "display_on": "默认启用", "display_off": "默认禁用"},
     "default_login_method":  {"type": str, "options": {"sms": "短信验证码", "password": "账号密码"}, "advanced": True, "label": "账号默认登录方式", "description": "只影响手动登录弹窗，与密码自动重登无关联"},
-    "show_tip":              {"type": bool,                            "advanced": True, "label": "显示 tip 提示", "description": "", "display_on": "显示TIP", "display_off": "隐藏TIP"},
+    "show_tip":              {"type": bool,                            "advanced": True,  "label": "显示 tip 提示", "description": "", "display_on": "显示TIP", "display_off": "隐藏TIP"},
+    "delete_account_confirm":  {"type": bool,                          "advanced": True,  "label": "删除单个账号时弹窗确认", "description": "", "display_on": "弹窗确认", "display_off": "不再弹窗"},
+    "auto_show_result_modal":  {"type": bool,                          "advanced": True,  "label": "遇问题账号自动弹出结果弹窗", "description": "领取过程中，如遇账号不是“成功”状态，自动弹出领取结果汇总的弹窗", "display_on": "自动弹出", "display_off": "不自动弹出"},
+    "auto_relogin":            {"type": bool,                          "advanced": True,  "label": "登录过期自动密码重登", "description": "关闭后，不再用密码自动重登token过期的账号；对全局生效，多数情况下推荐开启", "display_on": "自动重登", "display_off": "关闭重登"},
+    "close_window_confirm":    {"type": bool,                          "advanced": True,  "label": "关闭窗口时二次确认", "description": "开启后，退出程序前会弹窗确认；不影响“领取流程中尝试退出”的弹窗确认", "display_on": "二次确认", "display_off": "直接关闭"},
 }
 
 # advanced=True 的字段集合（由 SETTINGS_SCHEMA 推导，避免在多处硬编码导致不同步）

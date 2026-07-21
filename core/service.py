@@ -539,12 +539,14 @@ def batch_get_account_status(phones: list[str], max_workers: int = 10, total_tim
     # PERF-003: 入口处一次 load_settings() 后传给所有 worker，避免每个 get_account_status
     # 内部重复 deepcopy 整个 settings（1000 账号场景下省 999 次 deepcopy）
     batch_settings = load_settings()
+    # auto_relogin 开关：批量状态查询是否启用密码重登兜底（与 claim_for_account 口径一致）
+    batch_enable_relogin = batch_settings.get("auto_relogin", True)
     # 不用 with 语句：with 退出时 __exit__ 会调用 shutdown(wait=True) 阻塞等待已启动的
     # future 完成，违反 PERF-001 设计权衡（用户决策保持现状：超时后已启动的 future 在后台
     # 继续执行至完成，结果被丢弃，主线程立即返回）。手动管理 executor，finally 中用
     # shutdown(wait=False, cancel_futures=True) 立即返回（CONC-004 因与 PERF-001 冲突保持现状）。
     executor = ThreadPoolExecutor(max_workers=max_workers)
-    futures = {executor.submit(get_account_status, phone_to_account[p], True, batch_settings): p for p in pending_phones}
+    futures = {executor.submit(get_account_status, phone_to_account[p], batch_enable_relogin, batch_settings): p for p in pending_phones}
     try:
         # as_completed 传 timeout 防止无限阻塞：剩余 future 全部慢时，无 timeout 的
         # as_completed 会一直阻塞到所有 future 完成，导致 90s 总超时失效。
@@ -854,8 +856,14 @@ def _clear_account_password(phone: str) -> None:
         logger.exception("_clear_account_password update_fields failed for %s", mask_phone(phone))
 
 
-def init_client(account: dict) -> tuple[EtAlienClient | None, str]:
+def init_client(account: dict, enable_relogin: bool = True) -> tuple[EtAlienClient | None, str]:
     """初始化客户端。不再预检查 token，token 有效性由 API 请求自动检测。
+
+    Args:
+        account: 账号字典
+        enable_relogin: 是否注入 token 过期自动重登能力。由 claim_for_account 根据
+            settings.auto_relogin 传入（关闭后 token 过期即抛 NeedLoginError，
+            不再尝试密码重登）。
 
     Returns:
         (client, status): status 为 "ok" / "need_login"
@@ -863,7 +871,7 @@ def init_client(account: dict) -> tuple[EtAlienClient | None, str]:
         - "need_login": 未登录（无 auth_token 或 device_id）
     """
     phone = account["phone"]
-    client = get_client_for_account(account, enable_relogin=True)
+    client = get_client_for_account(account, enable_relogin=enable_relogin)
     if client and client.is_logged_in():
         logger.info("  [%s] 已登录，token 有效性由首个 API 请求检测", mask_phone(phone))
         return client, "ok"
@@ -1161,7 +1169,8 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
     # EH-013: init_client 调用包入 try/except，捕获 EtAlienClient 构造或 load_settings 异常，
     # 避免向上抛到 run_concurrent_claim 被标记为 "error"
     try:
-        client, init_status = init_client(account)
+        # auto_relogin 开关：关闭后不注入密码重登能力，token 过期即抛 NeedLoginError
+        client, init_status = init_client(account, enable_relogin=settings.get("auto_relogin", True))
     except Exception:
         logger.exception("[%s] init_client failed", mask_phone(phone))
         return _make_claim_result(phone, label, "error",

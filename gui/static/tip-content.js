@@ -13,7 +13,7 @@ window.TipContent = {
         '在已搜索状态下，可以只对搜到的账号进行领取任务！',
 
         '你记得看到这条tip几次了吗？',
-        'tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip',
+        'tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:tip:',
         '咕咕咕！',
 
         '在？请给项目一个star，谢谢！',
