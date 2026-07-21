@@ -20,7 +20,7 @@ from threading import Lock
 logger = logging.getLogger(__name__)
 
 # 应用版本号（api.py 通过 /api/version 接口对外暴露）
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # 定时执行时间格式校验正则（HH:MM）
 SCHEDULE_TIME_PATTERN = re.compile(r'^\d{2}:\d{2}$')
