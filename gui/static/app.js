@@ -367,8 +367,6 @@ async function windowClose() {
  * 避免全局永久监听 mousemove 造成不必要开销。
  */
 function initDrag() {
-    // 浏览器中 pywebview 未注入：不绑定 mousedown/dblclick，避免 e.preventDefault() 阻止浏览器默认行为（如文字选中），同时避免拖拽逻辑中的 ReferenceError
-    if (typeof pywebview === 'undefined') return;
     const titleBarDrag = document.getElementById('titleBarDrag');
     if (!titleBarDrag) return;
 
@@ -379,6 +377,10 @@ function initDrag() {
     // mousedown: 同步记录按下位置（不调用 API，避免 async 竞态）+ 绑定 mousemove/mouseup
     titleBarDrag.addEventListener('mousedown', (e) => {
         if (e.button !== 0) return;
+        // 浏览器中 pywebview 永不注入：return 避免 e.preventDefault() 阻止浏览器默认行为（如文字选中）和拖拽逻辑中的 ReferenceError。
+        // 注意：不能在 initDrag() 函数开头检查，因为 DOMContentLoaded 触发时 pywebview 尚未注入（pywebview 通过 pywebviewready 事件通知就绪），
+        // 那样会导致 pywebview 环境下也提前 return，mousedown 监听器从未绑定。
+        if (typeof pywebview === 'undefined') return;
         e.preventDefault();
         isMouseDown = true;
         mouseDownPos = { x: e.screenX, y: e.screenY };
@@ -567,11 +569,15 @@ function updateCardProgress(phone, current, total, phase, cardRef) {
     let initialWatched = 0;
     let totalItems = total || 0;
     if (phase === 'mobile') {
-        // 手机端初始进度来自 mobileStatusCache（翻面时 fetchMobileStatus 填充）
-        const mobileStatus = mobileStatusCache[phone];
-        if (mobileStatus && mobileStatus.mobile_progress) {
-            const parts = mobileStatus.mobile_progress.split('/').map(Number);
-            if (!isNaN(parts[0])) initialWatched = parts[0];
+        // 手机端 current 已是"当前已观看总数"（后端从 watched_before 开始递增 + 结束校准回写）
+        // 不再叠加 mobileStatusCache 的 initialWatched，避免领取中翻面查询导致重复累加（14/7 bug）
+        // 仅从缓存读取 totalItems 兜底（后端 total 异常为 0 时）
+        if (totalItems === 0) {
+            const mobileStatus = mobileStatusCache[phone];
+            if (mobileStatus && mobileStatus.mobile_progress) {
+                const parts = mobileStatus.mobile_progress.split('/').map(Number);
+                if (!isNaN(parts[1])) totalItems = parts[1];
+            }
         }
     } else {
         // PC 端初始进度来自 statusCache

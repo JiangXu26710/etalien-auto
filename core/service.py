@@ -988,13 +988,19 @@ def _claim_pc_phase(client: EtAlienClient, phone: str,
     # 结束查1次config校准真实领取数
     # EH-001: 包 try/except RequestException，网络异常时与 _error=True 走相同分支（用本地计数），
     # 避免异常上抛导致 claim_for_account 把已领取部分错误标记为 network_error
+    # 进度回写：用结束校准的真实领取数覆盖循环中的本地计数，避免 is_verify 计数与服务端
+    # 实际核销不一致导致前端进度条卡住（如服务端提前领完导致后续 is_verify=False break）
     try:
         final_result = client.fetch_pc_ad_config()
     except requests.RequestException:
         logger.warning("  [%s] 结束校准查询网络异常，使用本地计数 %d", mask_phone(phone), local_success)
+        if progress_entry is not None:
+            progress_entry["current"] = local_success
         return local_success, total_failed
     if final_result.get("_error"):
         logger.warning("  [%s] 结束校准查询失败，使用本地计数 %d", mask_phone(phone), local_success)
+        if progress_entry is not None:
+            progress_entry["current"] = local_success
         return local_success, total_failed
     final_unwatched = get_unwatched_count(final_result.get("list", []))
     real_claimed = unwatched_before - final_unwatched
@@ -1003,6 +1009,8 @@ def _claim_pc_phase(client: EtAlienClient, phone: str,
     if final_unwatched > 0 and local_success >= unwatched_before:
         logger.warning("  [%s] 本地计数%d已领够但服务端仍有%d未完成，可能存在异常",
                        mask_phone(phone), local_success, final_unwatched)
+    if progress_entry is not None:
+        progress_entry["current"] = real_claimed
     return real_claimed, total_failed
 
 
@@ -1114,6 +1122,8 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
     # 结束查1次activity校准真实领取数（用 user_watch_cnt 差值，因含无奖励任务）
     # EH-001: 包 try/except RequestException，网络异常时与 _error=True 走相同分支（用本地计数），
     # 避免异常上抛导致 claim_for_account 把已领取部分错误标记为 network_error
+    # 进度回写：用真实 user_watch_cnt 覆盖循环中的本地计数，避免 is_verify 计数与服务端
+    # 实际状态不一致（异常路径下保持循环退出时的 current 不变）
     try:
         final_activity = client.fetch_mobile_ad_activity()
     except requests.RequestException:
@@ -1130,6 +1140,9 @@ def _claim_mobile_phase(client: EtAlienClient, phone: str,
     if final_watch < target and local_success >= pending_count:
         logger.warning("  [%s] 手机端本地计数%d已领够但服务端仅%d/%d，可能存在异常",
                        mask_phone(phone), local_success, final_watch, target)
+    if progress_entry is not None:
+        video_cnt = progress_entry.get("total", 0)
+        progress_entry["current"] = _clamp_watch_cnt(final_watch, video_cnt)
     return real_claimed, total_failed
 
 
@@ -1400,7 +1413,8 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                                 mask_phone(phone), format_duration(mobile_before))
                     mobile_after = mobile_before
                     if progress_entry is not None:
-                        progress_entry["current"] = 0
+                        # current 语义为"当前已观看总数"，already_done 时即 video_cnt
+                        progress_entry["current"] = video_cnt
                         progress_entry["total"] = video_cnt
                     phase_results.append("already_done")
                 else:
@@ -1410,6 +1424,8 @@ def claim_for_account(account: dict, settings: dict, progress_entry: dict | None
                         progress_entry["mobile_before"] = mobile_before
                         if progress_entry.get("total", 0) == 0 and video_cnt > 0:
                             progress_entry["total"] = video_cnt
+                        # current 语义为"当前已观看总数"，从 watched_before 开始递增
+                        progress_entry["current"] = watched_before
 
                     pending = video_cnt - watched_before
                     mob_claimed, mob_failed = _claim_mobile_phase(client, phone, interval, mob_max_rounds, pending, watched_before, progress_entry)
